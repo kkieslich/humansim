@@ -236,6 +236,7 @@ A `set_parameters` call on a running node is validated and stored at once and ta
 | `local_planner.<key>` | Mean of a local planner param (`relaxation_time`, `repulsion_strength`, ...). It replaces the mean of the agent type and keeps its spread. `0` leaves the agent type's own value. Declared for the keys of the startup planner and of every planner selected through `local_planner` |
 | `waypoint_threshold`, `min_speed_for_heading`, `arrival_r_enter`, `arrival_r_exit`, `arrival_tau_brake`, `zone_wait_timeout`, `zone_let_out_timeout`, `force_local_planner`, `profile_phases`, `profile_interval` | The node re-reads them. `arrival_r_enter` must stay below `arrival_r_exit` |
 | `publish_markers` | The marker level changes. `0` deletes the published markers |
+| `seed` | Nothing at a soft `reset`, which keeps the RNG. The next plain `reset` or `remove_agents` with no ids re-roots every stream on it, so the next crowd draws as a first crowd with that seed does |
 | `rtf` | Master mode only, retimes the tick timer |
 
 Re-seating moves every live agent that follows the defaults onto the current local and global planner and shifts its planner params by the change of the mean, so it keeps its sampled offset. Three things stay fixed: an explicit `policy` of the spawn request, a planner named by the agent type, and a per-agent planner value. Pruning drops every local and global planner that no agent uses from the policy table, the wall and pool subscribers, and the module pool. The current defaults stay.

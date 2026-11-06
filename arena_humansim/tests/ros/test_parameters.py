@@ -37,6 +37,7 @@ _RESTORED = (
     "arrival_r_enter",
     "publish_markers",
     "rtf",
+    "seed",
 )
 
 
@@ -109,7 +110,7 @@ def test_out_of_range_values_are_rejected(system: RosTestSystem) -> None:
     assert system.manager.get_parameter(_RESOLUTION).value == pytest.approx(before)
 
 
-@pytest.mark.parametrize(("name", "value"), [("seed", 7), ("dt", 0.1), ("collision", "noop"), ("mode", "master"), ("bt_tick_interval", 3)])
+@pytest.mark.parametrize(("name", "value"), [("dt", 0.1), ("collision", "noop"), ("mode", "master"), ("bt_tick_interval", 3)])
 def test_static_param_is_rejected(system: RosTestSystem, name: str, value: object) -> None:
     before = system.manager.get_parameter(name).value
     result = _set(system, name, value)
@@ -135,11 +136,32 @@ def test_atomic_batch_takes_planner_keys_in_any_order(system: RosTestSystem) -> 
 
 def test_atomic_batch_is_all_or_nothing(system: RosTestSystem) -> None:
     before = system.manager.get_parameter(_RESOLUTION).value
-    batch = [Parameter(_RESOLUTION, value=0.1), Parameter("seed", value=7)]
+    batch = [Parameter(_RESOLUTION, value=0.1), Parameter("dt", value=0.1)]
     result = system.manager.set_parameters_atomically(batch)
     assert not result.successful
-    assert "seed" in result.reason
+    assert "dt" in result.reason
     assert system.manager.get_parameter(_RESOLUTION).value == pytest.approx(before)
+
+
+def _named_params(system: RosTestSystem, name: str) -> object:
+    msg = make_agent_msg()
+    msg.name = name
+    resp = system.call(SpawnAgents, "spawn_agents", SpawnAgents.Request(agents=[msg]))
+    assert resp.success
+    return system.manager._agents[resp.spawned_ids[0]].params
+
+
+def test_seed_takes_effect_at_the_next_remove_all(system: RosTestSystem) -> None:
+    before = system.manager.get_parameter("seed").value
+    system.call(RemoveAgents, "remove_agents", make_remove_request([]))
+    base = _named_params(system, "p")
+    assert _set(system, "seed", before + 7).successful
+    system.call(RemoveAgents, "remove_agents", make_remove_request([]))
+    reseeded = _named_params(system, "p")
+    assert _set(system, "seed", before).successful
+    system.call(RemoveAgents, "remove_agents", make_remove_request([]))
+    assert _named_params(system, "p") == base
+    assert reseeded != base
 
 
 def test_unknown_module_is_rejected(system: RosTestSystem) -> None:

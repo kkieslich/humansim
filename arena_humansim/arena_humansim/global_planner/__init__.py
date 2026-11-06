@@ -191,6 +191,12 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def _forget_paths(self) -> None:
         self._path_cache.clear()
 
+    def forget_agents(self) -> None:
+        """Drop every agent's cached path and goal: the next crowd reuses the ids from 1, and an entry left behind would
+        hand a new agent the path and progress of the agent that had its id in the previous episode."""
+        self._path_cache.clear()
+        self._cached_results = {}
+
     def configure(self, *, inflation_radius: float, resolution: float, comfort_radius: float) -> None:
         pass
 

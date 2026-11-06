@@ -79,3 +79,29 @@ def test_remove_agent_substreams() -> None:
 def test_seed_property() -> None:
     r = RNG(123)
     assert r.seed == 123
+
+
+def test_removing_an_agent_leaves_streams_of_a_key_it_prefixes() -> None:
+    r = RNG(42)
+    r.bind_agent(1, "ped")
+    r.bind_agent(2, "ped_2")
+    kept = r.get_agent_substream(2, "planner")
+    r.get_agent_substream(1, "planner")
+    r.remove_agent_substreams(1)
+    assert r.get_agent_substream(2, "planner") is kept
+
+
+def test_two_live_agents_with_one_key_draw_from_their_own_streams() -> None:
+    r = RNG(42)
+    r.bind_agent(1, "ped")
+    r.bind_agent(2, "ped")
+    assert r.get_agent_substream(1, "planner") is not r.get_agent_substream(2, "planner")
+
+
+def test_a_key_freed_by_a_removed_agent_is_taken_whole() -> None:
+    r = RNG(42)
+    r.bind_agent(1, "ped")
+    first = r.get_agent_substream(1, "planner").integers(1 << 30)
+    r.remove_agent_substreams(1)
+    r.bind_agent(7, "ped")
+    assert r.get_agent_substream(7, "planner").integers(1 << 30) == first

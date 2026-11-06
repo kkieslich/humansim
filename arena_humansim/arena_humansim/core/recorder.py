@@ -111,6 +111,14 @@ class BagRecorder:
         self._write_manifest()
         node.get_logger().info(f"BagRecorder writing to {self._bag_dir}")
 
+    def record_seed(self, seed: int) -> None:
+        """Note a seed the streams are re-rooted on (a reset or a remove-all): `seed` is the latest, `seeds` all of them in order."""
+        previous = self._provenance.get("seeds")
+        seeds = list(previous) if isinstance(previous, list) else [self._provenance.get("seed")]
+        self._provenance["seeds"] = [*seeds, seed]
+        self._provenance["seed"] = seed
+        self._write_manifest()
+
     def _check_publishers(self) -> bool:
         clean = True
         for topic in _GUARDED:

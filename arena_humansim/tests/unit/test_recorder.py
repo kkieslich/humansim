@@ -136,3 +136,14 @@ def test_recorder_keeps_meta_latched_before_it_started(node: Node, tmp_path: Pat
         counts[topic] = counts.get(topic, 0) + 1
     assert counts["/agent_meta"] == 1
     assert counts["/agent_gestures"] == 1
+
+
+def test_record_seed_keeps_the_latest_and_every_seed_in_order(node: Node, tmp_path: Path) -> None:
+    rec = BagRecorder(node, tmp_path / "run", provenance={"seed": 3})
+    rec.record_seed(11)
+    rec.record_seed(12)
+    rec.close()
+
+    manifest = yaml.safe_load((tmp_path / "run" / "recording.yaml").read_text())
+    assert manifest["seed"] == 12
+    assert manifest["seeds"] == [3, 11, 12]

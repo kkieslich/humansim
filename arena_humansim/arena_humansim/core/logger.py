@@ -43,6 +43,11 @@ class SimulationLogger:
         }
         self._log_file.write(json.dumps(record, separators=(",", ":")) + "\n")
 
+    def record_seed(self, seed: int) -> None:
+        """The seed every stream is re-rooted on from here (a reset or a remove-all), the startup one is in the config snapshot."""
+        self._seed = seed
+        self._log_file.write(json.dumps({"event": "seed", "seed": seed}, separators=(",", ":")) + "\n")
+
     def record_agent_despawn(self, agent_id: int, reason: str, tick: int) -> None:
         record = {
             "event": "despawn",

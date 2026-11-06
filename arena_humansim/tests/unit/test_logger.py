@@ -201,3 +201,11 @@ def test_records_are_line_delimited_json(tmp_path: Path) -> None:
     assert lines[-1] == ""
     records = [json.loads(line) for line in lines[:-1]]
     assert [r.get("event", "tick") for r in records] == ["spawn", "tick", "despawn"]
+
+
+def test_record_seed_logs_the_seed_streams_are_re_rooted_on(tmp_path: Path) -> None:
+    log = SimulationLogger(str(tmp_path), seed=1, config={})
+    log.record_seed(77)
+    log.close()
+
+    assert _read_lines(tmp_path / "session.jsonl") == [{"event": "seed", "seed": 77}]

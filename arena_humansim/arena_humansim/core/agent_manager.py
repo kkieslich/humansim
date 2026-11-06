@@ -266,6 +266,8 @@ _RECONFIGURABLE_PARAMS = _TUNABLE_PARAMS | {
     "contact_mode",
     "locomotion_standing_distance",
     "gesture_mode",
+    # takes effect at the next reset or remove-all, the running crowd keeps its streams
+    "seed",
 }
 
 _EXTERNAL_TIMEOUT_S = 2.0
@@ -2279,6 +2281,20 @@ class AgentManager(Node):
             self._feedback_callback,
         )
 
+    def _forget_agents(self) -> None:
+        """Clear what every global planner keeps per agent id, for a crowd that numbers its agents from 1 again."""
+        for planner in self._module_pool["global_planner"].values():
+            planner.forget_agents()
+
+    def _reseed(self) -> None:
+        """Re-root every stream on the `seed` param, and note it where the recordings keep their provenance."""
+        seed = self._int_param("seed")
+        self._rng.reset(seed)
+        if self._sim_logger is not None:
+            self._sim_logger.record_seed(seed)
+        if self._recorder is not None:
+            self._recorder.record_seed(seed)
+
     def _check_overrun(self, elapsed: float):
         if elapsed <= self._dt:
             return
@@ -2873,6 +2889,10 @@ class AgentManager(Node):
             aid = agent_msg.agent_id
             if aid == 0:
                 aid = self._allocate_robot_id() if kind == KIND_ROBOT else self._allocate_agent_id()
+            if agent_msg.name:
+                # key the agent's draws on its name without the namespace, as flow agents are keyed on source and
+                # release index: the same person then draws the same values whatever its id, spawn order or env
+                self._rng.bind_agent(aid, agent_msg.name.rsplit("/", 1)[-1])
 
             waypoints = [Pose2D(x=pt.pose.x, y=pt.pose.y, theta=pt.pose.theta) for pt in agent_msg.waypoints.points]
             radii = [pt.radius for pt in agent_msg.waypoints.points]
@@ -2973,6 +2993,10 @@ class AgentManager(Node):
             self._interaction_manager.reset()
             self._event_bus.clear()
             self._pending_stimuli.clear()
+            # a fresh crowd draws from fresh streams: without this, the next agent 4 or the next release of a source
+            # continues the old one's stream, and every episode after the first draws other needs, speeds and timings
+            self._reseed()
+            self._forget_agents()  # the next agent 1 must not walk on the old agent 1's cached path
             self._next_agent_id = 1
             self._next_robot_id = -1
             self._tick_count = 0
@@ -3036,7 +3060,8 @@ class AgentManager(Node):
         for subsystem in self._wall_aware:
             subsystem.set_walls([])
         self._world_knowledge.clear()
-        self._rng.reset()
+        self._reseed()
+        self._forget_agents()
         self._next_agent_id = 1
         self._next_robot_id = -1
         self._tick_count = 0

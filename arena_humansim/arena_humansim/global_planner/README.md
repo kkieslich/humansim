@@ -43,6 +43,7 @@ A subclass implements only `_has_map` and `_plan`. The base class owns everythin
 - `get_cached_goals` is how the rest of the pipeline (local planner, markers) reads the planner state without re-triggering work.
 - `get_cached_paths` is optional, only used for visualization.
 - `WallAware.set_walls(segments)` invalidates any grid / graph caches through `_forget_paths`.
+- `forget_agents` drops every agent's cached path and goal. The node calls it at a remove-all and at a plain `reset`, which number the next crowd from 1 again, so no new agent starts on the path and goal cached for the old agent with its id.
 - `configure` is optional, default is a no-op. The node calls it with all three params at startup and at every `reset`.
 
 ## Parameters
