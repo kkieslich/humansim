@@ -129,3 +129,28 @@ def test_clear_empties_all() -> None:
     assert len(wk) == 0
     assert wk._by_type == {}
     assert wk._queue_lengths == {}
+
+
+def test_resolve_takes_a_scenario_name_for_its_namespaced_id() -> None:
+    wk = _make_wk()
+    demand = _obj("env_0/fountain_demand", type_="fountain", x=1.0)
+    wk.add_object(demand)
+    wk.add_object(_obj("env_0/fountain_2", type_="fountain", x=9.0))
+    assert wk.resolve("fountain_demand", Pose2D(x=10.0, y=0.0)) is demand
+    assert wk.resolve("env_0/fountain_demand") is demand
+
+
+def test_resolve_falls_back_to_the_type_when_a_name_is_ambiguous() -> None:
+    wk = _make_wk()
+    wk.add_object(_obj("env_0/desk", type_="desk", x=0.0))
+    wk.add_object(_obj("env_1/desk", type_="desk", x=5.0))
+    near = wk.resolve("desk", Pose2D(x=4.0, y=0.0))
+    assert near is not None and near.object_id == "env_1/desk"
+
+
+def test_resolve_takes_a_type_before_an_object_named_like_it() -> None:
+    wk = _make_wk()
+    wk.add_object(_obj("env_0/fountain", type_="fountain", x=0.0))
+    inserted = _obj("env_0/fountain_2", type_="fountain", x=9.0)
+    wk.add_object(inserted)
+    assert wk.resolve("fountain", Pose2D(x=10.0, y=0.0)) is inserted

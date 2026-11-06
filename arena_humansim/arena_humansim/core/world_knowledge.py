@@ -68,13 +68,15 @@ class WorldKnowledge(Loggable):
         return list(self._by_type.get(object_type, []))
 
     def resolve(self, target: str, from_pose: Pose2D | None = None, exclude_full: bool = False) -> WorldObject | None:
-        """Try target as an object_id; otherwise treat as a type name and return nearest visible-by-pose."""
+        """Try target as an object id; else as a type name, the nearest of that type visible-by-pose; else as a scenario
+        name under a namespaced id (`find`). A type comes before a name, so a step aimed at a type still picks the
+        nearest of its objects when one of them is named like the type."""
         obj = self.get(target)
         if obj is not None:
             return obj
-        if from_pose is None:
-            return None
-        return self.nearest_object(target, from_pose, exclude_full=exclude_full)
+        if from_pose is not None and target in self._by_type:
+            return self.nearest_object(target, from_pose, exclude_full=exclude_full)
+        return self.find(target)
 
     def nearest_object(
         self,
