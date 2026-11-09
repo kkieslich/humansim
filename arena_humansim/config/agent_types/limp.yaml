@@ -1,0 +1,20 @@
+# Antalgic limp on the right leg (Kimodo SMPLX-RP, text only): short right stance, trunk shifted onto the left leg.
+# Gait: profile walk_limp (arena_runtime human profiles), fitted from the retargeted Kimodo clip
+# limp; speed/lateral harmonics measured on the clip's root track.
+name: limp
+extends: adult
+
+desired_velocity: {mean: 0.65, std: 0.05, clip_low: 0.5, clip_high: 0.8}
+max_velocity: {mean: 0.9, std: 0.05, clip_low: 0.7, clip_high: 1.1}
+
+locomotion:
+  cadence: {base: 0.4, per_speed: 0.4249, min: 0.4, max: 2.2}
+  phase_warp: {split: 0.4242}
+  speed_profile:
+    harmonics: [[0.239, 1.18], [0.042, -0.21]]
+  lateral_profile:
+    harmonics: [[0.121, -0.16], [0.045, -0.04]]
+
+pose:
+  walk: {base: walk_limp}
+  run: {same_as: walk}

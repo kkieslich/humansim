@@ -17,7 +17,8 @@ from .obs import (
     assemble_observation,
 )
 
-_UPSTREAM_CHECKPOINT_URL = "https://github.com/TempleRAIL/drl_vo_nav/raw/drl_vo/drl_vo/src/model/drl_vo.zip"
+_CHECKPOINT_URL = "https://huggingface.co/arena-rosnav/drlvo/resolve/main/drl_vo.zip"
+_CHECKPOINT_SHA256 = "78a6bc9918b092e2bd26782664248d9ce06a5498e7cd086260dbfe6548f99645"
 
 # Upstream stop-gate constants (drl_vo_inference.py).
 _GOAL_MARGIN = 0.9
@@ -102,8 +103,8 @@ class DRLVOPlanner(RobotPolicy):
         path = Path(self._checkpoint_path)
         if path.exists():
             return
-        self._logger.info(f"Fetching DRL-VO checkpoint from {_UPSTREAM_CHECKPOINT_URL} -> {path}")
-        fetch_to_disk(_UPSTREAM_CHECKPOINT_URL, path)
+        self._logger.info(f"Fetching DRL-VO checkpoint from {_CHECKPOINT_URL} -> {path}")
+        fetch_to_disk(_CHECKPOINT_URL, path, sha256=_CHECKPOINT_SHA256)
 
     def _ensure_model(self) -> None:
         if self._model is not None:

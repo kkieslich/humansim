@@ -19,7 +19,8 @@ if TYPE_CHECKING:
 
     from .model import SRNN
 
-_CHECKPOINT_URL = "https://github.com/Shuijing725/CrowdNav_DSRNN/raw/main/data/example_model_unicycle/checkpoints/55554.pt"
+_CHECKPOINT_URL = "https://huggingface.co/arena-rosnav/dsrnn/resolve/main/55554.pt"
+_CHECKPOINT_SHA256 = "e8b5ee59e289ebe87d98314ff701fe3893882b7e133a64ba5b68d1631a49120f"
 _CHECKPOINT_FILENAME = "55554.pt"
 _TRAINING_HUMAN_NUM = 5
 _TRAINING_TIME_STEP = 0.1
@@ -91,7 +92,7 @@ class DSRNNPlanner(RobotPolicy):
         if path != default:
             raise FileNotFoundError(f"DS-RNN checkpoint not found at {path}")
         self._logger.info(f"Fetching DS-RNN checkpoint from {_CHECKPOINT_URL} -> {path}")
-        fetch_to_disk(_CHECKPOINT_URL, path)
+        fetch_to_disk(_CHECKPOINT_URL, path, sha256=_CHECKPOINT_SHA256)
 
     def _ensure_model(self) -> None:
         if self._model is not None:
