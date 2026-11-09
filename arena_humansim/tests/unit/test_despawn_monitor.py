@@ -10,10 +10,14 @@ from arena_humansim.core.agents.base import BaseAgent
 from arena_humansim.core.despawn_monitor import DespawnMonitor
 from arena_humansim.utils.types import (
     AgentLifetime,
+    BehaviorTreeMovement,
+    CommandType,
+    HighLevelCommand,
     Pose2D,
     Shape,
     ShapeType,
     SinkConfig,
+    WaypointMovement,
 )
 
 
@@ -186,6 +190,99 @@ def test_point_in_polygon_square(px: float, py: float, expected: bool) -> None:
         Pose2D(x=-1.0, y=1.0),
     ]
     assert DespawnMonitor._point_in_polygon(px, py, square) is expected
+
+
+def _door_strip() -> SinkConfig:
+    """A sink strip 0.1 to 0.6 m inside a door on the line y = 0, like the one a FLOWEDIT entrance writes."""
+    return _polygon_sink(
+        "door_sink",
+        cx=0.0,
+        cy=0.35,
+        vertices=[Pose2D(x=-0.6, y=-0.25), Pose2D(x=0.6, y=-0.25), Pose2D(x=0.6, y=0.25), Pose2D(x=-0.6, y=0.25)],
+    )
+
+
+def _navigating(agent: BaseAgent, x: float, y: float, kind: CommandType = CommandType.NAVIGATE) -> BaseAgent:
+    agent.movement = BehaviorTreeMovement(command=HighLevelCommand(agent_id=agent.state.agent_id, type=kind, target_pose=Pose2D(x=x, y=y)))
+    return agent
+
+
+def test_behavior_tree_agent_passing_through_its_sink_stays(agent_factory: Callable[..., BaseAgent]) -> None:
+    m = _make_monitor()
+    m.add_sink(_door_strip())
+    agent = _navigating(agent_factory(agent_id=1, x=0.3, y=0.4), x=6.0, y=5.0)
+    lifetime = AgentLifetime(agent_id=1, target_sink_name="door_sink")
+    m.register(1, lifetime)
+    assert m.tick({1: agent}, _no_interaction, tick_count=1, dt=0.1) == []
+    assert lifetime.pending_despawn is False
+
+
+def test_behavior_tree_agent_walking_into_its_sink_is_taken(agent_factory: Callable[..., BaseAgent]) -> None:
+    m = _make_monitor()
+    m.add_sink(_door_strip())
+    agent = _navigating(agent_factory(agent_id=1, x=0.3, y=0.4), x=0.0, y=0.35)
+    m.register(1, AgentLifetime(agent_id=1, target_sink_name="door_sink"))
+    requests = m.tick({1: agent}, _no_interaction, tick_count=1, dt=0.1)
+    assert [(r.agent_id, r.reason) for r in requests] == [(1, "sink")]
+
+
+def test_released_visitor_stays_on_its_way_in_and_is_taken_on_its_way_out(agent_factory: Callable[..., BaseAgent]) -> None:
+    """A visitor released behind its door's sink walks through it to its first stop, then comes back to leave."""
+    m = _make_monitor()
+    m.add_sink(_door_strip())
+    agent = agent_factory(agent_id=1, x=0.0, y=1.3)
+    m.register(1, AgentLifetime(agent_id=1, target_sink_name="door_sink", spawn_tick=0))
+    agent.movement = BehaviorTreeMovement()
+    tick = 0
+    for y in (1.3, 0.9, 0.5, 0.3, 0.5, 0.9):
+        _navigating(agent, x=4.0, y=0.4)
+        agent.state.pose = Pose2D(x=min(4.0, 1.3 - y), y=y)
+        tick += 1
+        assert m.tick({1: agent}, _no_interaction, tick_count=tick, dt=0.1) == [], f"taken at y={y} on its way to its stop"
+    _navigating(agent, x=0.0, y=0.35)
+    agent.state.pose = Pose2D(x=0.2, y=0.8)
+    assert m.tick({1: agent}, _no_interaction, tick_count=tick + 1, dt=0.1) == []
+    agent.state.pose = Pose2D(x=0.1, y=0.5)
+    requests = m.tick({1: agent}, _no_interaction, tick_count=tick + 2, dt=0.1)
+    assert [(r.agent_id, r.reason) for r in requests] == [(1, "sink")]
+
+
+@pytest.mark.parametrize("command", [None, CommandType.STOP, CommandType.SEEK])
+def test_behavior_tree_agent_in_its_sink_without_a_way_out_stays(agent_factory: Callable[..., BaseAgent], command: CommandType | None) -> None:
+    m = _make_monitor()
+    m.add_sink(_door_strip())
+    agent = agent_factory(agent_id=1, x=0.0, y=0.35)
+    agent.movement = BehaviorTreeMovement() if command is None else BehaviorTreeMovement(command=HighLevelCommand(agent_id=1, type=command, target_pose=Pose2D(x=0.0, y=0.35)))
+    m.register(1, AgentLifetime(agent_id=1, target_sink_name="door_sink"))
+    assert m.tick({1: agent}, _no_interaction, tick_count=1, dt=0.1) == []
+
+
+def test_passing_through_in_interaction_does_not_defer_a_despawn(agent_factory: Callable[..., BaseAgent]) -> None:
+    m = _make_monitor()
+    m.add_sink(_door_strip())
+    agent = _navigating(agent_factory(agent_id=1, x=0.0, y=0.35), x=6.0, y=5.0)
+    lifetime = AgentLifetime(agent_id=1, target_sink_name="door_sink")
+    m.register(1, lifetime)
+    assert m.tick({1: agent}, _always_interaction, tick_count=1, dt=0.1) == []
+    assert lifetime.pending_despawn is False
+
+
+def test_waypoint_walker_heading_for_its_sink_is_taken(agent_factory: Callable[..., BaseAgent]) -> None:
+    m = _make_monitor()
+    m.add_sink(_circle_sink("exit", x=5.0, y=0.0, radius=0.5))
+    agent = agent_factory(agent_id=1, x=5.1, y=0.0)
+    agent.movement = WaypointMovement(waypoints=[Pose2D(x=5.0, y=0.0)])
+    m.register(1, AgentLifetime(agent_id=1, target_sink_name="exit"))
+    assert [r.reason for r in m.tick({1: agent}, _no_interaction, tick_count=1, dt=0.1)] == ["sink"]
+
+
+def test_waypoint_walker_rerouted_past_its_sink_stays(agent_factory: Callable[..., BaseAgent]) -> None:
+    m = _make_monitor()
+    m.add_sink(_circle_sink("exit", x=5.0, y=0.0, radius=0.5))
+    agent = agent_factory(agent_id=1, x=5.1, y=0.0)
+    agent.movement = WaypointMovement(waypoints=[Pose2D(x=5.0, y=0.0), Pose2D(x=12.0, y=0.0)], index=1)
+    m.register(1, AgentLifetime(agent_id=1, target_sink_name="exit"))
+    assert m.tick({1: agent}, _no_interaction, tick_count=1, dt=0.1) == []
 
 
 def test_point_in_polygon_concave_shape() -> None:

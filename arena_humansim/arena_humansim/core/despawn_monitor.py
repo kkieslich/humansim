@@ -3,7 +3,17 @@ from collections.abc import Callable, Sequence
 
 from arena_humansim.core.agents import BaseAgent
 from arena_humansim.utils.loggable import Loggable
-from arena_humansim.utils.types import AgentLifetime, AgentState, DespawnRequest, Pose2D, ShapeType, SinkConfig
+from arena_humansim.utils.types import (
+    AgentLifetime,
+    AgentState,
+    BehaviorTreeMovement,
+    CommandType,
+    DespawnRequest,
+    Pose2D,
+    ShapeType,
+    SinkConfig,
+    WaypointMovement,
+)
 
 
 class DespawnMonitor(Loggable):
@@ -27,7 +37,8 @@ class DespawnMonitor(Loggable):
                 continue
 
             age_s = (tick_count - lifetime.spawn_tick) * dt
-            at_sink = self._check_sink_proximity(agent.state, lifetime.target_sink_name)
+            # inside its sink and heading for it: an agent on its way to a point outside the sink only passes through
+            at_sink = self._check_sink_proximity(agent.state, lifetime.target_sink_name) and self._heading_for_sink(agent, lifetime.target_sink_name)
             ttl_expired = lifetime.max_lifetime_s > 0 and age_s >= lifetime.max_lifetime_s
             in_interaction = interaction_check(aid)
 
@@ -92,17 +103,33 @@ class DespawnMonitor(Loggable):
         if sink.capacity > 0 and self._sink_occupancy.get(sink.name, 0) >= sink.capacity:
             return False
 
-        if sink.shape.type == ShapeType.POLYGON and sink.shape.vertices:
-            return self._point_in_polygon(
-                agent_state.pose.x - sink.pose.x,
-                agent_state.pose.y - sink.pose.y,
-                sink.shape.vertices,
-            )
+        return self._contains(sink, agent_state.pose.x, agent_state.pose.y)
 
-        dx = agent_state.pose.x - sink.pose.x
-        dy = agent_state.pose.y - sink.pose.y
-        dist = math.sqrt(dx * dx + dy * dy)
-        return dist < sink.absorption_radius
+    def _heading_for_sink(self, agent: BaseAgent, target_sink_name: str) -> bool:
+        """Whether the agent is on its way out through its sink, not on its way somewhere else.
+
+        A waypoint walker heads for its current waypoint, and one without waypoints left has nowhere else to go. A behavior-tree
+        agent heads for the target of its navigate command; without one (standing, seeking an object, between steps) it is busy
+        with its behavior, not leaving.
+        """
+        sink = self._sinks.get(target_sink_name)
+        if sink is None:
+            return False
+        mv = agent.movement
+        if isinstance(mv, BehaviorTreeMovement):
+            cmd = mv.command
+            if cmd is None or cmd.type != CommandType.NAVIGATE:
+                return False
+            return self._contains(sink, cmd.target_pose.x, cmd.target_pose.y)
+        if isinstance(mv, WaypointMovement) and 0 <= mv.index < len(mv.waypoints):
+            goal = mv.waypoints[mv.index]
+            return self._contains(sink, goal.x, goal.y)
+        return True
+
+    def _contains(self, sink: SinkConfig, x: float, y: float) -> bool:
+        if sink.shape.type == ShapeType.POLYGON and sink.shape.vertices:
+            return self._point_in_polygon(x - sink.pose.x, y - sink.pose.y, sink.shape.vertices)
+        return math.hypot(x - sink.pose.x, y - sink.pose.y) < sink.absorption_radius
 
     @staticmethod
     def _point_in_polygon(px: float, py: float, vertices: Sequence[Pose2D]) -> bool:
