@@ -1,0 +1,30 @@
+# Elderly person pushing a four-wheeled rollator (wheeled walker with seat) with both hands, continuous gait, fairly
+# upright (Kimodo, both hands pinned to the grips 0.15 m ahead of the pelvis at 0.95 m, upright prompt).
+# Gait: profile walk_rollator (arena_runtime human profiles), fitted from the retargeted Kimodo clip
+# rollator (stride 1.10 s at 0.6 m/s); speed/lateral harmonics measured on the clip's root track.
+# Footprint: a 1.0 m capsule along the heading covers the body and the rollator ahead of it (0.57 m wide, 0.69 m deep).
+# Turning: a rollator is steered, not pivoted on the spot: wider turns and slower pivots than a free walker.
+name: elder_rollator
+extends: elder
+
+desired_velocity: {mean: 0.6, std: 0.05, clip_low: 0.45, clip_high: 0.75}
+max_velocity: {mean: 0.75, std: 0.05, clip_low: 0.6, clip_high: 0.9}
+agent_radius: {mean: 0.32, std: 0.01, clip_low: 0.3, clip_high: 0.35}
+max_acceleration: {mean: 0.5, std: 0.1, clip_low: 0.3, clip_high: 0.8}
+max_deceleration: {mean: 0.8, std: 0.1, clip_low: 0.5, clip_high: 1.2}
+min_turning_radius: {mean: 0.6, std: 0.05, clip_low: 0.4, clip_high: 1.0}
+pivot_angular_velocity: {mean: 0.6, std: 0.1, clip_low: 0.4, clip_high: 0.9}
+
+locomotion:
+  cadence: {base: 0.4, per_speed: 0.8485, min: 0.4, max: 2.2}
+  phase_warp: {split: 0.5772}
+  speed_profile:
+    harmonics: [[0.087, -3.09], [0.098, -1.84]]
+  lateral_profile:
+    harmonics: [[0.22, 0.15], [0.015, -2.91]]
+  footprint_length: 1.0
+
+pose:
+  hold: {l: {radius: 0.018, angle: -35}, r: {radius: 0.018, angle: -35}}  # RollatorFitted foam grips, diagonal across the palm (index base to heel of the hand)
+  walk: {base: walk_rollator}
+  run: {same_as: walk}

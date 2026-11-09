@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import random
 import tempfile
@@ -34,7 +35,7 @@ def cache_lock(path: Path) -> Iterator[None]:
             os.close(fd)
 
 
-def fetch_to_disk(url: str, dest: Path, timeout: float = _FETCH_TIMEOUT_SECONDS) -> None:
+def fetch_to_disk(url: str, dest: Path, timeout: float = _FETCH_TIMEOUT_SECONDS, sha256: str | None = None) -> None:
     if dest.exists():
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -50,6 +51,8 @@ def fetch_to_disk(url: str, dest: Path, timeout: float = _FETCH_TIMEOUT_SECONDS)
                 if not chunk:
                     break
                 f.write(chunk)
+        if sha256 is not None and hashlib.sha256(tmp.read_bytes()).hexdigest() != sha256:
+            raise ValueError(f"{url} did not match sha256 {sha256}")
         os.replace(tmp, dest)
     except Exception:
         tmp.unlink(missing_ok=True)

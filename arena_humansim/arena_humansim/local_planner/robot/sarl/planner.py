@@ -17,7 +17,8 @@ from .obs import build_full_state, build_observable_states, rotate
 if TYPE_CHECKING:
     from .model import ValueNetwork
 
-_CHECKPOINT_URL = "https://github.com/LeeKeyu/sarl_star/raw/master/sarl_star_ros/CrowdNav/crowd_nav/data/output/rl_model.pth"
+_CHECKPOINT_URL = "https://huggingface.co/arena-rosnav/sarl/resolve/main/rl_model.pth"
+_CHECKPOINT_SHA256 = "4f1e59c9a3c77db5e75b0581274123bb4e6e053733338ee1e8d81743c47d64cb"
 _CHECKPOINT_FILENAME = "rl_model.pth"
 
 _INPUT_DIM = 13
@@ -133,7 +134,7 @@ class SARLPlanner(RobotPolicy):
         if path != default:
             raise FileNotFoundError(f"SARL checkpoint not found at {path}")
         self._logger.info(f"Fetching SARL checkpoint from {_CHECKPOINT_URL} -> {path}")
-        fetch_to_disk(_CHECKPOINT_URL, path)
+        fetch_to_disk(_CHECKPOINT_URL, path, sha256=_CHECKPOINT_SHA256)
 
     def _ensure_model(self) -> None:
         if self._model is not None:

@@ -59,7 +59,7 @@ Declaring the block at all (even empty) activates the locomotion profile for the
 
 The zero-means-off fields (`footprint_length`, `recovery.*`) take a bare number for `0`, since the dict form's `clip_low` default of `0.01` would lift a `{mean: 0}` to `0.01`.
 
-Pose (`pose:`, optional): passed through untouched to the renderer (arena_runtime's human animation), humansim never reads it. Per-state (`walk`, `idle`, `run`) joint profiles keyed to the published gait phase, see the renderer's profile docs.
+Pose (`pose:`, optional): passed through untouched to the renderer (arena_runtime's human animation), humansim never reads it. Per-state (`walk`, `idle`, `run`) joint profiles keyed to the published gait phase, see the renderer's profile docs. `hold: {l|r: <grip radius m> | {radius, angle, curls, wrap}}` closes each named hand on a prop of that radius (cane, pole, walker handle): the renderer solves the finger curls from the template hand skeleton; `angle` turns the grip in the palm (deg), `curls` (thumb to pinky) gives a character's own curls instead (the retarget's `--hold` reports them), `wrap: true` closes the thumb over the fingers.
 
 Interaction class (`interaction_class:`, optional name string): social-force class of the type for the local planners' per-class gain matrices. Unset = `human`, robots are always `robot`, any other word (e.g. `wheelchair`) registers a new class on first sight, see [../../arena_humansim/core/interaction_classes.py](../../arena_humansim/core/interaction_classes.py).
 

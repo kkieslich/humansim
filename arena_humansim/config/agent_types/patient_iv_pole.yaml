@@ -1,0 +1,28 @@
+# Hospital patient pushing an IV pole with the left hand (Kimodo, left hand pinned ahead at chest height). The radius covers the pole beside the body.
+# Gait: profile walk_ivpole (arena_runtime human profiles), fitted from the retargeted Kimodo clip
+# ivpole; speed/lateral harmonics measured on the clip's root track.
+name: patient_iv_pole
+extends: elder
+
+desired_velocity: {mean: 0.6, std: 0.05, clip_low: 0.4, clip_high: 0.75}
+max_velocity: {mean: 0.75, std: 0.05, clip_low: 0.55, clip_high: 0.9}
+agent_radius: {mean: 0.38, std: 0.02, clip_low: 0.32, clip_high: 0.45}
+max_acceleration: {mean: 0.6, std: 0.1, clip_low: 0.3, clip_high: 1.0}
+min_turning_radius: {mean: 0.6, std: 0.05, clip_low: 0.3, clip_high: 1.2}
+
+locomotion:
+  cadence: {base: 0.4, per_speed: 0.3482, min: 0.4, max: 2.2}
+  phase_warp: {split: 0.5}
+  speed_profile:
+    harmonics: [[0.02, -2.1], [0.211, -2.53]]
+  lateral_profile:
+    harmonics: [[0.119, -0.3], [0.013, 1.59]]
+
+pose:
+  # power grip on the pole (IVStand upper pole, 7.7 mm), thumb up: the pole runs diagonally across the palm (42 deg from the
+  # knuckle line, which on this hand slants ~30 deg from square to the forearm) and the thumb closes over the index; curls solved
+  # on the scenario's actor (Hospital/patient_male_caucasian_old, assistive_1103 grasp_actor.py ... wrap): the template's curls
+  # push this actor's longer fingers into the pole
+  hold: {l: {radius: 0.008, angle: 42, curls: [0.5, 1.15, 1.11, 0.94, 0.31]}}
+  walk: {base: walk_ivpole}
+  run: {same_as: walk}

@@ -1,0 +1,30 @@
+# Blind long-cane user, constant contact with a rolling tip. Perceives only what the cane reaches.
+# Gait: profile walk_rollingcane (arena_runtime human profiles), fitted from a retargeted Kimodo clip; the right arm is
+# then re-solved per gait phase so the fist holds the cane forward of the hip, the cane continuing the forearm with
+# the tip rolling across the path in step with the feet. Speed/lateral harmonics measured on the clip's root track.
+# The arm is solved for one character's rig; use it with a model that carries the cane in the body
+# (<model>_rollingcane bundles: a cane joint under the right hand), e.g. Common/casual_male_asian_young_rollingcane.
+name: blind_rolling_cane
+extends: adult
+
+desired_velocity: {mean: 0.8, std: 0.05, clip_low: 0.6, clip_high: 0.95}
+max_velocity: {mean: 0.95, std: 0.05, clip_low: 0.75, clip_high: 1.15}
+perception:
+  vision_range: {mean: 1.2, std: 0.05, clip_low: 1.0, clip_high: 1.4}
+  vision_fov: {mean: 120.0, std: 5.0, clip_low: 100.0, clip_high: 140.0}
+  proximity_sense: {mean: 1.2, std: 0.05, clip_low: 1.0, clip_high: 1.4}
+  vision_occlusion: true
+max_acceleration: {mean: 0.8, std: 0.1, clip_low: 0.4, clip_high: 1.2}
+
+locomotion:
+  cadence: {base: 0.4, per_speed: 0.2815, min: 0.4, max: 2.2}
+  phase_warp: {split: 0.696}
+  speed_profile:
+    harmonics: [[0.044, -1.23], [0.141, 2.41]]
+  lateral_profile:
+    harmonics: [[0.08, -1.12], [0.016, 1.4]]
+
+pose:
+  hold: {r: {radius: 0.0125, angle: -60}}  # grip on the cane: radius (m), angle in the palm (deg): along the index finger, toward the little-finger heel
+  walk: {base: walk_rollingcane}
+  run: {same_as: walk}

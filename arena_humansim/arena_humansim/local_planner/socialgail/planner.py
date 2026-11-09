@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
-import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,6 +12,7 @@ from arena_humansim.core.agents import BaseAgent
 from arena_humansim.utils.types import Pose2D
 
 from .. import LocalPlanner
+from ..robot.base import fetch_to_disk
 
 if TYPE_CHECKING:
     from arena_humansim.core.pool import AgentPool
@@ -32,29 +31,13 @@ _DEFAULT_ACTION_DIM = 2
 _GOAL_REFRESH_DIST = 0.1
 _GOAL_V_MIN_NORM = 1e-3
 
-_WEIGHTS_URL = "https://github.com/William-island/SocialGAIL/raw/main/logs/good_models/socialgail/best.pt"
+_WEIGHTS_URL = "https://huggingface.co/arena-rosnav/socialgail/resolve/main/best.pt"
+_WEIGHTS_SHA256 = "528a7e6acedf5c1abb1ca5dfabd2e1e80e6ba8c687861ac51c9df43e90acda0f"
 
 
 def _default_cache_dir() -> Path:
     base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
     return Path(base) / "arena_humansim" / "socialgail"
-
-
-def _fetch_weights(dest: Path, url: str = _WEIGHTS_URL) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=str(dest.parent), delete=False, suffix=".part") as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        with urllib.request.urlopen(url) as resp, tmp_path.open("wb") as out:
-            while True:
-                chunk = resp.read(1 << 16)
-                if not chunk:
-                    break
-                out.write(chunk)
-        tmp_path.replace(dest)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
 
 
 def _try_import_torch() -> tuple:
@@ -134,7 +117,7 @@ class SocialGAILPlanner(LocalPlanner):
         weights = Path(self._weights_path)
         if not weights.exists():
             self._logger.warning(f"Fetching SocialGAIL weights to {weights} from {_WEIGHTS_URL}")
-            _fetch_weights(weights)
+            fetch_to_disk(_WEIGHTS_URL, weights, sha256=_WEIGHTS_SHA256)
 
         try:
             ckpt = torch.load(str(weights), map_location=self._device, weights_only=True)
