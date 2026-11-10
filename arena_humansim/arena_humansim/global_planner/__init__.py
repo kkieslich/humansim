@@ -114,9 +114,11 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
                 distances = min_distances_to_paths(positions, [points for _, _, points in tracked])
                 deviations = dict(zip([agent_id for agent_id, _, _ in tracked], distances.tolist(), strict=True))
         unchanged = {aid for aid, d in deviations.items() if d <= self._replan_distance and self._path_cache[aid][0] == (round(navigate[aid].x, 3), round(navigate[aid].y, 3))}
+        blind = self._blind(unchanged, agent_positions)
+        unchanged -= blind
         straight = [aid for aid, target in navigate.items() if has_map and aid not in unchanged and (pos := agent_positions.get(aid)) is not None and (math.hypot(target.x - pos.x, target.y - pos.y) <= DIRECT_RANGE or (aid in deviations and self._path_cache[aid][3] >= len(self._path_cache[aid][1]) - 2))]
         direct = set(straight)
-        moved = [aid for aid, d in deviations.items() if d <= self._replan_distance and aid not in unchanged and aid not in direct]
+        moved = [aid for aid, d in deviations.items() if d <= self._replan_distance and aid not in unchanged and aid not in direct and aid not in blind]
         legs = straight + moved
         ends = dict(zip(legs, self.snap_terminals([navigate[aid] for aid in legs]), strict=True))
         starts = [agent_positions[aid] for aid in straight] + [waypoints[-2] if len(waypoints := self._path_cache[aid][1]) > 1 else agent_positions[aid] for aid in moved]
@@ -175,6 +177,24 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
 
         self._cached_results = goals
         return goals
+
+    def _blind(self, kept: set[int], positions: dict[int, Pose2D]) -> set[int]:
+        """The agents among `kept` (on their path, within the replan distance) that a wall hides their next waypoint
+        from. Pushed off the path round a corner or a pillar (by the crowd), they would steer into the wall and stay
+        there, as the deviation never reaches the replan distance; they plan anew from where they stand."""
+        if not kept:
+            return set()
+        ids = sorted(kept)
+        starts = np.array([(positions[aid].x, positions[aid].y) for aid in ids], dtype=np.float64)
+        ends = np.empty_like(starts)
+        for k, aid in enumerate(ids):
+            _, waypoints, _, idx = self._path_cache[aid]
+            wp = next_waypoint(waypoints, self.advance_along_path(positions[aid], waypoints, idx))
+            ends[k] = (wp.x, wp.y)
+        if self._wall_grid is None or self._wall_grid[0] is not self._wall_segments:
+            self._wall_grid = (self._wall_segments, WallGrid(self._wall_segments))
+        seen = (cast_rays(self._wall_grid[1], starts, ends - starts, 1.0) >= 1.0) | (np.hypot(*(ends - starts).T) < 1e-6)
+        return {aid for aid, ok in zip(ids, seen.tolist(), strict=True) if not ok}
 
     def _sees(self, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
         """Whether each straight leg is walkable as a whole path."""
