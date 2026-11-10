@@ -25,6 +25,14 @@ _registry: ModuleRegistry[GlobalPlanner] = ModuleRegistry()
 PlanRequest = tuple[int, Pose2D, Pose2D]
 
 DIRECT_RANGE = 3.0
+#: An agent that moves less than this in `stall_time` seconds has stalled [m]
+STALL_M = 0.3
+#: The sides of a passage a route can keep to, relative to the walking direction (`lane_side`)
+LANE_SIDES = ("none", "right", "left")
+#: How far a route's inner corners move to the lane side by default (the node's `global_planner.lane_offset`): Fruin's
+#: 0.76 m walking lane. At a bend both directions wrap the same inner corner; the one with the inside of the bend on its
+#: lane side cannot move further in (the wall), so the other one's offset is all the room between them [m]
+LANE_OFFSET_M = 0.76
 
 
 def simplify_path(
@@ -84,6 +92,11 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         self._cached_results: dict[int, Pose2D] = {}
         self._wall_segments: list[Segment] = []
         self._wall_grid: tuple[list[Segment], WallGrid] | None = None
+        self._radii: dict[int, float] = {}
+        self._dt = 0.05
+        self._tick = 0
+        self._stall_time = 0.0
+        self._progress: dict[int, tuple[float, float, int]] = {}
         self._warmup()
 
     def _warmup(self) -> None:
@@ -100,7 +113,9 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         agents: Iterable[BaseAgent],
         high_level_commands: dict[int, HighLevelCommand],
     ) -> dict[int, Pose2D]:
+        agents = list(agents)
         agent_positions: dict[int, Pose2D] = {agent.state.agent_id: agent.state.pose for agent in agents}
+        self._radii = {agent.state.agent_id: float(getattr(getattr(agent, "params", None), "agent_radius", 0.0) or 0.0) for agent in agents}
         goals: dict[int, Pose2D] = {}
         requests: dict[int, tuple[Pose2D, Pose2D]] = {}
         navigate = {agent_id: cmd.target_pose for agent_id, cmd in high_level_commands.items() if isinstance(cmd, HighLevelCommand) and cmd.type == CommandType.NAVIGATE}
@@ -114,7 +129,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
                 distances = min_distances_to_paths(positions, [points for _, _, points in tracked])
                 deviations = dict(zip([agent_id for agent_id, _, _ in tracked], distances.tolist(), strict=True))
         unchanged = {aid for aid, d in deviations.items() if d <= self._replan_distance and self._path_cache[aid][0] == (round(navigate[aid].x, 3), round(navigate[aid].y, 3))}
-        blind = self._blind(unchanged, agent_positions)
+        blind = self._blind(unchanged, agent_positions) | self._stalled(unchanged, agent_positions)
         unchanged -= blind
         straight = [aid for aid, target in navigate.items() if has_map and aid not in unchanged and (pos := agent_positions.get(aid)) is not None and (math.hypot(target.x - pos.x, target.y - pos.y) <= DIRECT_RANGE or (aid in deviations and self._path_cache[aid][3] >= len(self._path_cache[aid][1]) - 2))]
         direct = set(straight)
@@ -196,6 +211,27 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         seen = (cast_rays(self._wall_grid[1], starts, ends - starts, 1.0) >= 1.0) | (np.hypot(*(ends - starts).T) < 1e-6)
         return {aid for aid, ok in zip(ids, seen.tolist(), strict=True) if not ok}
 
+    def _stalled(self, kept: set[int], positions: dict[int, Pose2D]) -> set[int]:
+        """The agents among `kept` that moved less than `STALL_M` in the last `stall_time` seconds (0: never): stuck in a
+        jam or against a wall, they plan anew, where a congestion-aware planner may find another way. Counts this
+        `compute` as one tick."""
+        self._tick += 1
+        if self._stall_time <= 0.0:
+            return set()
+        for aid in [a for a in self._progress if a not in positions]:
+            del self._progress[aid]
+        window = max(1, round(self._stall_time / self._dt))
+        out: set[int] = set()
+        for aid, pos in positions.items():
+            anchor = self._progress.get(aid)
+            if anchor is None or math.hypot(pos.x - anchor[0], pos.y - anchor[1]) > STALL_M:
+                self._progress[aid] = (pos.x, pos.y, self._tick)
+            elif self._tick - anchor[2] >= window:
+                self._progress[aid] = (pos.x, pos.y, self._tick)
+                if aid in kept:
+                    out.add(aid)
+        return out
+
     def _sees(self, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
         """Whether each straight leg is walkable as a whole path."""
         if self._wall_grid is None or self._wall_grid[0] is not self._wall_segments:
@@ -217,8 +253,18 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         self._path_cache.clear()
         self._cached_results = {}
 
-    def configure(self, *, inflation_radius: float, resolution: float, comfort_radius: float) -> None:
-        pass
+    def configure(self, *, inflation_radius: float, resolution: float, comfort_radius: float, **_: Any) -> None:  # noqa: ANN401
+        """Planner settings; a planner ignores the ones it has no use for (the grid planners: clearance margin, lanes)."""
+
+    def set_timing(self, dt: float, stall_time: float) -> None:
+        """The sim time between two `compute` calls (the behaviour-tree tick, dt x bt_tick_interval), and how long an agent
+        may make no progress before it plans anew (0: never); the stall and congestion windows hold in sim seconds."""
+        self._dt = float(dt)
+        self._stall_time = float(stall_time)
+
+    def _radius_of(self, agent_id: int) -> float:
+        """The radius of an agent the last `compute` saw, 0 for one it did not."""
+        return self._radii.get(agent_id, 0.0)
 
     def snap_terminal(self, pose: Pose2D) -> Pose2D:
         return pose

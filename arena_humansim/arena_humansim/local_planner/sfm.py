@@ -171,6 +171,10 @@ class SFMPlanner(LocalPlanner):
         "repulsion_strength": ParamDist(2.1, 0.2),
         "repulsion_range": ParamDist(0.3, 0.03),
         "anisotropy": ParamDist(0.5, 0.0),
+        # sideways share of the push from a walker coming towards one, to the planner's `side` (the node's
+        # global_planner.lane_side): both sidestep the same way and pass, as walkers with a side preference do (Helbing &
+        # Molnár 1995; Moussaïd et al. 2009), instead of pushing each other back head-on
+        "side_bias": ParamDist(0.5, 0.0),
     }
 
     def __init__(
@@ -180,6 +184,8 @@ class SFMPlanner(LocalPlanner):
     ):
         self.wall_repulsion_strength = wall_repulsion_strength
         self.wall_repulsion_range = wall_repulsion_range
+        #: the side walkers sidestep to from an oncoming neighbour: +1 right, -1 left, 0 never (`set_side`)
+        self.side = 0.0
         self._wall_segments: Segments = []
         self._wall_segments_np: np.ndarray = np.empty((0, 2, 2), dtype=np.float64)
         self._wall_p1: np.ndarray = np.empty((0, 2), dtype=np.float64)
@@ -198,6 +204,7 @@ class SFMPlanner(LocalPlanner):
         self._repulsion_strength = np.zeros(0, dtype=np.float64)
         self._repulsion_range = np.zeros(0, dtype=np.float64)
         self._anisotropy = np.zeros(0, dtype=np.float64)
+        self._side_bias = np.zeros(0, dtype=np.float64)
         self._warmup()
 
     def _warmup(self) -> None:
@@ -256,12 +263,18 @@ class SFMPlanner(LocalPlanner):
         self._repulsion_strength = np.zeros(cap, dtype=np.float64)
         self._repulsion_range = np.zeros(cap, dtype=np.float64)
         self._anisotropy = np.zeros(cap, dtype=np.float64)
+        self._side_bias = np.zeros(cap, dtype=np.float64)
 
     def on_pool_grow(self, new_capacity: int, old_capacity: int) -> None:
         self._relaxation_time = _resize_1d(self._relaxation_time, new_capacity, old_capacity)
         self._repulsion_strength = _resize_1d(self._repulsion_strength, new_capacity, old_capacity)
         self._repulsion_range = _resize_1d(self._repulsion_range, new_capacity, old_capacity)
         self._anisotropy = _resize_1d(self._anisotropy, new_capacity, old_capacity)
+        self._side_bias = _resize_1d(self._side_bias, new_capacity, old_capacity)
+
+    def set_side(self, lane_side: str) -> None:
+        """The side walkers sidestep to from an oncoming neighbour: right, left or none."""
+        self.side = {"right": 1.0, "left": -1.0}.get(lane_side, 0.0)
 
     def _param(self, lp: dict, key: str) -> float:
         try:
@@ -275,6 +288,7 @@ class SFMPlanner(LocalPlanner):
         self._repulsion_strength[idx] = self._param(lp, "repulsion_strength")
         self._repulsion_range[idx] = self._param(lp, "repulsion_range")
         self._anisotropy[idx] = self._param(lp, "anisotropy")
+        self._side_bias[idx] = self._param(lp, "side_bias")
 
     def on_pool_update(self, idx: int, agent: BaseAgent) -> None:
         self.on_pool_add(idx, agent)
@@ -284,6 +298,7 @@ class SFMPlanner(LocalPlanner):
         self._repulsion_strength[idx] = self._repulsion_strength[last]
         self._repulsion_range[idx] = self._repulsion_range[last]
         self._anisotropy[idx] = self._anisotropy[last]
+        self._side_bias[idx] = self._side_bias[last]
 
     def on_pool_reset(self) -> None:
         pass
@@ -397,6 +412,13 @@ class SFMPlanner(LocalPlanner):
             magnitudes *= w
 
             pair_forces = magnitudes[:, None] * normals
+            bias = self._side_bias[:n][pair_obs] * self.side
+            if self.side != 0.0 and np.any(bias != 0.0):
+                # a neighbour ahead that walks towards one: a sideways push to one's preferred side
+                e_i = e_goal[pair_obs]
+                oncoming = (cos_phi > 0.0) & (np.sum(vel[pair_nbr] * e_i, axis=1) < 0.0) & has_goal[pair_obs]
+                side = np.column_stack([e_i[:, 1], -e_i[:, 0]])
+                pair_forces = pair_forces + (magnitudes * bias * oncoming)[:, None] * side
             np.add.at(f_rep, pair_obs, pair_forces)
 
         f_wall = self._compute_wall_forces_vectorized(pos, radii, pool.theta[:n], pool.axial_offset[:n])
