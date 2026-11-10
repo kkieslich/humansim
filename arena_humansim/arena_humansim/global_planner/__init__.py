@@ -253,7 +253,8 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         """Planner settings; a planner ignores the ones it has no use for (the grid planners: clearance margin, lanes)."""
 
     def set_timing(self, dt: float, stall_time: float) -> None:
-        """The tick length `compute` runs at, and how long an agent may make no progress before it plans anew (0: never)."""
+        """The sim time between two `compute` calls (the behaviour-tree tick, dt x bt_tick_interval), and how long an agent
+        may make no progress before it plans anew (0: never); the stall and congestion windows hold in sim seconds."""
         self._dt = float(dt)
         self._stall_time = float(stall_time)
 

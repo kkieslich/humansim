@@ -1129,7 +1129,8 @@ class AgentManager(Node):
             lane_offset=self._float_param("global_planner.lane_offset"),
             congestion_interval=self._float_param("global_planner.congestion_interval"),
         )
-        self._global_planner.set_timing(self._dt, self._float_param("global_planner.stall_time"))
+        # the global planner runs on behaviour-tree ticks: its windows count calls of dt * bt_tick_interval seconds
+        self._global_planner.set_timing(self._dt * self._bt_tick_interval, self._float_param("global_planner.stall_time"))
         for planner in getattr(self, "_policies", ()):
             self._set_side(planner)
 
