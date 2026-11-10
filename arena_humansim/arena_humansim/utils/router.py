@@ -43,6 +43,7 @@ class Router:
         self._trees: dict[tuple[float, float], tuple[np.ndarray, np.ndarray]] = {}
         self._index, self._walls = mesh.index, mesh.con_edges
         self._blocked = np.zeros(0, np.int64)
+        self._slow: np.ndarray | None = None
         self._graph()
 
     def set_blocked(self, edges: np.ndarray) -> None:
@@ -53,6 +54,13 @@ class Router:
         if len(self._blocked):
             self._walls = np.vstack([mesh.con_edges, np.column_stack([mesh.ea[self._blocked], mesh.eb[self._blocked]])])
             self._index = SegIndex(mesh.P[self._walls[:, 0]], mesh.P[self._walls[:, 1]])
+        self._trees.clear()
+        self._graph()
+
+    def set_congestion(self, slowdown: np.ndarray | None) -> None:
+        """Weigh each step through the mesh by how much slower walkers move at its ends: `slowdown` per mesh edge (1 at
+        free flow), an arc costing its length times the mean of its two edges'. None restores plain lengths."""
+        self._slow = None if slowdown is None else np.maximum(np.asarray(slowdown, dtype=np.float64), 1.0)
         self._trees.clear()
         self._graph()
 
@@ -68,6 +76,8 @@ class Router:
         m = (mesh.arc_w >= 2 * self.r - 1e-9) & self._open[mesh.arc_a] & self._open[mesh.arc_b]
         a, b = mesh.arc_a[m], mesh.arc_b[m]
         c = mesh.arc_c[m]
+        if self._slow is not None:
+            c = c * 0.5 * (self._slow[a] + self._slow[b])
         src, dst, cst = np.concatenate([a, b]), np.concatenate([b, a]), np.concatenate([c, c])
         order = np.argsort(src, kind="stable")
         src, dst, cst = src[order], dst[order], cst[order]

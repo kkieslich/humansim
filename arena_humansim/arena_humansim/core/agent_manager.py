@@ -99,7 +99,7 @@ from arena_humansim.core.spawn_scheduler import SpawnScheduler
 from arena_humansim.core.teleport_zones import TeleportZones, Zone
 from arena_humansim.core.viz import MarkerPublisher, publish_infrastructure, publish_module_markers
 from arena_humansim.core.world_knowledge import FormationSpec, WorldKnowledge, WorldObject
-from arena_humansim.global_planner import GlobalPlanner
+from arena_humansim.global_planner import LANE_SIDES, GlobalPlanner
 from arena_humansim.local_planner import LocalPlanner
 from arena_humansim.occlusion import Occluder
 from arena_humansim.perception import Perception
@@ -261,6 +261,11 @@ _RECONFIGURABLE_PARAMS = _TUNABLE_PARAMS | {
     "global_planner.inflation_radius",
     "global_planner.resolution",
     "global_planner.comfort_radius",
+    "global_planner.clearance_margin",
+    "global_planner.lane_side",
+    "global_planner.lane_offset",
+    "global_planner.congestion_interval",
+    "global_planner.stall_time",
     "local_planner",
     "publish_markers",
     "rtf",
@@ -447,6 +452,34 @@ class AgentManager(Node):
             "global_planner.comfort_radius",
             0.6,
             ParameterDescriptor(description="preferred wall clearance of navmesh paths [m], relaxed in narrow passages", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=5.0)]),
+        )
+        self.declare_parameter(
+            "global_planner.clearance_margin",
+            0.25,
+            ParameterDescriptor(
+                description="navmesh: each agent routes with its own radius plus this margin from the walls where a route keeps it, else with the inflation radius [m]; 0.25 lies between the 0.20 m (corridor walls) and 0.46 m (wide concourses) boundary layers of Pauls' effective-width model",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0)],
+            ),
+        )
+        self.declare_parameter(
+            "global_planner.lane_side",
+            "right",
+            ParameterDescriptor(description="navmesh: the side of a passage a route keeps to, relative to the walking direction (right, left, none); a consistent side preference makes counter-flows separate into lanes (Helbing et al. 2001; Moussaïd et al. 2009)"),
+        )
+        self.declare_parameter(
+            "global_planner.lane_offset",
+            0.38,
+            ParameterDescriptor(description="navmesh: how far a route's inner corners move to the lane side where the clearance allows [m]; 0.38 is half Fruin's 0.76 m walking lane, so the two directions keep one lane apart", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0)]),
+        )
+        self.declare_parameter(
+            "global_planner.congestion_interval",
+            5.0,
+            ParameterDescriptor(description="navmesh: every this many seconds routes weigh each passage by how much slower walkers move there at its current density, by Weidmann's speed-density relation (0: off) [s]", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=600.0)]),
+        )
+        self.declare_parameter(
+            "global_planner.stall_time",
+            8.0,
+            ParameterDescriptor(description="an agent that moves less than 0.3 m in this long plans its route anew (0: never) [s]", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=600.0)]),
         )
         self.declare_parameter("local_planner", "sfm")
         self.declare_parameter("force_local_planner", False)
@@ -946,6 +979,8 @@ class AgentManager(Node):
         for name, registry in (("local_planner", LocalPlanner), ("global_planner", GlobalPlanner)):
             if name in incoming and incoming[name] not in registry.list_available():
                 return SetParametersResult(successful=False, reason=f"{name}: unknown module {incoming[name]!r}, available: {', '.join(registry.list_available())}")
+        if "global_planner.lane_side" in incoming and incoming["global_planner.lane_side"] not in LANE_SIDES:
+            return SetParametersResult(successful=False, reason=f"global_planner.lane_side must be one of {', '.join(LANE_SIDES)}, not {incoming['global_planner.lane_side']!r}")
         return SetParametersResult(successful=True)
 
     def set_parameters_atomically(self, parameter_list: list[Parameter]) -> SetParametersResult:
@@ -1088,7 +1123,12 @@ class AgentManager(Node):
             inflation_radius=self._float_param("global_planner.inflation_radius"),
             resolution=self._float_param("global_planner.resolution"),
             comfort_radius=self._float_param("global_planner.comfort_radius"),
+            clearance_margin=self._float_param("global_planner.clearance_margin"),
+            lane_side=str(self.get_parameter("global_planner.lane_side").value),
+            lane_offset=self._float_param("global_planner.lane_offset"),
+            congestion_interval=self._float_param("global_planner.congestion_interval"),
         )
+        self._global_planner.set_timing(self._dt, self._float_param("global_planner.stall_time"))
 
     def _attach_late(self, planner: LocalPlanner | GlobalPlanner) -> None:
         """Wire a planner created after __init__ into the pool and the walls."""
