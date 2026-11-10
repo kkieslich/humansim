@@ -457,7 +457,7 @@ class AgentManager(Node):
             "global_planner.clearance_margin",
             0.25,
             ParameterDescriptor(
-                description="navmesh: each agent routes with its own radius plus this margin from the walls where a route keeps it, else with the inflation radius [m]; 0.25 lies between the 0.20 m (corridor walls) and 0.46 m (wide concourses) boundary layers of Pauls' effective-width model",
+                description="navmesh: each agent routes with its own radius plus this margin from the walls where a route keeps it, else with the inflation radius; 0 routes every agent with the inflation radius [m]; 0.25 lies between the 0.20 m (corridor walls) and 0.46 m (wide concourses) boundary layers of Pauls' effective-width model",
                 floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0)],
             ),
         )

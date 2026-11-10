@@ -141,7 +141,7 @@ class NavMeshPlanner(GlobalPlanner):
         """The clearance an agent of `agent_radius` plans with: its radius plus the clearance margin, at least the
         inflation radius, rounded up to `CLEARANCE_STEP` and at most half the mesh's width cap."""
         wanted = agent_radius + self._margin
-        if wanted <= self._inflation_radius + 1e-9:
+        if self._margin <= 0.0 or wanted <= self._inflation_radius + 1e-9:  # margin 0: every agent at the inflation radius, as before
             return self._inflation_radius
         r = math.ceil(wanted / CLEARANCE_STEP - 1e-9) * CLEARANCE_STEP
         if self._mesh is not None:
