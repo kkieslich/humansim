@@ -29,6 +29,10 @@ DIRECT_RANGE = 3.0
 STALL_M = 0.3
 #: The sides of a passage a route can keep to, relative to the walking direction (`lane_side`)
 LANE_SIDES = ("none", "right", "left")
+#: How far a route's inner corners move to the lane side by default (the node's `global_planner.lane_offset`): Fruin's
+#: 0.76 m walking lane. At a bend both directions wrap the same inner corner; the one with the inside of the bend on its
+#: lane side cannot move further in (the wall), so the other one's offset is all the room between them [m]
+LANE_OFFSET_M = 0.76
 
 
 def simplify_path(

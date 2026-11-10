@@ -99,7 +99,7 @@ from arena_humansim.core.spawn_scheduler import SpawnScheduler
 from arena_humansim.core.teleport_zones import TeleportZones, Zone
 from arena_humansim.core.viz import MarkerPublisher, publish_infrastructure, publish_module_markers
 from arena_humansim.core.world_knowledge import FormationSpec, WorldKnowledge, WorldObject
-from arena_humansim.global_planner import LANE_SIDES, GlobalPlanner
+from arena_humansim.global_planner import LANE_OFFSET_M, LANE_SIDES, GlobalPlanner
 from arena_humansim.local_planner import LocalPlanner
 from arena_humansim.occlusion import Occluder
 from arena_humansim.perception import Perception
@@ -468,8 +468,8 @@ class AgentManager(Node):
         )
         self.declare_parameter(
             "global_planner.lane_offset",
-            0.38,
-            ParameterDescriptor(description="navmesh: how far a route's inner corners move to the lane side where the clearance allows [m]; 0.38 is half Fruin's 0.76 m walking lane, so the two directions keep one lane apart", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0)]),
+            LANE_OFFSET_M,
+            ParameterDescriptor(description="navmesh: how far a route's inner corners move to the lane side where the clearance allows (the whole offset, half of it, or none) [m]; 0.76 is Fruin's walking lane: at a bend both directions wrap the same inner corner and only the one turning away from its lane side can move, so its offset is all the room between them", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0)]),
         )
         self.declare_parameter(
             "global_planner.congestion_interval",
