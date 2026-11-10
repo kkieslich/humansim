@@ -55,6 +55,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetWaypoints.srv"
   "srv/SetZoneAccess.srv"
   "srv/SpawnAgents.srv"
+  "srv/StartClock.srv"
   "srv/TeleportAgents.srv"
   "srv/GetProfile.srv"
   "srv/UpdateRobot.srv"

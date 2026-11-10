@@ -1,0 +1,6 @@
+# Subsystem mode with `start_on_request`: start ticking at `epoch` after a reset or remove-all held the clock.
+# The first tick is stamped `epoch`, tick k `epoch + k * dt`, however the clock reached it.
+builtin_interfaces/Time epoch
+---
+bool success
+string message
