@@ -597,6 +597,7 @@ class AgentManager(Node):
         self._policy_names = [self._module_selections["local_planner"]]
         self._policy_name_to_idx = {self._module_selections["local_planner"]: 0}
         self._policies = [self._local_planner]
+        self._set_side(self._local_planner)
         self._interaction_manager = InteractionManager(rng_manager=self._rng)
         self._interaction_manager.set_contact_mode(
             str(self.get_parameter("contact_mode").value),
@@ -1129,6 +1130,13 @@ class AgentManager(Node):
             congestion_interval=self._float_param("global_planner.congestion_interval"),
         )
         self._global_planner.set_timing(self._dt, self._float_param("global_planner.stall_time"))
+        for planner in getattr(self, "_policies", ()):
+            self._set_side(planner)
+
+    def _set_side(self, planner: object) -> None:
+        """The lane side for a local planner that sidesteps oncoming walkers (`set_side`)."""
+        if hasattr(planner, "set_side"):
+            planner.set_side(str(self.get_parameter("global_planner.lane_side").value))
 
     def _attach_late(self, planner: LocalPlanner | GlobalPlanner) -> None:
         """Wire a planner created after __init__ into the pool and the walls."""
@@ -1138,6 +1146,7 @@ class AgentManager(Node):
         segments = self._all_wall_segments()
         if segments:
             planner.set_walls(segments)
+        self._set_side(planner)
 
     def _resolve_policy_idx(self, name: str) -> int:
         if not name:

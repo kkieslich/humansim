@@ -317,6 +317,10 @@ class NavMeshPlanner(GlobalPlanner):
             return plans
         snapped = self.snap_terminal(entries[0][2])
         goal = np.array([snapped.x, snapped.y])
+        if router is not self._router:
+            # a target closer to a wall than this clearance: route to the nearest point that keeps it, then step on
+            near = router.snap(goal)
+            goal = goal if near is None else near
         starts = np.array([start for _, _, _, start in entries])
         framed = self._inside(starts)
         beyond = (framed != starts).any(axis=1) | (self._inside(goal) != goal).any()
