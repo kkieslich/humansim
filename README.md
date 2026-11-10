@@ -200,6 +200,7 @@ Config format and stage semantics: [`config/benchmark/README.md`](arena_humansim
 | Parameter | Default | Description |
 |---|---|---|
 | `mode` | `master` | `master` owns `/clock` and ticks on a wall timer, `subsystem` ticks on `/clock` |
+| `start_on_request` | `false` | `subsystem` only: after a reset or remove-all no tick runs until `start_clock` gives the epoch, instead of the first `/clock` after it |
 | `seed` | `0` | RNG seed for deterministic runs |
 | `dt` | `0.05` | Simulation timestep (s) |
 | `bt_tick_interval` | `5` | BT ticks every N sim ticks |
@@ -236,6 +237,7 @@ A `set_parameters` call on a running node is validated and stored at once and ta
 | `local_planner.<key>` | Mean of a local planner param (`relaxation_time`, `repulsion_strength`, ...). It replaces the mean of the agent type and keeps its spread. `0` leaves the agent type's own value. Declared for the keys of the startup planner and of every planner selected through `local_planner` |
 | `waypoint_threshold`, `min_speed_for_heading`, `arrival_r_enter`, `arrival_r_exit`, `arrival_tau_brake`, `zone_wait_timeout`, `zone_let_out_timeout`, `force_local_planner`, `profile_phases`, `profile_interval` | The node re-reads them. `arrival_r_enter` must stay below `arrival_r_exit` |
 | `publish_markers` | The marker level changes. `0` deletes the published markers |
+| `start_on_request` | Nothing at a soft `reset`. The next plain `reset` or `remove_agents` with no ids holds the clock (`true`) or takes the next `/clock` as the epoch (`false`) |
 | `seed` | Nothing at a soft `reset`, which keeps the RNG. The next plain `reset` or `remove_agents` with no ids re-roots every stream on it, so the next crowd draws as a first crowd with that seed does |
 | `rtf` | Master mode only, retimes the tick timer |
 
@@ -253,7 +255,7 @@ Re-seating moves every live agent that follows the defaults onto the current loc
 
 **Subscribes:**
 - `world_state` (`AgentStates`) - poses of externally driven robots and possessed pedestrians. A robot fed without a velocity takes the one between its last two poses, from their header stamps: zero when the stamps are more than 0.2 s apart or do not advance, or when the pose jumped faster than 10 m/s. It keeps that velocity for 0.2 s after the last message. A robot declared in the scenario moves by the feed alone while it is fed, and its own policy takes over again 2 s after the last message
-- `/clock` (subsystem mode) drives the tick: every message runs the ticks its sim time has covered since the epoch, so a held clock cannot starve the engine
+- `/clock` (subsystem mode) drives the tick: every message runs the ticks its sim time has covered since the epoch, so a held clock cannot starve the engine. The epoch is the first `/clock` after a reset or remove-all, or with `start_on_request` the one `start_clock` gives
 
 **Services:**
 - `spawn_agents`, `remove_agents` — direct agent control
@@ -265,6 +267,7 @@ Re-seating moves every live agent that follows the defaults onto the current loc
 - `set_flow` — bulk configure sources, sinks, walls
 - `notify_stimulus` - drive a need on one agent (or `-1` for all) after its reaction time, a broadcast level also seeds agents spawned later
 - `reset` - clear all simulation state, or with `soft: true` keep it and only apply stored params, re-seat agents, and prune unused planners
+- `start_clock` (`StartClock`) - with `start_on_request`, start the clock held since the last reset or remove-all: the first tick is stamped `epoch`, tick k `epoch + k * dt`, catching up when the clock is already past it. An orchestrator whose episode starts some way after its reset gives its start here, so the same seed gives the same crowd at the same times after it. Refused while ticking
 
 ## Development
 
