@@ -27,6 +27,9 @@ CONGESTION_RADIUS = 1.5
 CONGESTION_CAP = 20.0
 #: The smallest body radius a lane assumes
 MIN_BODY_RADIUS = 0.15
+#: A walker pushed off its route's floor gets back along the route its body fits within this distance [m], checked every
+#: `ESCAPE_STEP` [m]
+ESCAPE_M, ESCAPE_STEP = 3.0, 0.1
 
 
 def _keys(segs: np.ndarray) -> set[tuple[float, ...]]:
@@ -58,6 +61,8 @@ class NavMeshPlanner(GlobalPlanner):
         self._mesh: Mesh | None = None
         self._router: Router | None = None
         self._routers: dict[float, Router] = {}
+        self._body_routers: dict[float, Router] = {}
+        self._routed: dict[int, tuple[float, float]] = {}
         self._blocked_edges = np.zeros(0, np.int64)
         self._meshed: set[tuple[float, ...]] = set()
         self._snapped: dict[tuple[float, float], tuple[float, float] | None] = {}
@@ -88,6 +93,8 @@ class NavMeshPlanner(GlobalPlanner):
         if (margin, side, offset) != (self._margin, self._lane_side, self._lane_offset):
             self._margin, self._lane_side, self._lane_offset = margin, side, offset
             self._routers.clear()
+            self._body_routers.clear()
+            self._routed.clear()
             self._forget_paths()
         if (inflation_radius, comfort_radius) == (self._inflation_radius, self._comfort_radius):
             return
@@ -108,6 +115,8 @@ class NavMeshPlanner(GlobalPlanner):
         self._mesh = None
         self._router = None
         self._routers = {}
+        self._body_routers = {}
+        self._routed = {}
         self._blocked_edges = np.zeros(0, np.int64)
         self._slowdown = None
         if not len(segs):
@@ -131,7 +140,7 @@ class NavMeshPlanner(GlobalPlanner):
         if (edges < 0).any():
             return False
         self._router.set_blocked(edges)
-        for router in self._routers.values():
+        for router in (*self._routers.values(), *self._body_routers.values()):
             router.set_blocked(edges)
         self._blocked_edges = edges
         self._logger.info(f"Walls blocked on the mesh: {len(edges)} edge(s), {(time.perf_counter() - began) * 1e3:.0f} ms")
@@ -162,8 +171,28 @@ class NavMeshPlanner(GlobalPlanner):
             self._routers[clearance] = router
         return self._routers[clearance]
 
+    def body_clearance(self, agent_radius: float) -> float | None:
+        """The clearance of an agent's last resort route: its body radius (at least `MIN_BODY_RADIUS`) rounded up to
+        `CLEARANCE_STEP`; None where that is no narrower than the inflation radius, which the agent tries before."""
+        r = round(math.ceil(max(agent_radius, MIN_BODY_RADIUS) / CLEARANCE_STEP - 1e-9) * CLEARANCE_STEP, 6)
+        return r if r < self._inflation_radius - 1e-9 else None
+
+    def _body_router(self, clearance: float) -> Router:
+        """The router that keeps only `clearance`, below the inflation radius, from the walls, built on first use. Its
+        routes take plain lengths: they only get a walker back to where its own route starts (`_escape`)."""
+        assert self._mesh is not None
+        if clearance not in self._body_routers:
+            router = Router(self._mesh, clearance, self._comfort_radius)
+            if len(self._blocked_edges):
+                router.set_blocked(self._blocked_edges)
+            self._body_routers[clearance] = router
+        return self._body_routers[clearance]
+
     def compute(self, agents, high_level_commands):  # noqa: ANN001, ANN201 - as GlobalPlanner.compute
         agents = list(agents)
+        if self._routed:
+            present = {a.state.agent_id for a in agents}
+            self._routed = {aid: key for aid, key in self._routed.items() if aid in present}
         if self._router is not None and self._congestion_interval > 0.0:
             self._congestion_tick += 1
             if self._congestion_tick >= max(1, round(self._congestion_interval / self._dt)):
@@ -198,8 +227,8 @@ class NavMeshPlanner(GlobalPlanner):
         """`polyline` with its inner corners moved `lane_offset` to the lane side, so walkers in opposite directions keep
         to opposite sides of a passage instead of meeting head-on on one line. A corner moves as far as its walkers'
         bodies keep `LANE_WALL_GAP` from the walls (their clearance without the margin): the full offset, half of it,
-        or not at all. The ends stay."""
-        if self._lane_side == "none" or self._lane_offset <= 0.0 or len(polyline) < 3:
+        or not at all. The ends stay. A body-radius route (`_escape`) keeps no lane."""
+        if self._lane_side == "none" or self._lane_offset <= 0.0 or len(polyline) < 3 or router.r < self._inflation_radius - 1e-9:
             return polyline
         body = max(router.r - self._margin, MIN_BODY_RADIUS) + LANE_WALL_GAP
         sign = 1.0 if self._lane_side == "right" else -1.0
@@ -302,8 +331,53 @@ class NavMeshPlanner(GlobalPlanner):
                 missing = [entry for entry in group if found.get(entry[0]) is None]
                 if missing:
                     found.update(self._plan_group(self._router, missing))
+            for agent_id, _, target in group:
+                if found.get(agent_id) is not None:
+                    self._routed[agent_id] = (round(target.x, 3), round(target.y, 3))
+            for agent_id, agent_pos, target in group:
+                if found.get(agent_id) is None and (way := self._escape(agent_id, agent_pos, target, clearance)) is not None:
+                    found[agent_id] = way
             plans.update(found)
         return plans
+
+    def _escape(self, agent_id: int, agent_pos: Pose2D, target: Pose2D, clearance: float) -> list[Pose2D] | None:
+        """The way back for an agent the crowd pushed off the floor its route keeps, into a gap narrower than the
+        inflation radius (a niche in a wall, between a pillar and a wall), where no route at its `clearance` or the
+        inflation radius starts: along the route its body fits (`body_clearance`) to the first point within `ESCAPE_M`
+        that keeps the inflation radius and reaches the target from there, then on by its own route. Without it, the
+        agent walks straight at its target into the wall, or stands in the niche, for good. Only for an agent that had a
+        route to this target before, so a target behind a door narrower than the inflation radius stays out of reach.
+        None where there is no such way."""
+        assert self._router is not None
+        body = self.body_clearance(self._radius_of(agent_id))
+        if body is None or self._routed.get(agent_id) != (round(target.x, 3), round(target.y, 3)):
+            return None
+        snapped = self.snap_terminal(target)
+        goal = np.array([snapped.x, snapped.y], dtype=np.float64)
+        reach = self._router.components(goal[None])[0]
+        router = self._body_router(body)
+        start = router.snap(np.array([agent_pos.x, agent_pos.y], dtype=np.float64))
+        end = router.snap(goal)
+        route = None if start is None or end is None or not reach else router.plan(start, end, try_line_of_sight=False)
+        if route is None:
+            return None
+        line = route[0]
+        along = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(line, axis=0).T))])
+        at = np.arange(ESCAPE_STEP, min(ESCAPE_M, along[-1]) + 1e-9, ESCAPE_STEP)
+        pts = np.column_stack([np.interp(at, along, line[:, 0]), np.interp(at, along, line[:, 1])])
+        if not len(pts):
+            return None
+        keeps = self._router.clearance(pts) >= self._router.r - VERIFY_EPS
+        back = next((i for i, comp in enumerate(self._router.components(pts)) if keeps[i] and comp & reach), None)
+        if back is None:
+            return None
+        out = Pose2D(x=float(pts[back, 0]), y=float(pts[back, 1]))
+        entry = [(agent_id, out, target)]
+        rest = self._plan_group(self._router_for(clearance), entry).get(agent_id) or self._plan_group(self._router, entry).get(agent_id)
+        if rest is None:
+            return None
+        head = [Pose2D(x=float(x), y=float(y)) for x, y in line[1 : int(np.searchsorted(along, at[back]))]]
+        return [Pose2D(x=agent_pos.x, y=agent_pos.y), *head, *rest]
 
     def _plan_group(self, router: Router, group: list[tuple[int, Pose2D, Pose2D]]) -> dict[int, list[Pose2D] | None]:
         """Routes for agents with one target, by `router`'s clearance, their inner corners on the lane side."""
