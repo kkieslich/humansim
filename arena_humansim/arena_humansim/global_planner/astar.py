@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
-
 import math
 import os
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import numpy as np
 import pyastar2d
