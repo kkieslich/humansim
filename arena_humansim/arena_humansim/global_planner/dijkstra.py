@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
-
 import math
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 from scipy.ndimage import binary_dilation
