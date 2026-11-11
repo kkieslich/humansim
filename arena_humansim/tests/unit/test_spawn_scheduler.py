@@ -336,8 +336,8 @@ def _area(poly: list[tuple[float, float]]) -> float:
     return abs(sum(poly[i][0] * poly[(i + 1) % len(poly)][1] - poly[(i + 1) % len(poly)][0] * poly[i][1] for i in range(len(poly)))) / 2.0
 
 
-# An entrance square cut to the floor along an alcove wall (the INFRA twin's Bras Basah 1), relative to its vertex mean: concave,
-# so the fan from its first vertex reaches outside it.
+# An entrance square cut to the floor along an alcove wall (the INFRA twin's Bras Basah 1), in the world frame: concave, so
+# the fan from its first vertex reaches outside it.
 CUT = [(153.31, 81.48), (153.31, 85.48), (156.68, 85.48), (156.2, 85.11), (156.21, 84.49), (155.76, 84.43), (155.46, 83.99), (155.54, 83.6), (155.71, 83.4), (155.73, 83.17), (155.93, 82.83), (156.07, 82.72), (156.41, 82.64), (156.41, 82.13), (156.04, 81.51)]
 L_SHAPE = [(0.0, 0.0), (4.0, 0.0), (4.0, 1.0), (1.0, 1.0), (1.0, 4.0), (0.0, 4.0)]
 
@@ -375,9 +375,34 @@ def test_every_spawn_in_a_concave_source_lands_inside_it(rng) -> None:
 def test_spawns_in_a_concave_source_spread_over_it_by_area(rng) -> None:
     sched = SpawnScheduler(rng.get_substream("sched"))
     center = Pose2D(x=0.0, y=0.0)
-    vertices = [Pose2D(x=x, y=y) for x, y in L_SHAPE]
+    # reversed, the L's fan from its first vertex (0, 6) reaches outside it
+    vertices = [Pose2D(x=x, y=y) for x, y in reversed(L_SHAPE)]
     draws = [sched._sample_pose_in_polygon(vertices, center) for _ in range(8000)]
     assert all(_inside(p.x, p.y, L_SHAPE) for p in draws)
     # the arm along x (x > 1) holds 3 of the shape's 7 m2
     share = sum(p.x > 1.0 for p in draws) / len(draws)
     assert share == pytest.approx(3.0 / 7.0, abs=0.02)
+
+
+@pytest.mark.parametrize(
+    ("ring", "area"),
+    [
+        ([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (2.0, 1.0), (2.0, 2.0), (1.0, 2.0), (1.0, 1.0), (0.0, 1.0)], 2.0),  # two squares touching at a corner
+        ([(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 2.0), (1.0, 2.0), (1.0, 3.0), (3.0, 3.0), (3.0, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0)], 12.0),  # a keyhole
+    ],
+)
+def test_a_self_touching_ring_is_ear_clipped_to_its_area(ring: list[tuple[float, float]], area: float) -> None:
+    from arena_humansim.core.spawn_scheduler import _triangulate
+
+    triangles = _triangulate([Pose2D(x=x, y=y) for x, y in ring])
+    assert sum(abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) / 2.0 for a, b, c in triangles) == pytest.approx(area)
+
+
+def test_a_convex_polygon_with_a_float32_edge_midpoint_keeps_the_fan() -> None:
+    from arena_humansim.core.spawn_scheduler import _triangulate
+
+    angle = 0.37
+    ux, uy, vx, vy = math.cos(angle), math.sin(angle), -math.sin(angle), math.cos(angle)
+    corners = [(0.0, 0.0), (3.0, 0.0), (3.0, 1.0), (1.5, 1.0), (0.0, 1.0)]
+    ring = [Pose2D(x=float(np.float32(100.0 + a * ux + b * vx)), y=float(np.float32(50.0 + a * uy + b * vy))) for a, b in corners]
+    assert _triangulate(ring) == [(ring[0], ring[i], ring[i + 1]) for i in range(1, len(ring) - 1)]

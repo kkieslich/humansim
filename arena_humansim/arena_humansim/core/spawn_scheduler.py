@@ -263,12 +263,15 @@ def _cross(o: Pose2D, a: Pose2D, b: Pose2D) -> float:
 
 def _triangulate(vertices: Sequence[Pose2D]) -> list[tuple[Pose2D, Pose2D, Pose2D]]:
     """Triangles that cover a simple polygon exactly: the fan from the first vertex for a convex polygon (as before), ear
-    clipping for a concave one, whose fan would reach outside it and count some of its area twice. A polygon ear clipping
-    cannot reduce (self-intersecting) keeps the fan."""
+    clipping for a concave one, whose fan would reach outside it and count some of its area twice. Turns within float32
+    noise of straight count as convex. A polygon ear clipping cannot reduce keeps the fan; a self-intersecting polygon
+    is not covered exactly either way."""
     n = len(vertices)
     fan = [(vertices[0], vertices[i], vertices[i + 1]) for i in range(1, n - 1)]
     turns = [_cross(vertices[i - 1], vertices[i], vertices[(i + 1) % n]) for i in range(n)]
-    if all(t >= 0.0 for t in turns) or all(t <= 0.0 for t in turns):
+    extent = max(max(v.x for v in vertices) - min(v.x for v in vertices), max(v.y for v in vertices) - min(v.y for v in vertices))
+    tol = 1e-9 * extent * extent
+    if all(t >= -tol for t in turns) or all(t <= tol for t in turns):
         return fan
     signed = sum(vertices[i].x * vertices[(i + 1) % n].y - vertices[(i + 1) % n].x * vertices[i].y for i in range(n))
     idx = list(range(n)) if signed > 0.0 else list(range(n - 1, -1, -1))
@@ -283,7 +286,9 @@ def _triangulate(vertices: Sequence[Pose2D]) -> list[tuple[Pose2D, Pose2D, Pose2
                 break
             if turn < 0.0:
                 continue  # reflex
-            others = (vertices[j] for j in idx if j not in (idx[k - 1], idx[k], idx[(k + 1) % len(idx)]))
+            corners = {(a.x, a.y), (b.x, b.y), (c.x, c.y)}
+            # a vertex at the same point as a corner (a self-touching ring) does not block the ear
+            others = (vertices[j] for j in idx if j not in (idx[k - 1], idx[k], idx[(k + 1) % len(idx)]) and (vertices[j].x, vertices[j].y) not in corners)
             if any(_cross(a, b, q) >= -eps and _cross(b, c, q) >= -eps and _cross(c, a, q) >= -eps for q in others):
                 continue
             triangles.append((a, b, c))
