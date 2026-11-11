@@ -229,14 +229,9 @@ class SpawnScheduler(Loggable):
                 return Pose2D(x=center.x + vertices[0].x, y=center.y + vertices[0].y)
             return Pose2D(x=center.x, y=center.y)
 
-        triangles = []
-        areas = []
         v0 = vertices[0]
-        for i in range(1, n - 1):
-            v1, v2 = vertices[i], vertices[i + 1]
-            area = abs((v1.x - v0.x) * (v2.y - v0.y) - (v2.x - v0.x) * (v1.y - v0.y)) / 2.0
-            triangles.append((v0, v1, v2))
-            areas.append(area)
+        triangles = _triangulate(vertices)
+        areas = [abs((v1.x - v0_.x) * (v2.y - v0_.y) - (v2.x - v0_.x) * (v1.y - v0_.y)) / 2.0 for v0_, v1, v2 in triangles]
 
         total_area = sum(areas)
         if total_area <= 0:
@@ -260,6 +255,46 @@ class SpawnScheduler(Loggable):
         x = center.x + w * a.x + u * b.x + v * c.x
         y = center.y + w * a.y + u * b.y + v * c.y
         return Pose2D(x=x, y=y, theta=0.0)
+
+
+def _cross(o: Pose2D, a: Pose2D, b: Pose2D) -> float:
+    return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+
+
+def _triangulate(vertices: Sequence[Pose2D]) -> list[tuple[Pose2D, Pose2D, Pose2D]]:
+    """Triangles that cover a simple polygon exactly: the fan from the first vertex for a convex polygon (as before), ear
+    clipping for a concave one, whose fan would reach outside it and count some of its area twice. A polygon ear clipping
+    cannot reduce (self-intersecting) keeps the fan."""
+    n = len(vertices)
+    fan = [(vertices[0], vertices[i], vertices[i + 1]) for i in range(1, n - 1)]
+    turns = [_cross(vertices[i - 1], vertices[i], vertices[(i + 1) % n]) for i in range(n)]
+    if all(t >= 0.0 for t in turns) or all(t <= 0.0 for t in turns):
+        return fan
+    signed = sum(vertices[i].x * vertices[(i + 1) % n].y - vertices[(i + 1) % n].x * vertices[i].y for i in range(n))
+    idx = list(range(n)) if signed > 0.0 else list(range(n - 1, -1, -1))
+    eps = 1e-12
+    triangles: list[tuple[Pose2D, Pose2D, Pose2D]] = []
+    while len(idx) > 3:
+        for k in range(len(idx)):
+            a, b, c = vertices[idx[k - 1]], vertices[idx[k]], vertices[idx[(k + 1) % len(idx)]]
+            turn = _cross(a, b, c)
+            if abs(turn) <= eps:
+                idx.pop(k)  # a collinear vertex adds no area
+                break
+            if turn < 0.0:
+                continue  # reflex
+            others = (vertices[j] for j in idx if j not in (idx[k - 1], idx[k], idx[(k + 1) % len(idx)]))
+            if any(_cross(a, b, q) >= -eps and _cross(b, c, q) >= -eps and _cross(c, a, q) >= -eps for q in others):
+                continue
+            triangles.append((a, b, c))
+            idx.pop(k)
+            break
+        else:
+            return fan
+    a, b, c = (vertices[j] for j in idx)
+    if abs(_cross(a, b, c)) > eps:
+        triangles.append((a, b, c))
+    return triangles or fan
 
 
 type GainSpec = bool | float | int | str | list[GainSpec] | dict[str, GainSpec] | None

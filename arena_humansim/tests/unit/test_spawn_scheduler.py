@@ -320,3 +320,64 @@ def test_template_without_speed_or_radius_requests_the_type_sample(rng) -> None:
     reqs = {req.lifetime.source_name: req for req in sched.tick(0, 1.0)}
     assert (reqs["unset"].desired_velocity, reqs["unset"].agent_radius) == (0.0, 0.0)
     assert (reqs["pinned"].desired_velocity, reqs["pinned"].agent_radius) == (pytest.approx(1.2), 0.3)
+
+
+def _inside(px: float, py: float, poly: list[tuple[float, float]]) -> bool:
+    inside, j = False, len(poly) - 1
+    for i in range(len(poly)):
+        (xi, yi), (xj, yj) = poly[i], poly[j]
+        if (yi > py) != (yj > py) and px < (xj - xi) * (py - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _area(poly: list[tuple[float, float]]) -> float:
+    return abs(sum(poly[i][0] * poly[(i + 1) % len(poly)][1] - poly[(i + 1) % len(poly)][0] * poly[i][1] for i in range(len(poly)))) / 2.0
+
+
+# An entrance square cut to the floor along an alcove wall (the INFRA twin's Bras Basah 1), relative to its vertex mean: concave,
+# so the fan from its first vertex reaches outside it.
+CUT = [(153.31, 81.48), (153.31, 85.48), (156.68, 85.48), (156.2, 85.11), (156.21, 84.49), (155.76, 84.43), (155.46, 83.99), (155.54, 83.6), (155.71, 83.4), (155.73, 83.17), (155.93, 82.83), (156.07, 82.72), (156.41, 82.64), (156.41, 82.13), (156.04, 81.51)]
+L_SHAPE = [(0.0, 0.0), (4.0, 0.0), (4.0, 1.0), (1.0, 1.0), (1.0, 4.0), (0.0, 4.0)]
+
+
+def test_a_convex_polygon_keeps_the_fan_from_its_first_vertex() -> None:
+    from arena_humansim.core.spawn_scheduler import _triangulate
+
+    pentagon = [Pose2D(x=x, y=y) for x, y in [(0.0, 0.0), (2.0, -0.5), (3.0, 1.0), (1.5, 2.5), (-0.5, 1.5)]]
+    assert _triangulate(pentagon) == [(pentagon[0], pentagon[i], pentagon[i + 1]) for i in range(1, 4)]
+    assert _triangulate(list(reversed(pentagon))) == [(pentagon[-1], pentagon[-1 - i], pentagon[-2 - i]) for i in range(1, 4)]
+
+
+@pytest.mark.parametrize("poly", [CUT, L_SHAPE, list(reversed(L_SHAPE))])
+def test_a_concave_polygon_is_cut_into_triangles_that_cover_exactly_its_area(poly: list[tuple[float, float]]) -> None:
+    from arena_humansim.core.spawn_scheduler import _triangulate
+
+    triangles = _triangulate([Pose2D(x=x, y=y) for x, y in poly])
+    covered = sum(abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) / 2.0 for a, b, c in triangles)
+    assert covered == pytest.approx(_area(poly), rel=1e-9)
+    for a, b, c in triangles:
+        mid = ((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0)
+        assert _inside(*mid, poly)
+
+
+def test_every_spawn_in_a_concave_source_lands_inside_it(rng) -> None:
+    sched = SpawnScheduler(rng.get_substream("sched"))
+    cx, cy = sum(x for x, _ in CUT) / len(CUT), sum(y for _, y in CUT) / len(CUT)
+    center = Pose2D(x=cx, y=cy)
+    vertices = [Pose2D(x=x - cx, y=y - cy) for x, y in CUT]
+    for _ in range(4000):
+        p = sched._sample_pose_in_polygon(vertices, center)
+        assert _inside(p.x, p.y, CUT)
+
+
+def test_spawns_in_a_concave_source_spread_over_it_by_area(rng) -> None:
+    sched = SpawnScheduler(rng.get_substream("sched"))
+    center = Pose2D(x=0.0, y=0.0)
+    vertices = [Pose2D(x=x, y=y) for x, y in L_SHAPE]
+    draws = [sched._sample_pose_in_polygon(vertices, center) for _ in range(8000)]
+    assert all(_inside(p.x, p.y, L_SHAPE) for p in draws)
+    # the arm along x (x > 1) holds 3 of the shape's 7 m2
+    share = sum(p.x > 1.0 for p in draws) / len(draws)
+    assert share == pytest.approx(3.0 / 7.0, abs=0.02)
