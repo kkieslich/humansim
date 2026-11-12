@@ -2377,7 +2377,7 @@ class AgentManager(Node):
     def _hold_clock(self) -> None:
         """A reset or remove-all just set the tick count back: with `start_on_request` no tick runs until start_clock."""
         self._start_epoch_ns = None
-        self._clock_held = self._mode == self.MODE_SUBSYSTEM and bool(self.get_parameter("start_on_request").value)
+        self._clock_held = self._mode == MODE_SUBSYSTEM and bool(self.get_parameter("start_on_request").value)
 
     def _start_clock_callback(
         self,
