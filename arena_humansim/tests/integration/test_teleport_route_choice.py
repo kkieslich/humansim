@@ -226,3 +226,25 @@ def test_a_wheelchair_pushed_onto_a_running_escalator_half_walks_off_it(manager_
         mgr.tick()
     assert _pos(mgr, 1)[0] < 10.0
     assert 1 not in mgr._zones.riders
+
+
+def test_a_walker_pushed_back_past_the_seam_it_landed_on_walks_on_instead_of_flying_back(manager_factory: Callable[..., AgentManager]) -> None:
+    mgr = _manager(manager_factory, "landed_push", True, _pair()[:1])
+    zones = [_half("st_a", "st_b", (10.0, 5.0, 0.0), (13.55, 5.0), (10.0, 4.0, 14.0, 6.0)), _half("st_b", "st_a", (20.0, 5.0, math.pi), (16.45, 5.0), (16.0, 4.0, 20.0, 6.0))]
+    zones[0].delay = zones[1].delay = 2.0
+    assert mgr._set_teleport_zones_callback(SetTeleportZones.Request(zones=zones), SetTeleportZones.Response()).success
+    flew = 0
+    pushed = False
+    for _ in range(20 * 60):
+        was = 1 in mgr._zones.flying
+        mgr.tick()
+        if 1 not in mgr._agents:
+            break
+        if 1 in mgr._zones.flying and not was:
+            flew += 1
+        if was and 1 not in mgr._zones.flying and not pushed:
+            i = mgr._pool.idx(1)
+            mgr._pool.pos[i, 0] = 16.35  # pushed back past st_b's hold line (16.45)
+            pushed = True
+    assert pushed and flew == 1
+    assert 1 not in mgr._agents or _pos(mgr, 1)[0] > 20.0

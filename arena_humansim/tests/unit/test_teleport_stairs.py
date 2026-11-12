@@ -432,3 +432,50 @@ def test_unreachable_names_stair_halves_whose_hold_is_on_a_wall_or_outside_the_f
     assert tz.unreachable([_up(), _up_b(), on_seam, outside, *_lift()], WALLS) == ["on_seam", "outside"]
     assert tz.unreachable([_up()], []) == []  # no walls yet: only the footprint is checked
     assert tz.unreachable([on_seam], []) == ["on_seam"]  # a hold on the footprint edge counts as outside
+
+
+def _land(tz: TeleportZones, pool: AgentPool, ticks: range) -> None:
+    """Run hold over `ticks`, applying its moves and ending the transfer of each pedestrian that lands, as the node does."""
+    for tick in ticks:
+        for aid, x, y, theta in tz.hold(pool, tick, 1000, 0.05, 0):
+            i = pool.idx(aid)
+            pool.pos[i] = (x, y)
+            pool.theta[i] = theta
+            if aid not in tz.flying:
+                tz.forget(aid)
+
+
+def test_a_pedestrian_drifting_back_past_the_seam_it_landed_on_is_not_carried_back_until_it_steps_off(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    pool = _pool(agent_factory, (1, 9.6, 5.4))
+    tz.transfers[1] = Transfer(goal=(GOAL_B.x, GOAL_B.y), zone="up", destination="up_b")
+    _land(tz, pool, range(0, 1))
+    assert tuple(pool.pos[0]) == pytest.approx((22.6, 0.45 + LANDING_BACKOFF))
+    pool.pos[0] = (22.6, 0.3)  # pushed past up_b's seam, no route over it
+    assert tz.hold(pool, 1, 1000, 0.05, 0) == []
+    pool.pos[0] = (21.0, 3.0)  # off up_b
+    assert tz.hold(pool, 2, 1000, 0.05, 0) == []
+    pool.pos[0] = (22.6, 0.3)
+    assert [aid for aid, *_ in tz.hold(pool, 3, 1000, 0.05, 0)] == [1]
+
+
+def test_a_pedestrian_whose_route_takes_the_half_it_landed_on_back_crosses_it(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    pool = _pool(agent_factory, (1, 9.6, 5.4))
+    tz.transfers[1] = Transfer(goal=(GOAL_B.x, GOAL_B.y), zone="up", destination="up_b")
+    _land(tz, pool, range(0, 1))
+    tz.transfers[1] = Transfer(goal=(GOAL_A.x, GOAL_A.y), zone="up_b", destination="up")
+    pool.pos[0] = (22.6, 0.3)
+    assert [aid for aid, *_ in tz.hold(pool, 1, 1000, 0.05, 0)] == [1]
+
+
+def test_a_flight_landing_is_not_flown_back_by_a_drift_past_the_partner_seam(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([attrs.evolve(_up(), delay=0.5), attrs.evolve(_up_b(), delay=0.5)])
+    pool = _pool(agent_factory, (1, 9.6, 5.4))
+    tz.transfers[1] = Transfer(goal=(GOAL_B.x, GOAL_B.y), zone="up", destination="up_b")
+    _land(tz, pool, range(0, 11))
+    assert tz.flying == frozenset() and tuple(pool.pos[0]) == pytest.approx((22.6, 0.45 + LANDING_BACKOFF))
+    pool.pos[0] = (22.6, 0.3)
+    assert tz.hold(pool, 11, 1000, 0.05, 0) == [] and tz.flying == frozenset()
+    tz.clear_transfers()
+    assert [aid for aid, *_ in tz.hold(pool, 12, 1000, 0.05, 0)] == [1] and tz.flying == {1}

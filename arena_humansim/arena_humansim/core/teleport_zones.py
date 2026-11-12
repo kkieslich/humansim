@@ -174,6 +174,9 @@ class TeleportZones:
         self._flights: dict[int, _Flight] = {}
         #: the stair kinds each pedestrian's type climbs, as last steered: a type that does not climb a half is never carried over its seam
         self._climbs: dict[int, tuple[str, ...]] = {}
+        #: the half each pedestrian landed on, while it stands on it: it is not carried back over that half's seam unless
+        #: its route takes the half. Kept through `forget`, which ends the transfer at the landing.
+        self._landed: dict[int, str] = {}
 
     def set_zones(self, zones: Sequence[Zone], is_open: Sequence[bool]) -> None:
         """Replace every zone, keeping the transfers through zones that come back unchanged or stairs that keep their destination."""
@@ -198,6 +201,7 @@ class TeleportZones:
         if not self.zones:
             self._flights.clear()
             self._climbs.clear()
+            self._landed.clear()
 
     def clear_transfers(self) -> None:
         self.transfers.clear()
@@ -207,6 +211,7 @@ class TeleportZones:
         self._choices.clear()
         self._flights.clear()
         self._climbs.clear()
+        self._landed.clear()
 
     def forget(self, aid: int) -> None:
         self.transfers.pop(aid, None)
@@ -509,11 +514,15 @@ class TeleportZones:
     def _cross(self, pool: AgentPool, tick: int = 0, dt: float = 0.05) -> list[tuple[int, float, float, float]]:
         """Teleports of the pedestrians past a stair seam whose landing is clear, the others held still at the seam. On a
         half with a `delay` (the stair flight the halves leave out) the pedestrian boards the flight instead (`_fly`). A
-        pedestrian whose type does not climb the half's kind is never carried over."""
+        pedestrian whose type does not climb the half's kind is never carried over. Nor is one standing on the half it
+        landed on, unless its route takes that half: one that drifts back past the seam after landing walks off."""
         self._held = set()
         teleports: list[tuple[int, float, float, float]] = []
         landed: list[tuple[float, float, float]] = []
-        for i, zone in self._on_stairs(pool):
+        on = self._on_stairs(pool)
+        here = {int(pool.agent_ids[i]): zone.name for i, zone in on}
+        self._landed = {aid: name for aid, name in self._landed.items() if here.get(aid) == name}
+        for i, zone in on:
             x, y = float(pool.pos[i, 0]), float(pool.pos[i, 1])
             if not zone.destinations or not zone.past_seam(x, y):
                 continue
@@ -524,6 +533,8 @@ class TeleportZones:
             if climbs is not None and zone.kind not in climbs:
                 continue
             transfer = self.transfers.get(aid)
+            if self._landed.get(aid) == zone.name and (transfer is None or transfer.zone != zone.name):
+                continue
             dest = transfer.destination if transfer is not None and transfer.zone == zone.name else zone.destinations[0]
             lx, ly, theta = self._landing(zone, self.zones[dest], x, y, float(pool.theta[i]))
             if zone.delay > 0.0:
@@ -545,6 +556,7 @@ class TeleportZones:
                 continue
             landed.append((lx, ly, float(pool.agent_radius[i])))
             teleports.append((aid, lx, ly, theta))
+            self._landed[aid] = dest
         return teleports
 
     def hold(self, pool: AgentPool, tick: int, timeout_ticks: int, dt: float, let_out_ticks: int) -> list[tuple[int, float, float, float]]:
@@ -639,6 +651,7 @@ class TeleportZones:
                 continue
             landed.append((spot[0], spot[1], float(pool.agent_radius[idx])))
             moves.append((aid, spot[0], spot[1], et))
+            self._landed[aid] = flight.dest
             del self._flights[aid]
         return moves
 
