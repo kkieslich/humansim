@@ -42,6 +42,20 @@ SEGMENTS = [
     ((16.0, 6.0), (20.0, 6.0)),
     ((16.0, 4.0), (16.0, 6.0)),
 ]
+# the same rooms and stair pockets without the corridor: only the stair joins them
+NO_CORRIDOR = [
+    ((0.0, 0.0), (10.0, 0.0)),
+    ((0.0, 0.0), (0.0, 10.0)),
+    ((0.0, 10.0), (10.0, 10.0)),
+    ((10.0, 0.0), (10.0, 4.0)),
+    ((10.0, 6.0), (10.0, 10.0)),
+    ((20.0, 0.0), (30.0, 0.0)),
+    ((30.0, 0.0), (30.0, 10.0)),
+    ((20.0, 10.0), (30.0, 10.0)),
+    ((20.0, 0.0), (20.0, 4.0)),
+    ((20.0, 6.0), (20.0, 10.0)),
+    *SEGMENTS[18:],
+]
 GOAL = Pose2D(x=25.0, y=5.0)
 
 
@@ -248,3 +262,23 @@ def test_a_walker_pushed_back_past_the_seam_it_landed_on_walks_on_instead_of_fly
             pushed = True
     assert pushed and flew == 1
     assert 1 not in mgr._agents or _pos(mgr, 1)[0] > 20.0
+
+
+def test_crowds_crossing_a_two_way_stair_without_a_flight_both_ways_get_through(manager_factory: Callable[..., AgentManager]) -> None:
+    # 12 walkers each way at once: each queue's front walker stands on the other's landing
+    agents = []
+    for k in range(12):
+        agents.append(AgentConfig(agent_id=k + 1, spawn_pose=Pose2D(x=1.5 + 0.9 * (k % 8), y=1.5 + 1.1 * (k // 8)), goal_sequence=[Pose2D(x=25.0, y=5.0)], desired_velocity=1.0 + 0.03 * k))
+        agents.append(AgentConfig(agent_id=k + 101, spawn_pose=Pose2D(x=21.5 + 0.9 * (k % 8), y=1.5 + 1.1 * (k // 8)), goal_sequence=[Pose2D(x=5.0, y=5.0)], desired_velocity=1.1))
+    scenario = ScenarioConfig(name="two_way_stair", simulation=SimulationParams(seed=5, dt=0.05), modules=ModuleConfig(global_planner="navmesh"), walls=[WallConfig(name=f"w{i}", start=Pose2D(x=a[0], y=a[1]), end=Pose2D(x=b[0], y=b[1])) for i, (a, b) in enumerate(NO_CORRIDOR)], agents=agents)
+    mgr = manager_factory(scenario, node_name="test_two_way_stair")
+    zones = [_half("st_a", "st_b", (10.0, 5.0, 0.0), (13.55, 5.0), (10.0, 4.0, 14.0, 6.0)), _half("st_b", "st_a", (20.0, 5.0, math.pi), (16.45, 5.0), (16.0, 4.0, 20.0, 6.0))]
+    assert mgr._set_teleport_zones_callback(SetTeleportZones.Request(zones=zones), SetTeleportZones.Response()).success
+    over = set()
+    for _ in range(20 * 100):
+        mgr.tick()
+        for aid in list(mgr._agents):
+            x = _pos(mgr, aid)[0]
+            if (aid < 100 and x > 20.0) or (aid > 100 and x < 10.0):
+                over.add(aid)
+    assert len([a for a in over if a < 100]) >= 10 and len([a for a in over if a > 100]) >= 10
