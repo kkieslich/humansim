@@ -168,3 +168,61 @@ def test_a_stair_flight_takes_its_delay_between_the_seam_and_the_landing(manager
     assert boarded is not None and landed is not None
     assert (landed - boarded) * 0.05 >= 3.0 - 1e-9
     assert len(between) > 10 and between == sorted(between)
+
+
+def test_a_queue_of_walkers_through_a_stair_with_a_flight_all_land_soon_after_the_delay(manager_factory: Callable[..., AgentManager]) -> None:
+    import attrs
+
+    from .test_teleport_zones import PLANNERS, STAIRS_WALLS, _scenario, _set_zones, _stair_half
+
+    zones = [_stair_half("st_a", "st_b", "stairs", 0.0, b_side=False), _stair_half("st_b", "st_a", "stairs", 0.0, b_side=True)]
+    zones[0].delay = 4.0
+    scenario = attrs.evolve(_scenario("flight_queue", "navmesh", riders=16), walls=_scenario("x", "navmesh").walls + STAIRS_WALLS)
+    mgr = manager_factory(scenario, node_name="test_flight_queue", extra_params=PLANNERS["navmesh"])
+    assert _set_zones(mgr, zones).success
+    since: dict[int, int] = {}
+    longest: dict[int, int] = {}
+    flew: set[int] = set()
+    for n in range(20 * 120):
+        mgr.tick()
+        for aid in mgr._zones.flying:
+            flew.add(aid)
+            since.setdefault(aid, n)
+            longest[aid] = n - since[aid]
+        for aid in [a for a in since if a not in mgr._zones.flying]:
+            del since[aid]
+        if len(flew) >= 10 and not mgr._zones.flying and not mgr._agents:
+            break
+    assert len(flew) >= 10
+    assert not mgr._zones.flying
+    assert max(longest.values()) * 0.05 <= 4.0 + 3.0
+
+
+def test_a_hard_reset_mid_flight_leaves_no_flight_for_the_next_crowd(manager_factory: Callable[..., AgentManager]) -> None:
+    from arena_humansim_msgs.srv import ResetSimulation
+
+    mgr = _manager(manager_factory, "flight_reset", True, _pair()[:1])
+    zones = [_half("st_a", "st_b", (10.0, 5.0, 0.0), (13.55, 5.0), (10.0, 4.0, 14.0, 6.0)), _half("st_b", "st_a", (20.0, 5.0, math.pi), (16.45, 5.0), (16.0, 4.0, 20.0, 6.0))]
+    zones[0].delay = 3.0
+    assert mgr._set_teleport_zones_callback(SetTeleportZones.Request(zones=zones), SetTeleportZones.Response()).success
+    for _ in range(1200):
+        mgr.tick()
+        if 1 in mgr._zones.flying:
+            break
+    assert 1 in mgr._zones.flying
+    assert mgr._reset_callback(ResetSimulation.Request(soft=False), ResetSimulation.Response()).success
+    assert not mgr._zones.flying and not mgr._zones._climbs
+
+
+def test_a_wheelchair_pushed_onto_a_running_escalator_half_walks_off_it(manager_factory: Callable[..., AgentManager]) -> None:
+    agents = [AgentConfig(agent_id=1, agent_type="wheelchair_manual", spawn_pose=Pose2D(x=11.0, y=5.0, theta=math.pi), goal_sequence=[Pose2D(x=5.0, y=5.0)], desired_velocity=0.9)]
+    mgr = _manager(manager_factory, "chair_belt", False, agents)
+    zones = [_half("st_a", "st_b", (10.0, 5.0, 0.0), (13.55, 5.0), (10.0, 4.0, 14.0, 6.0)), _half("st_b", "", (20.0, 5.0, math.pi), (16.45, 5.0), (16.0, 4.0, 20.0, 6.0))]
+    for z, belt in zip(zones, (0.6, -0.6), strict=True):
+        z.kind, z.belt = "escalator", belt
+    zones[1].destinations = []
+    assert mgr._set_teleport_zones_callback(SetTeleportZones.Request(zones=zones), SetTeleportZones.Response()).success
+    for _ in range(20 * 30):
+        mgr.tick()
+    assert _pos(mgr, 1)[0] < 10.0
+    assert 1 not in mgr._zones.riders

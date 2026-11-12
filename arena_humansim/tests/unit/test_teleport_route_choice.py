@@ -9,7 +9,7 @@ import attrs
 import numpy as np
 import pytest
 from arena_humansim.core.agents.base import BaseAgent
-from arena_humansim.core.teleport_zones import LANDING_BACKOFF, STAIR_SPEED, SWITCH_M, TeleportZones, Zone
+from arena_humansim.core.teleport_zones import CHOICE_INTERVAL, CHOICE_STAGGER, LANDING_BACKOFF, STAIR_SPEED, SWITCH_M, TeleportZones, Zone
 from arena_humansim.global_planner.navmesh import NavMeshPlanner
 from arena_humansim.utils.types import CommandType, HighLevelCommand, Pose2D, Segments
 
@@ -183,7 +183,7 @@ def _stair_cost(into: float, onward: float, speed: float = 1.1) -> float:
 
 def test_a_walker_keeps_its_choice_unless_the_other_option_is_clearly_cheaper(agent_factory: Callable[..., BaseAgent]) -> None:
     landing = (round(16.45 + LANDING_BACKOFF, 2), 5.0)
-    priced = _Priced({(25.0, 5.0): 100.0, (13.55, 5.0): 9.0, (16.45, 5.0): 60.0}, {(landing, (25.0, 5.0)): 9.0})
+    priced = _Priced({(25.0, 5.0): 100.0, (13.55, 5.0): 9.0, (16.45, 5.0): 60.0, landing: 9.0, (13.45, 5.0): 60.0})
     tz = _zones(_stairs())
     walker = _walker(agent_factory, priced, 1, 5.0, 5.0)
     cmds = _go([walker], IN_B)
@@ -203,7 +203,7 @@ def test_a_walker_keeps_its_choice_unless_the_other_option_is_clearly_cheaper(ag
 
 def test_a_walker_on_the_stair_is_not_asked_again(agent_factory: Callable[..., BaseAgent]) -> None:
     landing = (round(16.45 + LANDING_BACKOFF, 2), 5.0)
-    priced = _Priced({(25.0, 5.0): 100.0, (13.55, 5.0): 9.0, (16.45, 5.0): 60.0}, {(landing, (25.0, 5.0)): 9.0})
+    priced = _Priced({(25.0, 5.0): 100.0, (13.55, 5.0): 9.0, (16.45, 5.0): 60.0, landing: 9.0, (13.45, 5.0): 60.0})
     tz = _zones(_stairs())
     walker = _walker(agent_factory, priced, 1, 5.0, 5.0)
     cmds = _go([walker], IN_B)
@@ -226,7 +226,7 @@ def test_forget_drops_the_choice(agent_factory: Callable[..., BaseAgent], planne
 
 def test_the_stair_flight_counts_in_the_stair_cost(agent_factory: Callable[..., BaseAgent]) -> None:
     landing = (round(16.45 + LANDING_BACKOFF, 2), 5.0)
-    priced = _Priced({(25.0, 5.0): 40.0, (13.55, 5.0): 9.0, (16.45, 5.0): 60.0}, {(landing, (25.0, 5.0)): 9.0})
+    priced = _Priced({(25.0, 5.0): 40.0, (13.55, 5.0): 9.0, (16.45, 5.0): 60.0, landing: 9.0, (13.45, 5.0): 60.0})
     walker = _walker(agent_factory, priced, 1, 5.0, 5.0)
     fast = _zones(_stairs())
     fast.steer([walker], _go([walker], IN_B), now=0.0)
@@ -235,3 +235,57 @@ def test_the_stair_flight_counts_in_the_stair_cost(agent_factory: Callable[..., 
     slow = _zones([attrs.evolve(zones[0], delay=20.0), zones[1]])
     slow.steer([walker], _go([walker], IN_B), now=0.0)
     assert 1 not in slow.transfers
+
+
+def test_a_walker_whose_chosen_half_closes_is_routed_again_at_once(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner) -> None:
+    tz = _zones(_stairs())
+    walker = _walker(agent_factory, planner, 1, 5.0, 5.0)
+    cmds = _go([walker], IN_B)
+    tz.steer([walker], cmds, now=0.0)
+    assert tz.transfers[1].zone == "st_a"
+    tz.open["st_a"] = False  # set_zone_access
+    out = tz.steer([walker], cmds, now=1.0)
+    assert 1 not in tz.transfers
+    assert out[1].target_pose == IN_B
+
+
+def test_walkers_decided_together_decide_again_spread_over_the_interval(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner) -> None:
+    tz = _zones(_stairs())
+    walkers = [_walker(agent_factory, planner, aid, 5.0, 2.0 + 0.3 * (aid % 10)) for aid in range(1, 41)]
+    tz.steer(walkers, _go(walkers, IN_B), now=0.0)
+    due = sorted({c.at for c in tz._choices.values()})
+    assert len(due) == CHOICE_STAGGER and min(due) == 0.0 and max(due) < CHOICE_INTERVAL
+
+
+@attrs.define(eq=False)
+class _Counting(_Priced):
+    calls: list[tuple[int, tuple[float, float]]] = attrs.Factory(list)
+
+    def route_costs(self, starts: Sequence[Pose2D], goal: Pose2D) -> np.ndarray:
+        self.calls.append((len(starts), (round(goal.x, 2), round(goal.y, 2))))
+        return super().route_costs(starts, goal)
+
+
+def test_onward_costs_come_from_one_query_per_landing(agent_factory: Callable[..., BaseAgent]) -> None:
+    landing = (round(16.45 + LANDING_BACKOFF, 2), 5.0)
+    goals = [Pose2D(x=25.0, y=2.0 + k) for k in range(5)]
+    costs = {(g.x, g.y): 100.0 for g in goals} | {(13.55, 5.0): 9.0, (16.45, 5.0): 60.0, landing: 9.0, (13.45, 5.0): 60.0}
+    priced = _Counting(costs)
+    tz = _zones(_stairs())
+    walkers = [_walker(agent_factory, priced, k + 1, 5.0, 5.0) for k in range(5)]
+    cmds = {w.state.agent_id: HighLevelCommand(agent_id=w.state.agent_id, type=CommandType.NAVIGATE, target_pose=g) for w, g in zip(walkers, goals, strict=True)}
+    tz.steer(walkers, cmds, now=0.0)
+    at_landings = [c for c in priced.calls if c[1] in (landing, (13.45, 5.0))]
+    assert len(at_landings) == 2 and all(n == 5 for n, _ in at_landings)
+    assert all(tz.transfers[k + 1].zone == "st_a" for k in range(5))
+
+
+def test_pricing_routes_keeps_the_planners_trees(planner: NavMeshPlanner) -> None:
+    router = planner._router
+    assert router is not None
+    planner.route_costs([Pose2D(x=5.0, y=5.0)], IN_B)
+    router.plan(np.array([5.0, 5.0]), np.array([25.0, 5.0]))
+    kept = dict(router._trees)
+    for k in range(80):
+        planner.route_costs([Pose2D(x=5.0, y=5.0)], Pose2D(x=2.0 + 0.05 * k, y=8.0))
+    assert set(kept) <= set(router._trees)

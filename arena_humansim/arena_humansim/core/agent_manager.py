@@ -678,6 +678,7 @@ class AgentManager(Node):
         self._walls: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {}
         self._obstacles: dict[str, ObstacleData] = {}
         self._zones = TeleportZones()
+        self._zones.route_choice = self._zone_route_choice
         self._prone: set[int] = set()
         self._parked_from: dict[int, tuple[float, float, float]] = {}
         self._rising: dict[int, tuple[float, float, float, int]] = {}
@@ -972,6 +973,8 @@ class AgentManager(Node):
         self._zone_wait_ticks = max(1, int(round(self._float_param("zone_wait_timeout") / self._dt)))
         self._zone_let_out_ticks = max(0, int(round(self._float_param("zone_let_out_timeout") / self._dt)))
         self._zone_route_choice = bool(self.get_parameter("zone_route_choice").value)
+        if hasattr(self, "_zones"):
+            self._zones.route_choice = self._zone_route_choice
         self._profile_phases = self.get_parameter("profile_phases").value
         self._profile_interval = self._int_param("profile_interval")
 
@@ -1824,7 +1827,6 @@ class AgentManager(Node):
                 if planner is None or planner.needs_global_subgoal:
                     needs_subgoal_ids.add(int(pool.agent_ids[i]))
             subgoal_agents = [a for a in agents if a.state.agent_id in needs_subgoal_ids]
-            self._zones.route_choice = self._zone_route_choice
             steered = self._zones.steer(subgoal_agents, self._high_level_cmds, now=self._tick_count * self._dt)
             for planner, group in _group_by(subgoal_agents, key=lambda a: a.global_planner):
                 planner.compute(group, steered)
@@ -1924,10 +1926,12 @@ class AgentManager(Node):
                 desired_velocity=agent.state.desired_velocity,
             )
         self._apply_desired_speeds(agents, pool)
-        for aid, x, y, theta in self._zones.hold(pool, self._tick_count, self._zone_wait_ticks, self._dt, self._zone_let_out_ticks):
+        moves = self._zones.hold(pool, self._tick_count, self._zone_wait_ticks, self._dt, self._zone_let_out_ticks)
+        flying = self._zones.flying
+        for aid, x, y, theta in moves:
             idx = pool.idx(aid)
             self._teleport_agent(aid, x, y, theta, float(pool.agent_radius[idx]))
-            if aid not in self._zones.flying:
+            if aid not in flying:
                 self._zones.forget(aid)
         heading_goals = dict(self._interaction_manager.formation_headings())
         for aid, agent in self._agents.items():
@@ -3162,6 +3166,7 @@ class AgentManager(Node):
         self._interaction_scripts_by_tick.clear()
         self._walls.clear()
         self._obstacles.clear()
+        self._zones.clear_transfers()
         self._zones.set_zones([], [])
         for subsystem in self._wall_aware:
             subsystem.set_walls([])

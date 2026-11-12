@@ -41,6 +41,8 @@ class Router:
             self._rho = np.clip(GAP_SHARE * gap, radius, comfort_radius)
         self._mx, self._my = mesh.e_mid[:, 0].tolist(), mesh.e_mid[:, 1].tolist()
         self._trees: dict[tuple[float, float], tuple[np.ndarray, np.ndarray]] = {}
+        #: `costs`' own trees, so pricing routes never evicts the trees `plan` reuses
+        self._cost_trees: dict[tuple[float, float], tuple[np.ndarray, np.ndarray]] = {}
         self._index, self._walls = mesh.index, mesh.con_edges
         self._blocked = np.zeros(0, np.int64)
         self._slow: np.ndarray | None = None
@@ -55,6 +57,7 @@ class Router:
             self._walls = np.vstack([mesh.con_edges, np.column_stack([mesh.ea[self._blocked], mesh.eb[self._blocked]])])
             self._index = SegIndex(mesh.P[self._walls[:, 0]], mesh.P[self._walls[:, 1]])
         self._trees.clear()
+        self._cost_trees.clear()
         self._graph()
 
     def set_congestion(self, slowdown: np.ndarray | None) -> None:
@@ -62,6 +65,7 @@ class Router:
         free flow), an arc costing its length times the mean of its two edges'. None restores plain lengths."""
         self._slow = None if slowdown is None else np.maximum(np.asarray(slowdown, dtype=np.float64), 1.0)
         self._trees.clear()
+        self._cost_trees.clear()
         self._graph()
 
     def clearance(self, pts: np.ndarray) -> np.ndarray:
@@ -345,19 +349,20 @@ class Router:
             ch = None
         return None
 
-    def _tree(self, g: np.ndarray, gnodes: np.ndarray, gcost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Shortest-path tree towards goal g over the edge graph, cached per goal."""
+    def _tree(self, g: np.ndarray, gnodes: np.ndarray, gcost: np.ndarray, cache: dict[tuple[float, float], tuple[np.ndarray, np.ndarray]] | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Shortest-path tree towards goal g over the edge graph, cached per goal (in `cache`, `plan`'s trees by default)."""
+        trees = self._trees if cache is None else cache
         key = (float(g[0]), float(g[1]))
-        hit = self._trees.pop(key, None)
+        hit = trees.pop(key, None)
         if hit is None:
             E = len(self.mesh.ea)
             gm = np.isfinite(gcost)
             indptr = np.append(self._indptr, self._indptr[-1] + gm.sum())
             graph = csr_matrix((np.append(self._data, gcost[gm]), np.append(self._indices, gnodes[gm]), indptr), shape=(E + 1, E + 1))
             hit = dijkstra(graph, directed=True, indices=E, return_predecessors=True)
-            if len(self._trees) >= TREE_CACHE:
-                self._trees.pop(next(iter(self._trees)))
-        self._trees[key] = hit
+            if len(trees) >= TREE_CACHE:
+                trees.pop(next(iter(trees)))
+        trees[key] = hit
         return hit
 
     def _walk(self, pred: np.ndarray, first: int) -> list[int]:
@@ -416,8 +421,8 @@ class Router:
 
     def costs(self, starts: np.ndarray, goal: np.ndarray) -> np.ndarray:
         """Walking cost from each start to goal over the edge graph, congestion-weighted where set (`set_congestion`), inf
-        where goal is out of reach. Points closer to a wall than the radius are snapped off it first. Shares the per-goal
-        trees with `plan`."""
+        where goal is out of reach. Points closer to a wall than the radius are snapped off it first. Per-goal trees as
+        `plan`'s, in a cache of their own so that pricing never evicts the planner's."""
         pts = np.atleast_2d(np.asarray(starts, dtype=np.float64)).copy()
         g = np.asarray(goal, dtype=np.float64).copy()
         out = np.full(len(pts), np.inf)
@@ -434,7 +439,7 @@ class Router:
             if q is not None:
                 pts[i] = q
         ok, ts, nodes, cost = self._terminals(pts)
-        dist, _ = self._tree(g, gnodes[0], gcost[0])
+        dist, _ = self._tree(g, gnodes[0], gcost[0], self._cost_trees)
         total = np.min(cost + dist[nodes], axis=1)
         same = ok & (ts == gt[0])
         total[same] = np.minimum(total[same], np.hypot(*(pts[same] - g).T))
