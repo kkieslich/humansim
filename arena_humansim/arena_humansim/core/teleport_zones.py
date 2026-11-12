@@ -166,6 +166,8 @@ class TeleportZones:
         self.riders: set[int] = set()
         self._banned: dict[int, tuple[tuple[float, float], list[str]]] = {}
         self._held: set[int] = set()
+        #: the tick each pedestrian held on a seam (its landing taken) was first held there
+        self._held_since: dict[int, int] = {}
         #: walkers that can climb a stair or escalator take it where that is cheaper than walking (walk to it, climb at
         #: stair or belt speed, walk on), by the global planner's congestion-weighted route costs; off: zones only join
         #: floor that walking cannot reach
@@ -197,6 +199,7 @@ class TeleportZones:
                 del self._banned[aid]
         self.riders.clear()
         self._held.clear()
+        self._held_since.clear()
         self._choices.clear()
         if not self.zones:
             self._flights.clear()
@@ -208,6 +211,7 @@ class TeleportZones:
         self._banned.clear()
         self.riders.clear()
         self._held.clear()
+        self._held_since.clear()
         self._choices.clear()
         self._flights.clear()
         self._climbs.clear()
@@ -217,6 +221,7 @@ class TeleportZones:
         self.transfers.pop(aid, None)
         self._banned.pop(aid, None)
         self._held.discard(aid)
+        self._held_since.pop(aid, None)
         self._choices.pop(aid, None)
         self._flights.pop(aid, None)
         self._climbs.pop(aid, None)
@@ -511,16 +516,20 @@ class TeleportZones:
             overlap[list(skip)] = False
         return bool(overlap.any()) or any(math.hypot(lx - x, ly - y) < lr + r for lx, ly, lr in landed)
 
-    def _cross(self, pool: AgentPool, tick: int = 0, dt: float = 0.05) -> list[tuple[int, float, float, float]]:
-        """Teleports of the pedestrians past a stair seam whose landing is clear, the others held still at the seam. On a
-        half with a `delay` (the stair flight the halves leave out) the pedestrian boards the flight instead (`_fly`). A
-        pedestrian whose type does not climb the half's kind is never carried over. Nor is one standing on the half it
+    def _cross(self, pool: AgentPool, tick: int = 0, dt: float = 0.05, timeout_ticks: int = 0) -> list[tuple[int, float, float, float]]:
+        """Teleports of the pedestrians past a stair seam whose landing is clear, the others held still at the seam. A
+        pedestrian held on a seam does not count as taking a landing, so two held facing each other across a stair (each
+        on the other's landing, the partner's hold line) both land; one held for `timeout_ticks` (0: never) lands anyway.
+        On a half with a `delay` (the stair flight the halves leave out) the pedestrian boards the flight instead (`_fly`).
+        A pedestrian whose type does not climb the half's kind is never carried over. Nor is one standing on the half it
         landed on, unless its route takes that half: one that drifts back past the seam after landing walks off."""
+        waiting = self._held
         self._held = set()
         teleports: list[tuple[int, float, float, float]] = []
         landed: list[tuple[float, float, float]] = []
         on = self._on_stairs(pool)
         here = {int(pool.agent_ids[i]): zone.name for i, zone in on}
+        holding = [i for i, _ in on if int(pool.agent_ids[i]) in waiting]
         self._landed = {aid: name for aid, name in self._landed.items() if here.get(aid) == name}
         for i, zone in on:
             x, y = float(pool.pos[i, 0]), float(pool.pos[i, 1])
@@ -544,7 +553,7 @@ class TeleportZones:
                 wait = (lx - ux / norm * gap, ly - uy / norm * gap)
                 self._flights[aid] = _Flight(start=(x, y), end=(lx, ly, theta), t0=tick, ticks=max(1, round(zone.delay / dt)), dest=dest, wait=wait)
                 continue
-            if self._occupied(pool, i, lx, ly, landed):
+            if self._occupied(pool, i, lx, ly, landed, holding) and not 0 < timeout_ticks <= tick - self._held_since.setdefault(aid, tick):
                 self._held.add(aid)
                 ax, ay = zone.axis
                 excess = zone.along(x, y) - zone.along(zone.hold.x, zone.hold.y)
@@ -557,6 +566,7 @@ class TeleportZones:
             landed.append((lx, ly, float(pool.agent_radius[i])))
             teleports.append((aid, lx, ly, theta))
             self._landed[aid] = dest
+        self._held_since = {aid: since for aid, since in self._held_since.items() if aid in self._held}
         return teleports
 
     def hold(self, pool: AgentPool, tick: int, timeout_ticks: int, dt: float, let_out_ticks: int) -> list[tuple[int, float, float, float]]:
@@ -615,7 +625,7 @@ class TeleportZones:
                 cx, cy = zone.center
                 dx, dy = self.zones[transfer.destination].center
                 teleports.append((aid, x - cx + dx, y - cy + dy, float(pool.theta[idx])))
-        teleports.extend(self._cross(pool, tick, dt))
+        teleports.extend(self._cross(pool, tick, dt, timeout_ticks))
         teleports.extend(self._fly(pool, tick, timeout_ticks))
         return teleports
 

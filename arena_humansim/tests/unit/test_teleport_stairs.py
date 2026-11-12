@@ -479,3 +479,24 @@ def test_a_flight_landing_is_not_flown_back_by_a_drift_past_the_partner_seam(age
     assert tz.hold(pool, 11, 1000, 0.05, 0) == [] and tz.flying == frozenset()
     tz.clear_transfers()
     assert [aid for aid, *_ in tz.hold(pool, 12, 1000, 0.05, 0)] == [1] and tz.flying == {1}
+
+
+def test_two_pedestrians_held_facing_each_other_across_a_stair_swap(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    # each stands past its own seam, on the other's landing (0.1 m short of the partner's hold line)
+    pool = _pool(agent_factory, (1, 9.6, 5.2), (2, 22.8, 0.4))
+    assert tz.hold(pool, 0, 1000, 0.05, 0) == []
+    assert tz._held == {1, 2}
+    moves = {aid: (x, y) for aid, x, y, _ in tz.hold(pool, 1, 1000, 0.05, 0)}
+    assert moves == {1: pytest.approx((22.8, 0.45 + LANDING_BACKOFF)), 2: pytest.approx((9.55 - LANDING_BACKOFF, 5.2))}
+
+
+def test_a_pedestrian_held_on_a_seam_for_the_wait_timeout_lands_anyway(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up("escalator", 0.5), _up_b("escalator", -0.5, ())])
+    pool = _pool(agent_factory, (1, 9.6, 5.2), (2, 22.8, 0.55))  # 2 stands on 1's landing and is not held
+    tz.transfers[1] = Transfer(goal=(GOAL_B.x, GOAL_B.y), zone="up", destination="up_b")
+    for tick in range(10):
+        assert tz.hold(pool, tick, 10, 0.05, 0) == []
+    [(aid, x, y, _)] = tz.hold(pool, 10, 10, 0.05, 0)
+    assert (aid, x, y) == (1, pytest.approx(22.8), pytest.approx(0.45 + LANDING_BACKOFF))
+    assert tz._held == set() and tz._held_since == {}
