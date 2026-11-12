@@ -96,7 +96,7 @@ from arena_humansim.core.recorder import BagRecorder, default_record_dir
 from arena_humansim.core.replay import ReplayManager, ReplayResult
 from arena_humansim.core.robot_services import RobotServiceAdvertiser
 from arena_humansim.core.spawn_scheduler import SpawnScheduler
-from arena_humansim.core.teleport_zones import TeleportZones, Zone
+from arena_humansim.core.teleport_zones import HOLD_CLEARANCE, TeleportZones, Zone
 from arena_humansim.core.viz import MarkerPublisher, publish_infrastructure, publish_module_markers
 from arena_humansim.core.world_knowledge import FormationSpec, WorldKnowledge, WorldObject
 from arena_humansim.global_planner import LANE_OFFSET_M, LANE_SIDES, GlobalPlanner
@@ -252,6 +252,7 @@ _TUNABLE_PARAMS = frozenset(
         "arrival_tau_brake",
         "zone_wait_timeout",
         "zone_let_out_timeout",
+        "zone_route_choice",
         "profile_phases",
         "profile_interval",
     }
@@ -504,6 +505,11 @@ class AgentManager(Node):
         self.declare_parameter("arrival_tau_brake", 0.15)
         self.declare_parameter("zone_wait_timeout", 30.0)
         self.declare_parameter("zone_let_out_timeout", 10.0)
+        self.declare_parameter(
+            "zone_route_choice",
+            False,
+            ParameterDescriptor(description="walkers that climb take a stair or escalator where that costs less than walking (the global planner's congestion-weighted route costs; stairs at stair speed, escalators at belt speed), also where walking reaches the goal; false: stairs, escalators and cabins only join floor that walking cannot reach"),
+        )
         self.declare_parameter("publish_markers", 0, ParameterDescriptor(integer_range=[IntegerRange(from_value=0, to_value=2)]))
         self.declare_parameter("profile_phases", False)
         self.declare_parameter("profile_interval", 0)
@@ -672,6 +678,7 @@ class AgentManager(Node):
         self._walls: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {}
         self._obstacles: dict[str, ObstacleData] = {}
         self._zones = TeleportZones()
+        self._zones.route_choice = self._zone_route_choice
         self._prone: set[int] = set()
         self._parked_from: dict[int, tuple[float, float, float]] = {}
         self._rising: dict[int, tuple[float, float, float, int]] = {}
@@ -965,6 +972,9 @@ class AgentManager(Node):
             self._arrival_tau_brake = float(self._dt)
         self._zone_wait_ticks = max(1, int(round(self._float_param("zone_wait_timeout") / self._dt)))
         self._zone_let_out_ticks = max(0, int(round(self._float_param("zone_let_out_timeout") / self._dt)))
+        self._zone_route_choice = bool(self.get_parameter("zone_route_choice").value)
+        if hasattr(self, "_zones"):
+            self._zones.route_choice = self._zone_route_choice
         self._profile_phases = self.get_parameter("profile_phases").value
         self._profile_interval = self._int_param("profile_interval")
 
@@ -1817,7 +1827,7 @@ class AgentManager(Node):
                 if planner is None or planner.needs_global_subgoal:
                     needs_subgoal_ids.add(int(pool.agent_ids[i]))
             subgoal_agents = [a for a in agents if a.state.agent_id in needs_subgoal_ids]
-            steered = self._zones.steer(subgoal_agents, self._high_level_cmds)
+            steered = self._zones.steer(subgoal_agents, self._high_level_cmds, now=self._tick_count * self._dt)
             for planner, group in _group_by(subgoal_agents, key=lambda a: a.global_planner):
                 planner.compute(group, steered)
 
@@ -1916,10 +1926,13 @@ class AgentManager(Node):
                 desired_velocity=agent.state.desired_velocity,
             )
         self._apply_desired_speeds(agents, pool)
-        for aid, x, y, theta in self._zones.hold(pool, self._tick_count, self._zone_wait_ticks, self._dt, self._zone_let_out_ticks):
+        moves = self._zones.hold(pool, self._tick_count, self._zone_wait_ticks, self._dt, self._zone_let_out_ticks)
+        flying = self._zones.flying
+        for aid, x, y, theta in moves:
             idx = pool.idx(aid)
             self._teleport_agent(aid, x, y, theta, float(pool.agent_radius[idx]))
-            self._zones.forget(aid)
+            if aid not in flying:
+                self._zones.forget(aid)
         heading_goals = dict(self._interaction_manager.formation_headings())
         for aid, agent in self._agents.items():
             if aid in heading_goals:
@@ -3153,6 +3166,7 @@ class AgentManager(Node):
         self._interaction_scripts_by_tick.clear()
         self._walls.clear()
         self._obstacles.clear()
+        self._zones.clear_transfers()
         self._zones.set_zones([], [])
         for subsystem in self._wall_aware:
             subsystem.set_walls([])
@@ -3496,6 +3510,15 @@ class AgentManager(Node):
             )
             for z in request.zones
         ]
+        walls = self._all_wall_segments()
+        unreachable = self._zones.unreachable(zones, walls)
+        if unreachable:
+            response.success = False
+            response.message = f"Rejected teleport zones: stair half hold(s) {unreachable} outside the footprint or closer than {HOLD_CLEARANCE} m to a wall, so no one ever crosses (put the hold inside the half, before the seam wall)"
+            self._logger.error(response.message)
+            return response
+        if not walls and any(z.kind for z in zones):
+            self._logger.warning("teleport zones set before any wall: stair half holds are not checked against the walls")
         self._zones.set_zones(zones, [z.open for z in request.zones])
         response.success = True
         response.message = f"Set {len(zones)} teleport zone(s)"

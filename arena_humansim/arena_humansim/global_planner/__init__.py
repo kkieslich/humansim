@@ -280,6 +280,11 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         """Free-space components each pose can walk into, empty where the planner cannot tell."""
         return [frozenset() for _ in poses]
 
+    def route_costs(self, starts: Sequence[Pose2D], goal: Pose2D) -> np.ndarray | None:
+        """Walking cost [m, congestion-weighted where the planner weighs it] from each start to goal, inf where out of
+        reach; None where the planner cannot price routes."""
+        return None
+
     def publish_markers(self, pub: MarkerPublisher) -> None:
         pass
 
