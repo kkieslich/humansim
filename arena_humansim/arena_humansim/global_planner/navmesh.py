@@ -300,6 +300,14 @@ class NavMeshPlanner(GlobalPlanner):
             return super().components(poses)
         return self._router.components(self._inside(np.array([(p.x, p.y) for p in poses], dtype=np.float64)))
 
+    def route_costs(self, starts: Sequence[Pose2D], goal: Pose2D) -> np.ndarray | None:
+        if self._router is None:
+            return None
+        if not starts:
+            return np.zeros(0)
+        pts = self._inside(np.array([(p.x, p.y) for p in starts], dtype=np.float64))
+        return self._router.costs(pts, self._inside(np.array([goal.x, goal.y], dtype=np.float64)))
+
     def _inside(self, p: np.ndarray) -> np.ndarray:
         """p moved onto the meshed frame when it lies beyond it."""
         assert self._mesh is not None

@@ -414,6 +414,33 @@ class Router:
         comp = self._comp[nodes]
         return [frozenset(comp[i][np.isfinite(cost[i])].tolist()) for i in range(len(pts))]
 
+    def costs(self, starts: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        """Walking cost from each start to goal over the edge graph, congestion-weighted where set (`set_congestion`), inf
+        where goal is out of reach. Points closer to a wall than the radius are snapped off it first. Shares the per-goal
+        trees with `plan`."""
+        pts = np.atleast_2d(np.asarray(starts, dtype=np.float64)).copy()
+        g = np.asarray(goal, dtype=np.float64).copy()
+        out = np.full(len(pts), np.inf)
+        if self.clearance(g[None])[0] < self.r:
+            q = self.snap(g)
+            if q is None:
+                return out
+            g = q
+        gok, gt, gnodes, gcost = self._terminals(g[None])
+        if not gok[0] or not np.isfinite(gcost[0]).any():
+            return out
+        for i in np.nonzero(self.clearance(pts) < self.r)[0]:
+            q = self.snap(pts[i])
+            if q is not None:
+                pts[i] = q
+        ok, ts, nodes, cost = self._terminals(pts)
+        dist, _ = self._tree(g, gnodes[0], gcost[0])
+        total = np.min(cost + dist[nodes], axis=1)
+        same = ok & (ts == gt[0])
+        total[same] = np.minimum(total[same], np.hypot(*(pts[same] - g).T))
+        out[ok] = total[ok]
+        return out
+
     def line_of_sight(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
         """Per segment A->B: clear of walls by the comfort radius."""
         n = len(A)

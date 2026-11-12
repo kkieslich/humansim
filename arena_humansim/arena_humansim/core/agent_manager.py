@@ -252,6 +252,7 @@ _TUNABLE_PARAMS = frozenset(
         "arrival_tau_brake",
         "zone_wait_timeout",
         "zone_let_out_timeout",
+        "zone_route_choice",
         "profile_phases",
         "profile_interval",
     }
@@ -504,6 +505,11 @@ class AgentManager(Node):
         self.declare_parameter("arrival_tau_brake", 0.15)
         self.declare_parameter("zone_wait_timeout", 30.0)
         self.declare_parameter("zone_let_out_timeout", 10.0)
+        self.declare_parameter(
+            "zone_route_choice",
+            False,
+            ParameterDescriptor(description="walkers that climb take a stair or escalator where that costs less than walking (the global planner's congestion-weighted route costs; stairs at stair speed, escalators at belt speed), also where walking reaches the goal; false: stairs, escalators and cabins only join floor that walking cannot reach"),
+        )
         self.declare_parameter("publish_markers", 0, ParameterDescriptor(integer_range=[IntegerRange(from_value=0, to_value=2)]))
         self.declare_parameter("profile_phases", False)
         self.declare_parameter("profile_interval", 0)
@@ -965,6 +971,7 @@ class AgentManager(Node):
             self._arrival_tau_brake = float(self._dt)
         self._zone_wait_ticks = max(1, int(round(self._float_param("zone_wait_timeout") / self._dt)))
         self._zone_let_out_ticks = max(0, int(round(self._float_param("zone_let_out_timeout") / self._dt)))
+        self._zone_route_choice = bool(self.get_parameter("zone_route_choice").value)
         self._profile_phases = self.get_parameter("profile_phases").value
         self._profile_interval = self._int_param("profile_interval")
 
@@ -1817,7 +1824,8 @@ class AgentManager(Node):
                 if planner is None or planner.needs_global_subgoal:
                     needs_subgoal_ids.add(int(pool.agent_ids[i]))
             subgoal_agents = [a for a in agents if a.state.agent_id in needs_subgoal_ids]
-            steered = self._zones.steer(subgoal_agents, self._high_level_cmds)
+            self._zones.route_choice = self._zone_route_choice
+            steered = self._zones.steer(subgoal_agents, self._high_level_cmds, now=self._tick_count * self._dt)
             for planner, group in _group_by(subgoal_agents, key=lambda a: a.global_planner):
                 planner.compute(group, steered)
 
