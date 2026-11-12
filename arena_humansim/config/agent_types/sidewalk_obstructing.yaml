@@ -1,0 +1,17 @@
+# A stationary pedestrian who turns to face the robot and stands in its way once it is within 10 m ahead.
+name: sidewalk_obstructing
+extends: adult
+mode: behavior_tree
+initial_sequence: idle
+sequences:
+  idle:
+    steps:
+      watch: {kind: robot, when: {ahead: 10.0}}
+    then: obstruct
+  obstruct:
+    then: done
+    steps:
+      block_path: {kind: robot, act: stand, face: robot, duration: {mean: 300.0}}
+  done:
+    steps:
+      rest: {duration: {mean: 3600.0}}

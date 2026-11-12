@@ -24,6 +24,7 @@ For symmetric types (peer-to-peer, no service tag or object anchor - e.g. `GROUP
 | `kind: go_to, target:` | `ClearOutcome -> Resolve -> GoTo` |
 | `kind: attention` (or `attention:` alone) | `ClearOutcome -> Attention -> Satisfy?` (bare: halt, face, drive every channel) |
 | any of the above plus `attention:` | same inner sequence, plus an `AttentionNode` rider as a third `Parallel` child |
+| `kind: robot` | `ClearOutcome -> Robot -> Satisfy?` (waits for the robot trigger, then acts, needs `pool`) |
 | only `duration:` (pure wait) | `ClearOutcome -> Hold` |
 | `autonomous: true` | `AutonomousNode` that scores `actions:` while idle and runs the winner to its end, each action compiled like the step it stands for (a symmetric interaction with `target:` walks there first) |
 

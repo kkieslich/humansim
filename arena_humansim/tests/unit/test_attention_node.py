@@ -25,7 +25,8 @@ from arena_humansim.core.behavior.nodes.attention import (
 from arena_humansim.core.behavior.reach import ARM_IN, ARM_OUT, HEAD_IN, HEAD_OUT, MIN_RESIDENCE_S, reachable
 from arena_humansim.core.behavior.step_context import StepContext
 from arena_humansim.core.interaction_kinds import InteractionType
-from arena_humansim.core.interaction_manager import CONTACT_LOCOMOTION_ONLY, InteractionManager
+from arena_humansim.core.interaction_manager import InteractionManager
+from arena_humansim.params import CONTACT_LOCOMOTION_ONLY
 from arena_humansim.core.pool import KIND_ROBOT
 from arena_humansim.core.world_knowledge import WorldKnowledge, WorldObject
 from arena_humansim.utils.rng import RNG

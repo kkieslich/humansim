@@ -254,6 +254,13 @@ class WallProjectionResolver(CollisionResolver):
             return
         i, j = pairs[:, 0], pairs[:, 1]
         pairs = pairs[np.hypot(pos[i, 0] - pos[j, 0], pos[i, 1] - pos[j, 1]) < radius[i] + radius[j] + offset[i] + offset[j]]
+        if len(pool.ignored_pairs):
+            n_rows = pool.n
+            key = np.minimum(pairs[:, 0], pairs[:, 1]).astype(np.int64) * n_rows + np.maximum(pairs[:, 0], pairs[:, 1])
+            skip = np.minimum(pool.ignored_pairs[:, 0], pool.ignored_pairs[:, 1]) * n_rows + np.maximum(pool.ignored_pairs[:, 0], pool.ignored_pairs[:, 1])
+            pairs = pairs[~np.isin(key, skip)]
+            if len(pairs) == 0:
+                return
         ids = pool.agent_ids[:n][pairs]
         pairs = pairs[np.lexsort((ids.max(axis=1), ids.min(axis=1)))]
         _separate_kernel(pos, pool.vel[:n], radius, pool.policy_idx[:n] != -1, pairs.astype(np.int64), offset, pool.theta[:n])

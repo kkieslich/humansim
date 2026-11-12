@@ -91,6 +91,7 @@ class AgentPool:
 
         self.neighbor_indptr = np.zeros(1, dtype=np.int32)
         self.neighbor_indices = np.empty(0, dtype=np.int32)
+        self.ignored_pairs = np.empty((0, 2), dtype=np.int64)  # row pairs contact separation leaves alone this tick (core/carry.py)
 
     def register_extension(self, ext: PoolAware) -> None:
         assert self.n == 0 or self._late_attach, "register_extension must be called before agents are added"

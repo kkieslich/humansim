@@ -55,11 +55,12 @@ from arena_humansim_msgs.srv import (
     TeleportAgents,
     UpdateRobot,
 )
+from arena_rclpy_mixins.params import Param, declare
 from geometry_msgs.msg import Point32, Vector3
 from geometry_msgs.msg import Pose2D as Pose2DMsg
 from py_trees.common import Status
 from py_trees.trees import BehaviourTree
-from rcl_interfaces.msg import FloatingPointRange, IntegerRange, ParameterDescriptor, SetParametersResult
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.clock import Clock as RclClock
 from rclpy.clock import ClockType
 from rclpy.node import Node
@@ -85,10 +86,11 @@ from arena_humansim.core.agents.loader import resolve_agent_type_name
 from arena_humansim.core.agents.types import ATTENTION_KEYWORDS, AWARENESS_PRESETS, STAIRS_KINDS, ParamDist
 from arena_humansim.core.animation_kinds import AnimationType, locomotion_states
 from arena_humansim.core.behavior.compiler import BehaviorTreeFactory
+from arena_humansim.core.carry import Carrier
 from arena_humansim.core.despawn_monitor import DespawnMonitor
 from arena_humansim.core.formation.clearance import Clearance
 from arena_humansim.core.interaction_kinds import InteractionType, MembershipRole
-from arena_humansim.core.interaction_manager import CONTACT_ENABLED, DEFAULT_STANDING_DISTANCE, GESTURE_ENABLED, InteractionEdge, InteractionManager, InteractionRow, check_gesture_mode
+from arena_humansim.core.interaction_manager import InteractionEdge, InteractionManager, InteractionRow, check_gesture_mode
 from arena_humansim.core.locomotion import LocomotionExtension
 from arena_humansim.core.logger import SimulationLogger
 from arena_humansim.core.pool import KIND_ROBOT, AgentPool, PoolAware
@@ -102,6 +104,7 @@ from arena_humansim.core.world_knowledge import FormationSpec, WorldKnowledge, W
 from arena_humansim.global_planner import LANE_OFFSET_M, LANE_SIDES, GlobalPlanner
 from arena_humansim.local_planner import LocalPlanner
 from arena_humansim.occlusion import Occluder
+from arena_humansim.params import AGENT_MANAGER_PARAMS, GESTURE_ENABLED, MODE_MASTER, MODE_SUBSYSTEM
 from arena_humansim.perception import Perception
 from arena_humansim.utils import RNG
 from arena_humansim.utils.event_bus import EventBus
@@ -425,106 +428,14 @@ def _gesture_msg(intent: GestureIntent) -> GestureMsg:
 
 
 class AgentManager(Node):
-    MODE_MASTER = "master"
-    MODE_SUBSYSTEM = "subsystem"
-
     def __init__(self, **node_kwargs: Any) -> None:
         super().__init__("arena_humansim", **node_kwargs)
         self._logger = self.get_logger()
         Loggable.init_logging(self)
 
         inherited = set(self.list_parameters([], 0).names)
-        self.declare_parameter("seed", 0)
-        self.declare_parameter("dt", 0.05)
-        self.declare_parameter("bt_tick_interval", 5, ParameterDescriptor(integer_range=[IntegerRange(from_value=1, to_value=100000)]))
-        self.declare_parameter("perception", "default")
-        self.declare_parameter("global_planner", "navmesh")
-        self.declare_parameter(
-            "global_planner.inflation_radius",
-            0.38,
-            ParameterDescriptor(description="wall clearance of planned paths [m], rounded up to whole cells", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=5.0)]),
-        )
-        self.declare_parameter(
-            "global_planner.resolution",
-            0.2,
-            ParameterDescriptor(description="planning grid cell size [m]", floating_point_range=[FloatingPointRange(from_value=0.01, to_value=5.0)]),
-        )
-        self.declare_parameter(
-            "global_planner.comfort_radius",
-            0.6,
-            ParameterDescriptor(description="preferred wall clearance of navmesh paths [m], relaxed in narrow passages", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=5.0)]),
-        )
-        self.declare_parameter(
-            "global_planner.clearance_margin",
-            0.25,
-            ParameterDescriptor(
-                description="navmesh: each agent routes with its own radius plus this margin from the walls where a route keeps it, else with the inflation radius; 0 routes every agent with the inflation radius [m]; 0.25 lies between the 0.20 m (corridor walls) and 0.46 m (wide concourses) boundary layers of Pauls' effective-width model",
-                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0)],
-            ),
-        )
-        self.declare_parameter(
-            "global_planner.lane_side",
-            "right",
-            ParameterDescriptor(description="navmesh: the side of a passage a route keeps to, relative to the walking direction (right, left, none); a consistent side preference makes counter-flows separate into lanes (Helbing et al. 2001; Moussaïd et al. 2009)"),
-        )
-        self.declare_parameter(
-            "global_planner.lane_offset",
-            LANE_OFFSET_M,
-            ParameterDescriptor(description="navmesh: how far a route's inner corners move to the lane side where the clearance allows (the whole offset, half of it, or none) [m]; 0.76 is Fruin's walking lane: at a bend both directions wrap the same inner corner and only the one turning away from its lane side can move, so its offset is all the room between them", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0)]),
-        )
-        self.declare_parameter(
-            "global_planner.congestion_interval",
-            5.0,
-            ParameterDescriptor(description="navmesh: every this many seconds routes weigh each passage by how much slower walkers move there at its current density, by Weidmann's speed-density relation (0: off) [s]", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=600.0)]),
-        )
-        self.declare_parameter(
-            "global_planner.stall_time",
-            8.0,
-            ParameterDescriptor(description="an agent that moves less than 0.3 m in this long plans its route anew (0: never) [s]", floating_point_range=[FloatingPointRange(from_value=0.0, to_value=600.0)]),
-        )
-        self.declare_parameter("local_planner", "sfm")
-        self.declare_parameter("force_local_planner", False)
-        self.declare_parameter("robot_policy", "")
-        self.declare_parameter("robot_shutdown", "")
-        self.declare_parameter("force_waypoint_mode", "")
-        self.declare_parameter("animation", "noop")
-        self.declare_parameter("collision", "wall_projection")
-        self.declare_parameter("occlusion", "bitmap")
-        self.declare_parameter("mode", self.MODE_MASTER)
-        self.declare_parameter(
-            "start_on_request",
-            False,
-            ParameterDescriptor(description="subsystem mode: after a reset or remove-all, tick only once start_clock gives the epoch of the first tick"),
-        )
-        self.declare_parameter("log_dir", "")
-        self.declare_parameter("replay_mode", "")
-        self.declare_parameter("waypoint_threshold", 0.1)
-        self.declare_parameter("min_speed_for_heading", 0.1)
-        self.declare_parameter("arrival_r_enter", 0.15)
-        self.declare_parameter("arrival_r_exit", 0.30)
-        self.declare_parameter("arrival_tau_brake", 0.15)
-        self.declare_parameter("zone_wait_timeout", 30.0)
-        self.declare_parameter("zone_let_out_timeout", 10.0)
-        self.declare_parameter(
-            "zone_route_choice",
-            False,
-            ParameterDescriptor(description="walkers that climb take a stair or escalator where that costs less than walking (the global planner's congestion-weighted route costs; stairs at stair speed, escalators at belt speed), also where walking reaches the goal; false: stairs, escalators and cabins only join floor that walking cannot reach"),
-        )
-        self.declare_parameter("publish_markers", 0, ParameterDescriptor(integer_range=[IntegerRange(from_value=0, to_value=2)]))
-        self.declare_parameter("profile_phases", False)
-        self.declare_parameter("profile_interval", 0)
-        self.declare_parameter("record_bag", False)
-        self.declare_parameter("strict_recording", True)
-        self.declare_parameter("trial_id", "")
-        self.declare_parameter("record_dir", "")
-        self.declare_parameter("scenario", "")
-        self.declare_parameter("ticks", 0)
-        self.declare_parameter("time", 0.0)
-        self.declare_parameter("rtf", 1.0, ParameterDescriptor(floating_point_range=[FloatingPointRange(from_value=0.0, to_value=1000.0)]))
-        self.declare_parameter("subsystem_overrun_policy", "lag")
-        self.declare_parameter("contact_mode", CONTACT_ENABLED)
-        self.declare_parameter("locomotion_standing_distance", DEFAULT_STANDING_DISTANCE)
-        self.declare_parameter("gesture_mode", GESTURE_ENABLED)
+        for param in AGENT_MANAGER_PARAMS:
+            declare(self, param)
         self._static_params = frozenset(self.list_parameters([], 0).names) - inherited - _RECONFIGURABLE_PARAMS
 
         seed = self._int_param("seed")
@@ -542,7 +453,7 @@ class AgentManager(Node):
             self._ticks_limit = max(1, int(round(time_limit / self._dt)))
         self._rtf = float(self._float_param("rtf"))
         self._subsystem_overrun_policy = str(self.get_parameter("subsystem_overrun_policy").value)
-        if self._mode == self.MODE_SUBSYSTEM and self._subsystem_overrun_policy != "lag":
+        if self._mode == MODE_SUBSYSTEM and self._subsystem_overrun_policy != "lag":
             raise ValueError(f"subsystem_overrun_policy={self._subsystem_overrun_policy!r} not implemented; only 'lag' is available")
         self._robot_policy_override = str(self.get_parameter("robot_policy").value)
         self._trial_id = str(self.get_parameter("trial_id").value)
@@ -599,6 +510,7 @@ class AgentManager(Node):
         self._declare_local_planner_params(type(self._local_planner))
         self._lp_means = self._read_lp_means()
         self._pinned: dict[int, _Pinned] = {}
+        self._carrier = Carrier()
         self._default_policy_idx: int = 0
         self._policy_names = [self._module_selections["local_planner"]]
         self._policy_name_to_idx = {self._module_selections["local_planner"]: 0}
@@ -853,12 +765,12 @@ class AgentManager(Node):
 
         self._timer: rclpy.timer.Timer | None = None
         self._clock_sub: rclpy.subscription.Subscription | None = None
-        if self._mode == self.MODE_MASTER:
+        if self._mode == MODE_MASTER:
             self._setup_master_mode()
-        elif self._mode == self.MODE_SUBSYSTEM:
+        elif self._mode == MODE_SUBSYSTEM:
             self._setup_subsystem_mode()
         else:
-            raise ValueError(f"Unknown mode '{self._mode}'. Use '{self.MODE_MASTER}' or '{self.MODE_SUBSYSTEM}'.")
+            raise ValueError(f"Unknown mode '{self._mode}'. Use '{MODE_MASTER}' or '{MODE_SUBSYSTEM}'.")
 
         self._sim_logger = None
         if log_dir:
@@ -902,7 +814,7 @@ class AgentManager(Node):
             )
 
         scenario_arg = str(self.get_parameter("scenario").value)
-        if scenario_arg and self._mode == self.MODE_MASTER:
+        if scenario_arg and self._mode == MODE_MASTER:
             self._load_scenario_file(scenario_arg)
         elif scenario_arg:
             self._logger.warning(f"scenario='{scenario_arg}' ignored in mode={self._mode} (orchestrator-driven)")
@@ -1048,14 +960,14 @@ class AgentManager(Node):
         if rtf == self._rtf:
             return
         self._rtf = rtf
-        if self._mode == self.MODE_MASTER:
+        if self._mode == MODE_MASTER:
             assert self._timer is not None
             self._timer.timer_period_ns = int(1e9 * self._dt / rtf) if rtf > 0.0 else 0
 
     def _declare_local_planner_params(self, planner_cls: type[LocalPlanner]) -> None:
         for key in planner_cls.PARAM_DEFAULTS:
             if not self.has_parameter(f"local_planner.{key}"):
-                self.declare_parameter(f"local_planner.{key}", 0.0, ParameterDescriptor(description=f"mean of {key}, 0 = agent type's own, a per-agent spawn value still wins"))
+                declare(self, Param[float](f"local_planner.{key}", 0.0, f"Mean of {key} (0 = agent type's own value, a per-agent spawn value still wins)."))
 
     def _read_lp_means(self) -> dict[str, float]:
         prefix = "local_planner."
@@ -1778,6 +1690,8 @@ class AgentManager(Node):
         default_layer = next(iter(self._perception_cache.values()), None)
         if default_layer is not None and default_layer.supports_pool:
             default_layer.compute_pool(pool)
+        self._carrier.update(pool, self._interaction_manager.carries(), self._dt)
+        self._carrier.exclude(pool)
 
         if is_bt_tick or any(len(a.perception) > 1 for a in agents):
             indptr = pool.neighbor_indptr
@@ -1863,6 +1777,7 @@ class AgentManager(Node):
         t0 = time.perf_counter()
         self._locomotion.restore(pool)
         pool.store_prev_vel()
+        self._carrier.hold_still(pool)
         n = pool.n
         active_mask = pool.policy_idx[:n] != -1
         if not np.any(active_mask):
@@ -1901,6 +1816,7 @@ class AgentManager(Node):
             pool.has_goal[:n] = saved_has_goal
             pool.vel[:n][~active_mask] = 0.0
 
+        self._carrier.transmit(pool)
         self._run_extra_modules(agents, TickPhase.PLAN)
         self._phase_end("local_plan", t0)
 
@@ -1977,6 +1893,7 @@ class AgentManager(Node):
         self._locomotion.constrain(pool, self._dt, self._provides_heading_mask(pool))
         self._apply_external_velocity_pins()
         self._zones.carry(pool)
+        self._carrier.steer(pool, self._dt)
         self._phase_end("kinematics", t0)
 
         t0 = time.perf_counter()
@@ -1991,7 +1908,9 @@ class AgentManager(Node):
         self._phase_end("integrate", t0)
 
         t0 = time.perf_counter()
+        self._carrier.before_collision(pool)
         self._collision.resolve(pool)
+        self._carrier.place(pool)
         self._park_seated(pool)
         self._phase_end("collision", t0)
 
@@ -2713,7 +2632,7 @@ class AgentManager(Node):
         return np.flatnonzero(~np.isin(self._pool.agent_ids[:n], external))
 
     def _header(self) -> Header:
-        if self._mode == self.MODE_SUBSYSTEM:
+        if self._mode == MODE_SUBSYSTEM:
             # covered time on the clock epoch: the stamp advances only as ticks
             # actually complete, so consumers (and lockstep gates) see true
             # coverage instead of a fresh-looking stamp masking engine lag
@@ -2747,14 +2666,17 @@ class AgentManager(Node):
         msg.gait_phase = _flat("d", gait_phase)
         msg.gait_cadence = _flat("d", gait_cadence)
         im = self._interaction_manager
-        active = [im.active_interaction(aid) for aid in pool.agent_ids[rows].tolist()] if self._gesture_mode == GESTURE_ENABLED else [None] * len(rows)
+        active = [im.active_interaction(aid) for aid in pool.agent_ids[rows].tolist()]
+        if self._gesture_mode != GESTURE_ENABLED:  # a push stays on the wire, the pair's poses depend on it
+            active = [a if a is not None and a[1] == InteractionType.PUSH_WHEELCHAIR else None for a in active]
         msg.interaction_id = array.array("i", [a[0] if a is not None else -1 for a in active])
         msg.interaction_type = array.array("B", [int(a[1]) if a is not None else 0 for a in active])
         return msg
 
     def _publish_agent_meta(self, header: Header) -> None:
         self._meta_dirty = False
-        ids = self._pool.agent_ids[self._own_rows()].tolist()
+        rows = self._own_rows()
+        ids = self._pool.agent_ids[rows].tolist()
         names: dict[int, str] = {}
         for name, aid in self._agent_name_to_id.items():
             names.setdefault(aid, name)
@@ -2768,11 +2690,15 @@ class AgentManager(Node):
             tuple(agent.params.name if agent is not None else "" for agent in agents),
             tuple(lifetime.source_name if lifetime is not None else "" for lifetime in lifetimes),
             tuple(lifetime.source_seq if lifetime is not None else 0 for lifetime in lifetimes),
+            tuple(self._pool.robot_awareness[rows]),
+            tuple(self._pool.robot_repulsion_gain[rows]),
+            tuple(self._pool.robot_fov_gain[rows]),
+            tuple(self._pool.robot_reaction_gain[rows]),
         )
         if content == self._meta_published:
             return
         self._meta_published = content
-        policies, _, agent_names, handedness, agent_types, source_names, source_seqs = content
+        policies, _, agent_names, handedness, agent_types, source_names, source_seqs, robot_awareness, robot_repulsion_gain, robot_fov_gain, robot_reaction_gain = content
         msg = AgentMetaMsg(header=header)
         msg.policies = list(policies)
         msg.agent_id = array.array("i", ids)
@@ -2781,6 +2707,10 @@ class AgentManager(Node):
         msg.agent_type = list(agent_types)
         msg.source_name = list(source_names)
         msg.source_seq = array.array("i", source_seqs)
+        msg.robot_awareness = array.array("f", robot_awareness)
+        msg.robot_repulsion_gain = array.array("f", robot_repulsion_gain)
+        msg.robot_fov_gain = array.array("f", robot_fov_gain)
+        msg.robot_reaction_gain = array.array("f", robot_reaction_gain)
         self._agent_meta_pub.publish(msg)
 
     def _publish_agent_gestures(self, header: Header) -> None:
@@ -3181,6 +3111,7 @@ class AgentManager(Node):
         self._last_spawned_ids = []
         self._last_despawned_ids = []
         self._pinned.clear()
+        self._carrier.reset()
         self._publish_world_geometry()
 
     def _update_robot_callback(
@@ -3710,7 +3641,7 @@ class AgentManager(Node):
         super().destroy_node()
 
     def _log_final_rtf(self):
-        if self._mode != self.MODE_MASTER:
+        if self._mode != MODE_MASTER:
             return
         if self._tick_wall_start is None or self._tick_count == 0:
             return

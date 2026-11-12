@@ -109,8 +109,8 @@ class DespawnMonitor(Loggable):
         """Whether the agent is on its way out through its sink, not on its way somewhere else.
 
         A waypoint walker heads for its current waypoint, and one without waypoints left has nowhere else to go. A behavior-tree
-        agent heads for the target of its navigate command; without one (standing, seeking an object, between steps) it is busy
-        with its behavior, not leaving.
+        agent heads for the target of a navigate command that moves it; without one (standing, which navigates to its own pose
+        at zero speed, seeking an object, between steps) it is busy with its behavior, not leaving.
         """
         sink = self._sinks.get(target_sink_name)
         if sink is None:
@@ -118,7 +118,7 @@ class DespawnMonitor(Loggable):
         mv = agent.movement
         if isinstance(mv, BehaviorTreeMovement):
             cmd = mv.command
-            if cmd is None or cmd.type != CommandType.NAVIGATE:
+            if cmd is None or cmd.type != CommandType.NAVIGATE or cmd.desired_velocity <= 0.0:
                 return False
             return self._contains(sink, cmd.target_pose.x, cmd.target_pose.y)
         if isinstance(mv, WaypointMovement) and 0 <= mv.index < len(mv.waypoints):

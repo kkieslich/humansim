@@ -10,6 +10,8 @@ from arena_humansim.core.agents.types import (
     ARM_CHANNELS,
     CHANNEL_SLOTS,
     HEADING_SOURCES,
+    ROBOT_ACTS,
+    ROBOT_GESTURES,
     TUNABLE,
     TUNABLE_PERCEPTION,
     ActionDef,
@@ -30,6 +32,8 @@ from arena_humansim.core.agents.types import (
     Pose3,
     RelativeRef,
     RobotRef,
+    RobotStepDef,
+    RobotTrigger,
     SequenceDef,
     StepDef,
     TransitionDef,
@@ -100,7 +104,7 @@ def _structure_action_def(val: object, _: type) -> ActionDef:
 converter.register_structure_hook(ActionDef, _structure_action_def)
 
 
-_STEP_KINDS = ("object_interact", "go_to", "attention")
+_STEP_KINDS = ("object_interact", "go_to", "attention", "robot")
 
 _ADVANCES = ("dwell", "unreachable")
 _HOLDS = ("release", "keep")
@@ -406,11 +410,54 @@ def _structure_step_def(val: object, _: type) -> StepDef:
 converter.register_structure_hook(StepDef, _structure_step_def)
 
 
+def _structure_robot_trigger(val: object) -> RobotTrigger:
+    if isinstance(val, RobotTrigger):
+        return val
+    d = _as_dict(val)
+    unknown = set(d) - {f.name for f in attrs.fields(RobotTrigger)}
+    if unknown:
+        raise ValueError(f"unknown robot trigger fields: {sorted(unknown)}")
+    for key, num in d.items():
+        if isinstance(num, bool) or not isinstance(num, (int, float)) or num <= 0:
+            raise ValueError(f"robot trigger {key!r} must be a number > 0, got {num!r}")
+    if not {"ahead", "behind", "within"} & set(d):
+        raise ValueError("robot trigger needs at least one of ahead, behind, within")
+    return RobotTrigger(**{k: float(v) for k, v in d.items()})
+
+
+def _structure_robot_step_def(val: object, _: type) -> RobotStepDef:
+    if isinstance(val, RobotStepDef):
+        return val
+    d = _as_dict(val)
+    d.pop("kind", None)
+    if d.get("when") is not None:
+        d["when"] = _structure_robot_trigger(d["when"])
+    if d.get("act", "wait") not in ROBOT_ACTS:
+        raise ValueError(f"robot step 'act' must be one of {ROBOT_ACTS}, got {d['act']!r}")
+    if d.get("gesture", "") not in ROBOT_GESTURES:
+        raise ValueError(f"robot step 'gesture' must be one of {ROBOT_GESTURES}, got {d['gesture']!r}")
+    face = d.get("face")
+    if face is not None and face != "robot" and (isinstance(face, bool) or not isinstance(face, (int, float))):
+        raise ValueError(f"robot step 'face' must be robot or a bearing in degrees, got {face!r}")
+    if d.get("act", "wait") == "wait" and (face is not None or d.get("gesture")):
+        raise ValueError("robot step with act wait takes no face or gesture")
+    if d.get("tune") is not None:
+        d["tune"] = _structure_tune_def(d["tune"])
+    known = {f.name for f in attrs.fields(RobotStepDef) if f.init}
+    unknown = set(d) - known
+    if unknown:
+        raise ValueError(f"unknown robot step fields: {sorted(unknown)}")
+    return RobotStepDef(**d)
+
+
+converter.register_structure_hook(RobotStepDef, _structure_robot_step_def)
+
+
 _BARE_ATTENTION_EXCLUDES = ("interaction", "target", "target_pose", "cancel", "autonomous")
 
 
-def _structure_step_variant(val: object) -> StepDef | GoToStepDef | AttentionStepDef:
-    if isinstance(val, (StepDef, GoToStepDef, AttentionStepDef)):
+def _structure_step_variant(val: object) -> StepDef | GoToStepDef | AttentionStepDef | RobotStepDef:
+    if isinstance(val, (StepDef, GoToStepDef, AttentionStepDef, RobotStepDef)):
         return val
     d = _as_dict(val)
     kind = d.get("kind")
@@ -421,6 +468,8 @@ def _structure_step_variant(val: object) -> StepDef | GoToStepDef | AttentionSte
         return converter.structure(val, GoToStepDef)
     if kind == "attention":
         return converter.structure(val, AttentionStepDef)
+    if kind == "robot":
+        return converter.structure(val, RobotStepDef)
     if kind == "object_interact":
         return converter.structure(val, StepDef)
     raise ValueError(f"unknown step kind {kind!r}; expected one of {_STEP_KINDS}")

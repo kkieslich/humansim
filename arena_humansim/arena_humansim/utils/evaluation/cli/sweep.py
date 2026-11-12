@@ -30,6 +30,7 @@ _THREAD_ENV = {
 }
 
 
+from arena_humansim.params import WAYPOINT_MODES
 from arena_humansim.utils.scenario_discovery import scenario_has_robot as _scenario_has_robot
 
 
@@ -221,8 +222,8 @@ def run_sweep(
 ) -> None:
     if robot_shutdown not in ("", "true", "false"):
         raise ValueError(f"robot_shutdown must be '', 'true', or 'false'; got {robot_shutdown!r}")
-    if force_waypoint_mode not in ("", "once", "repeat", "reverse", "random"):
-        raise ValueError(f"force_waypoint_mode must be '' or one of (once, repeat, reverse, random); got {force_waypoint_mode!r}")
+    if force_waypoint_mode not in WAYPOINT_MODES.values:
+        raise ValueError(f"force_waypoint_mode must be one of {WAYPOINT_MODES.values}; got {force_waypoint_mode!r}")
     output_dir.mkdir(parents=True, exist_ok=True)
     if progress_file is not None:
         progress_file.parent.mkdir(parents=True, exist_ok=True)
@@ -429,7 +430,7 @@ def main() -> None:
     parser.add_argument("--num_workers", type=int, default=1, help="Total cooperating workers; this worker owns trials with index %% num_workers == worker_id.")
     parser.add_argument("--progress_file", type=str, default=None)
     parser.add_argument("--robot_shutdown", choices=("", "true", "false"), default="", help="end each trial when every robot reaches its goal; empty leaves the scenario value (default false).")
-    parser.add_argument("--force_waypoint_mode", choices=("", "once", "repeat", "reverse", "random"), default="", help="override scenario waypoint_mode for every kind=human agent (robots untouched). Empty = scenario value.")
+    parser.add_argument("--force_waypoint_mode", choices=WAYPOINT_MODES.values, default="", help="override scenario waypoint_mode for every kind=human agent (robots untouched). Empty = scenario value.")
     parser.add_argument("--trial_timeout_factor", type=float, default=3.0, help="kill a trial after factor x sim_duration seconds of wall clock (0 disables).")
     parser.add_argument("--prune", action="store_true", help="delete <trial>/bag after extraction unless the trial failed the integrity gate or falls in the deterministic 5%% keep sample.")
     args = parser.parse_args()

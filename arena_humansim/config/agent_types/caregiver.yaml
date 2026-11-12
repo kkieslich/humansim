@@ -1,0 +1,17 @@
+# Caregiver or nurse: an adult who pushes wheelchairs (interaction PUSH_WHEELCHAIR, seeking the rider's offer).
+# While she holds the handles her arms come from the gait profile walk_pushwheelchair (Kimodo, both hands pinned to
+# push handles 0.40 m ahead of the pelvis, 0.42 m apart at 0.995 m, arms re-solved onto them by the retarget's
+# --hold), fingers closed on the handles; stopped she holds that stride's mean pose (stand_pushwheelchair).
+name: caregiver
+extends: adult
+desired_velocity: {mean: 1.2, std: 0.1, clip_low: 0.9, clip_high: 1.5}
+
+pose:
+  while:
+    PUSH_WHEELCHAIR:
+      hold:  # the push handles, diagonal across the palm; curls solved on nurse_female_caucasian_young
+        l: {radius: 0.014, angle: -35, curls: [0.0, 0.25, 0.89, 0.97, 1.05]}
+        r: {radius: 0.014, angle: -35, curls: [0.0, 0.25, 0.89, 0.97, 1.05]}
+      walk: {base: walk_pushwheelchair}
+      run: {same_as: walk}
+      idle: {base: stand_pushwheelchair}

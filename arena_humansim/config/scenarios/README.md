@@ -10,7 +10,7 @@ Every BT step that joins or creates an interaction uses `SeekNode` under the hoo
 |----------|------------------------------------------------|------------------------------|-----------------------|
 | `NONE`   | `TALK_TO`, `GROUP_CONVERSATION`, `GROUP_WALK`, `WAVE_AT`, `HUG`, `SHAKE_HAND` | omitted                   | not allowed           |
 | `OBJECT` | `USE`, `SIT_ON`, `LIE_ON`, `QUEUE_USE`         | `str` (object id or type)    | not allowed           |
-| `TAG`    | `SERVICE`                                      | `str` (service tag; required for `offer: true`, optional for seekers) | provider side only |
+| `TAG`    | `SERVICE`, `PUSH_WHEELCHAIR`                   | `str` (service tag; required for `offer: true`, optional for seekers) | provider side only |
 | `AGENT`  | `BLOCK`                                        | `int` (agent id)             | not allowed           |
 
 `WorldKnowledge.resolve` treats an `OBJECT` target as object id first, then falls back to object type (nearest visible). The loader rejects mismatched shapes (e.g. `target: <str>` on BLOCK, `offer: true` on TALK_TO).
@@ -53,6 +53,7 @@ Cascade (first non-null wins):
 | `LIE_ON`             | `DISTANCE_TOLERANCE` |
 | `GROUP_CONVERSATION` | 3.0                  |
 | `GROUP_WALK`         | 3.0                  |
+| `PUSH_WHEELCHAIR`    | 3.0                  |
 | `TALK_TO`            | 2.0                  |
 | `SERVICE`            | 3.0                  |
 | `WAVE_AT`            | 6.0                   |

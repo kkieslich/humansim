@@ -1,0 +1,19 @@
+# A pedestrian beside the sidewalk who crosses the robot's projected path once the robot is within 4 m ahead.
+name: sidewalk_lateral
+extends: adult
+mode: behavior_tree
+initial_sequence: idle
+sequences:
+  idle:
+    steps:
+      watch: {kind: robot, when: {ahead: 4.0, lateral: 6.0}}
+    then: cross
+  cross:
+    then: done
+    tune:
+      desired_velocity: {mul: 1.3}
+    steps:
+      cross_path: {kind: robot, act: cross, clearance: 3.0, duration: {mean: 60.0}}
+  done:
+    steps:
+      rest: {duration: {mean: 3600.0}}

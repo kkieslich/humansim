@@ -10,7 +10,8 @@ import pytest
 from arena_humansim.core.formation.anchor import PoseAnchor
 from arena_humansim.core.formation.dyad import DyadFormation
 from arena_humansim.core.interaction_kinds import ClipSet, InteractionType
-from arena_humansim.core.interaction_manager import CONTACT_ENABLED, InteractionManager
+from arena_humansim.core.interaction_manager import InteractionManager
+from arena_humansim.params import CONTACT_ENABLED
 from arena_humansim.core.world_knowledge import WorldKnowledge
 from arena_humansim.utils.rng import RNG
 from arena_humansim.utils.types import AnchorKind, BehaviorTreeMovement, CommandType, FormationSpec, HighLevelCommand, Pose2D, SeekSpec

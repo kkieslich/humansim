@@ -10,7 +10,8 @@ pytest.importorskip("rclpy")
 from rclpy.parameter import Parameter
 
 from arena_humansim.core.agent_manager import AgentManager
-from arena_humansim.core.interaction_manager import CONTACT_ENABLED, GESTURE_DISABLED, GESTURE_ENABLED, check_gesture_mode
+from arena_humansim.core.interaction_manager import check_gesture_mode
+from arena_humansim.params import CONTACT_ENABLED, GESTURE_DISABLED, GESTURE_ENABLED
 
 
 class _InteractionManager:

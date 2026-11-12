@@ -10,6 +10,7 @@ import numpy as np
 
 from arena_humansim.core.agents import BaseAgent
 from arena_humansim.core.pool import PoolAware
+from arena_humansim.params import LANE_OFFSET_M, LANE_SIDES  # noqa: F401 - the node parameters' defaults, re-exported
 from arena_humansim.utils import ModuleRegistry
 from arena_humansim.utils.loggable import Loggable
 from arena_humansim.utils.types import CommandType, HighLevelCommand, Pose2D, Segment, WallAware
@@ -27,12 +28,6 @@ PlanRequest = tuple[int, Pose2D, Pose2D]
 DIRECT_RANGE = 3.0
 #: An agent that moves less than this in `stall_time` seconds has stalled [m]
 STALL_M = 0.3
-#: The sides of a passage a route can keep to, relative to the walking direction (`lane_side`)
-LANE_SIDES = ("none", "right", "left")
-#: How far a route's inner corners move to the lane side by default (the node's `global_planner.lane_offset`): Fruin's
-#: 0.76 m walking lane. At a bend both directions wrap the same inner corner; the one with the inside of the bend on its
-#: lane side cannot move further in (the wall), so the other one's offset is all the room between them [m]
-LANE_OFFSET_M = 0.76
 
 
 def simplify_path(

@@ -1,0 +1,17 @@
+# A pedestrian in a tight line from the side of the sidewalk that turns to face along the line once the robot is within 10 m ahead.
+name: sidewalk_queueing
+extends: adult
+mode: behavior_tree
+initial_sequence: idle
+sequences:
+  idle:
+    steps:
+      watch: {kind: robot, when: {ahead: 10.0}}
+    then: queue
+  queue:
+    then: done
+    steps:
+      stand_in_line: {kind: robot, act: stand, face: 90.0, duration: {mean: 300.0}}
+  done:
+    steps:
+      rest: {duration: {mean: 3600.0}}

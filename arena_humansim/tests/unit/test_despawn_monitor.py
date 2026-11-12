@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
 import pytest
 
 pytest.importorskip("rclpy")
 
 from arena_humansim.core.agents.base import BaseAgent
+from arena_humansim.core.agents.types import ParamDist
+from arena_humansim.core.behavior.nodes import HoldNode
 from arena_humansim.core.despawn_monitor import DespawnMonitor
 from arena_humansim.utils.types import (
     AgentLifetime,
@@ -253,6 +256,18 @@ def test_behavior_tree_agent_in_its_sink_without_a_way_out_stays(agent_factory: 
     m.add_sink(_door_strip())
     agent = agent_factory(agent_id=1, x=0.0, y=0.35)
     agent.movement = BehaviorTreeMovement() if command is None else BehaviorTreeMovement(command=HighLevelCommand(agent_id=1, type=command, target_pose=Pose2D(x=0.0, y=0.35)))
+    m.register(1, AgentLifetime(agent_id=1, target_sink_name="door_sink"))
+    assert m.tick({1: agent}, _no_interaction, tick_count=1, dt=0.1) == []
+
+
+def test_behavior_tree_agent_holding_in_its_sink_stays(agent_factory: Callable[..., BaseAgent], rng_np: np.random.Generator) -> None:
+    m = _make_monitor()
+    m.add_sink(_door_strip())
+    agent = agent_factory(agent_id=1, x=0.0, y=0.35)
+    agent.movement = BehaviorTreeMovement()
+    hold = HoldNode("hold", agent, duration_source=ParamDist(5.0), rng=rng_np, dt=0.1)
+    hold.setup()
+    hold.tick_once()
     m.register(1, AgentLifetime(agent_id=1, target_sink_name="door_sink"))
     assert m.tick({1: agent}, _no_interaction, tick_count=1, dt=0.1) == []
 
