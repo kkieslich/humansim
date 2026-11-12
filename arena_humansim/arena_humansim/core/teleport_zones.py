@@ -23,6 +23,8 @@ CHOICE_INTERVAL = 5.0
 #: ... and leaves its choice only for an option cheaper by this share of its cost, at least `SWITCH_M` metres
 SWITCH_SHARE = 0.1
 SWITCH_M = 3.0
+#: A stair half's hold keeps at least this from every wall, or no walker reaches it and no one ever crosses [m]
+HOLD_CLEARANCE = 0.25
 
 
 def _inside(pts: tuple[tuple[float, float], ...], x: float, y: float) -> bool:
@@ -121,6 +123,16 @@ class Transfer:
     chosen: bool = False
 
 
+@attrs.define
+class _Flight:
+    """A pedestrian on a stair flight: from where it crossed the seam to its landing on the partner half, `ticks` long."""
+
+    start: tuple[float, float]
+    end: tuple[float, float, float]
+    t0: int
+    ticks: int
+
+
 @attrs.frozen
 class _Choice:
     goal: tuple[float, float]
@@ -149,6 +161,9 @@ class TeleportZones:
         #: floor that walking cannot reach
         self.route_choice = False
         self._choices: dict[int, _Choice] = {}
+        self._flights: dict[int, _Flight] = {}
+        #: the stair kinds each pedestrian's type climbs, as last steered: a type that does not climb a half is never carried over its seam
+        self._climbs: dict[int, tuple[str, ...]] = {}
 
     def set_zones(self, zones: Sequence[Zone], is_open: Sequence[bool]) -> None:
         """Replace every zone, keeping the transfers through zones that come back unchanged or stairs that keep their destination."""
@@ -177,12 +192,20 @@ class TeleportZones:
         self.riders.clear()
         self._held.clear()
         self._choices.clear()
+        self._flights.clear()
 
     def forget(self, aid: int) -> None:
         self.transfers.pop(aid, None)
         self._banned.pop(aid, None)
         self._held.discard(aid)
         self._choices.pop(aid, None)
+        self._flights.pop(aid, None)
+        self._climbs.pop(aid, None)
+
+    @property
+    def flying(self) -> frozenset[int]:
+        """Pedestrians on a stair flight: their per-tick moves along it are not the end of their transfer."""
+        return frozenset(self._flights)
 
     def steer(self, agents: Sequence[BaseAgent], cmds: dict[int, HighLevelCommand], now: float | None = None) -> dict[int, HighLevelCommand]:
         """Commands with each transferring pedestrian's target swapped for its cabin's wait pose or spot inside, or its stair's seam trigger point.
@@ -193,7 +216,14 @@ class TeleportZones:
         out = dict(cmds)
         groups: dict[GlobalPlanner, list[tuple[BaseAgent, HighLevelCommand]]] = {}
         for agent in agents:
-            cmd = cmds.get(agent.state.agent_id)
+            aid = agent.state.agent_id
+            if agent.state.kind != KIND_ROBOT:
+                self._climbs[aid] = tuple(agent.params.climbs)
+            cmd = cmds.get(aid)
+            flight = self._flights.get(aid)
+            if flight is not None and cmd is not None:
+                out[aid] = attrs.evolve(cmd, target_pose=Pose2D(x=flight.end[0], y=flight.end[1], theta=flight.end[2]))
+                continue
             if cmd is not None and cmd.type == CommandType.NAVIGATE and agent.state.kind != KIND_ROBOT:
                 groups.setdefault(agent.global_planner, []).append((agent, cmd))
         blocked: dict[tuple[str, ...], set[str]] = {}
@@ -324,7 +354,7 @@ class TeleportZones:
                     if d is None or dest in closed:
                         continue
                     ld, fd = self._climb(d, speed)
-                    bound = math.hypot(p.x - z.entry.x, p.y - z.entry.y) + lz * fz + ld * fd + math.hypot(g.x - d.entry.x, g.y - d.entry.y)
+                    bound = math.hypot(p.x - z.entry.x, p.y - z.entry.y) + lz * fz + max(0.0, z.delay) * speed + ld * fd + math.hypot(g.x - d.entry.x, g.y - d.entry.y)
                     if bound < walk[k] or held[k][1] == (name, dest):
                         options.setdefault(k, []).append((name, dest))
         into: dict[str, dict[int, float]] = {}
@@ -353,7 +383,7 @@ class TeleportZones:
             for name, dest in options.get(k, ()):
                 lz, fz = self._climb(self.zones[name], speed)
                 ld, fd = self._climb(self.zones[dest], speed)
-                priced[(name, dest)] = into[name][k] + lz * (fz - 1.0) + onward[(dest, goal)] + ld * (fd - 1.0)
+                priced[(name, dest)] = into[name][k] + lz * (fz - 1.0) + max(0.0, self.zones[name].delay) * speed + onward[(dest, goal)] + ld * (fd - 1.0)
             best = min(priced, key=lambda e: (priced[e], () if e is None else e))
             known, prev = held[k]
             if known and best != prev:
@@ -437,8 +467,10 @@ class TeleportZones:
         overlap[i] = False
         return bool(overlap.any()) or any(math.hypot(lx - x, ly - y) < lr + r for lx, ly, lr in landed)
 
-    def _cross(self, pool: AgentPool) -> list[tuple[int, float, float, float]]:
-        """Teleports of the pedestrians past a stair seam whose landing is clear, the others held still at the seam."""
+    def _cross(self, pool: AgentPool, tick: int = 0, dt: float = 0.05) -> list[tuple[int, float, float, float]]:
+        """Teleports of the pedestrians past a stair seam whose landing is clear, the others held still at the seam. On a
+        half with a `delay` (the stair flight the halves leave out) the pedestrian boards the flight instead (`_fly`). A
+        pedestrian whose type does not climb the half's kind is never carried over."""
         self._held = set()
         teleports: list[tuple[int, float, float, float]] = []
         landed: list[tuple[float, float, float]] = []
@@ -447,9 +479,17 @@ class TeleportZones:
             if not zone.destinations or not zone.past_seam(x, y):
                 continue
             aid = int(pool.agent_ids[i])
+            if aid in self._flights:
+                continue
+            climbs = self._climbs.get(aid)
+            if climbs is not None and zone.kind not in climbs:
+                continue
             transfer = self.transfers.get(aid)
             dest = transfer.destination if transfer is not None and transfer.zone == zone.name else zone.destinations[0]
             lx, ly, theta = self._landing(zone, self.zones[dest], x, y, float(pool.theta[i]))
+            if zone.delay > 0.0:
+                self._flights[aid] = _Flight(start=(x, y), end=(lx, ly, theta), t0=tick, ticks=max(1, round(zone.delay / dt)))
+                continue
             if self._occupied(pool, i, lx, ly, landed):
                 self._held.add(aid)
                 ax, ay = zone.axis
@@ -520,8 +560,54 @@ class TeleportZones:
                 cx, cy = zone.center
                 dx, dy = self.zones[transfer.destination].center
                 teleports.append((aid, x - cx + dx, y - cy + dy, float(pool.theta[idx])))
-        teleports.extend(self._cross(pool))
+        teleports.extend(self._cross(pool, tick, dt))
+        teleports.extend(self._fly(pool, tick))
         return teleports
+
+    def _fly(self, pool: AgentPool, tick: int) -> list[tuple[int, float, float, float]]:
+        """Move each pedestrian on a stair flight along it (a straight line from its seam crossing to its landing, the floor
+        between the halves), standing, and land it once its `ticks` are over and the landing is clear; until then it waits
+        at the flight's end."""
+        moves: list[tuple[int, float, float, float]] = []
+        landed: list[tuple[float, float, float]] = []
+        for aid in sorted(self._flights):
+            flight = self._flights[aid]
+            idx = pool._id_to_idx.get(aid)
+            if idx is None:
+                del self._flights[aid]
+                continue
+            pool.vel[idx] = 0.0
+            pool.prev_vel[idx] = 0.0
+            pool.desired_vel[idx] = 0.0
+            (sx, sy), (ex, ey, et) = flight.start, flight.end
+            share = (tick - flight.t0) / flight.ticks
+            if share < 1.0:
+                moves.append((aid, sx + (ex - sx) * share, sy + (ey - sy) * share, math.atan2(ey - sy, ex - sx)))
+            elif not self._occupied(pool, idx, ex, ey, landed):
+                landed.append((ex, ey, float(pool.agent_radius[idx])))
+                moves.append((aid, ex, ey, et))
+                del self._flights[aid]
+        return moves
+
+    def unreachable(self, zones: Sequence[Zone], walls: Sequence[tuple[tuple[float, float], tuple[float, float]]]) -> list[str]:
+        """The stair halves among `zones` no walker can cross: the hold outside the footprint, or closer than
+        `HOLD_CLEARANCE` to a wall (the seam trigger lies on the seam wall)."""
+        out = []
+        segs = np.array([(a[0], a[1], b[0], b[1]) for a, b in walls], dtype=np.float64).reshape(-1, 4)
+        for zone in zones:
+            if not zone.kind:
+                continue
+            h = zone.hold
+            if not _inside(zone.footprint, h.x, h.y):
+                out.append(zone.name)
+                continue
+            if len(segs):
+                d = segs[:, 2:] - segs[:, :2]
+                t = np.clip(((h.x - segs[:, 0]) * d[:, 0] + (h.y - segs[:, 1]) * d[:, 1]) / np.maximum((d * d).sum(1), 1e-12), 0.0, 1.0)
+                gap = np.hypot(segs[:, 0] + t * d[:, 0] - h.x, segs[:, 1] + t * d[:, 1] - h.y).min()
+                if gap < HOLD_CLEARANCE:
+                    out.append(zone.name)
+        return out
 
     def _free_slot(self, zone: Zone, covered: set[int]) -> int | None:
         taken = {t.slot for t in self.transfers.values() if t.zone == zone.name and t.phase in (Phase.BOARD, Phase.HOLD)} | covered

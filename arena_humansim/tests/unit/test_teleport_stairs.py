@@ -290,3 +290,58 @@ def test_resent_stairs_keep_their_transfers_and_changed_cabins_drop_theirs(agent
     assert sorted(tz.transfers) == [1]
     tz.set_zones([], [])
     assert not tz.transfers
+
+
+def test_a_half_with_a_delay_carries_the_crossing_pedestrian_along_the_flight_then_lands_it(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([attrs.evolve(_up(), delay=1.0), _up_b()])
+    pool = _pool(agent_factory, (1, 9.6, 5.4))
+    tz.transfers[1] = Transfer(goal=(GOAL_B.x, GOAL_B.y), zone="up", destination="up_b")
+    assert tz.hold(pool, 0, 1000, 0.05, 0) == [(1, 9.6, 5.4, pytest.approx(math.atan2(0.45 + LANDING_BACKOFF - 5.4, 22.6 - 9.6)))]
+    assert tz.flying == {1}
+    [(_, x, y, _)] = tz.hold(pool, 10, 1000, 0.05, 0)
+    assert (x, y) == pytest.approx((9.6 + (22.6 - 9.6) * 0.5, 5.4 + (0.45 + LANDING_BACKOFF - 5.4) * 0.5))
+    assert pool.vel[0] == pytest.approx((0.0, 0.0)) and pool.desired_vel[0] == 0.0
+    [(aid, x, y, theta)] = tz.hold(pool, 20, 1000, 0.05, 0)
+    assert (aid, x, y) == (1, pytest.approx(22.6), pytest.approx(0.45 + LANDING_BACKOFF))
+    assert tz.flying == frozenset()
+
+
+def test_a_flight_waits_at_its_end_until_the_landing_clears(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([attrs.evolve(_up(), delay=0.5), _up_b()])
+    pool = _pool(agent_factory, (1, 9.6, 5.4), (2, 22.6, 0.55))
+    tz.transfers[1] = Transfer(goal=(GOAL_B.x, GOAL_B.y), zone="up", destination="up_b")
+    tz.hold(pool, 0, 1000, 0.05, 0)
+    assert all(aid != 1 for aid, *_ in tz.hold(pool, 10, 1000, 0.05, 0))
+    assert tz.flying == {1}
+    pool.pos[1] = (27.0, 2.0)
+    assert [aid for aid, *_ in tz.hold(pool, 11, 1000, 0.05, 0)] == [1]
+    assert tz.flying == frozenset()
+
+
+def test_a_flying_pedestrian_keeps_steering_at_its_landing_and_forget_ends_the_flight(agent_factory: Callable[..., BaseAgent], planner: DijkstraPlanner) -> None:
+    tz = _zones([attrs.evolve(_up(), delay=1.0), _up_b()])
+    walker = _walker(agent_factory, planner, 1, 9.6, 5.4)
+    pool = _pool(agent_factory, (1, 9.6, 5.4))
+    tz.transfers[1] = Transfer(goal=(GOAL_B.x, GOAL_B.y), zone="up", destination="up_b")
+    tz.hold(pool, 0, 1000, 0.05, 0)
+    out = tz.steer([walker], _go([walker], GOAL_B))
+    assert (out[1].target_pose.x, out[1].target_pose.y) == pytest.approx((22.6, 0.45 + LANDING_BACKOFF))
+    tz.forget(1)
+    assert tz.flying == frozenset()
+
+
+def test_a_type_that_does_not_climb_the_half_is_not_carried_over_its_seam(agent_factory: Callable[..., BaseAgent], planner: DijkstraPlanner) -> None:
+    tz = _zones([_up(), _up_b()])
+    chair = _walker(agent_factory, planner, 1, 9.6, 5.4, climbs=())
+    tz.steer([chair], _go([chair], GOAL_A))
+    pool = _pool(agent_factory, (1, 9.6, 5.4))
+    assert tz.hold(pool, 0, 1000, 0.05, 0) == []
+
+
+def test_unreachable_names_stair_halves_whose_hold_is_on_a_wall_or_outside_the_footprint() -> None:
+    tz = TeleportZones()
+    on_seam = _stair("on_seam", ("up_b",), Pose2D(x=5.0, y=5.2), Pose2D(x=10.0, y=5.2), _box(5.0, 4.4, 10.0, 6.0))
+    outside = _stair("outside", ("up_b",), Pose2D(x=5.0, y=5.2), Pose2D(x=10.5, y=5.2), _box(5.0, 4.4, 10.0, 6.0))
+    assert tz.unreachable([_up(), _up_b(), on_seam, outside, *_lift()], WALLS) == ["on_seam", "outside"]
+    assert tz.unreachable([_up()], []) == []  # no walls yet: only the footprint is checked
+    assert tz.unreachable([on_seam], []) == ["on_seam"]  # a hold on the footprint edge counts as outside

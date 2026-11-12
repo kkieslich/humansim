@@ -96,7 +96,7 @@ from arena_humansim.core.recorder import BagRecorder, default_record_dir
 from arena_humansim.core.replay import ReplayManager, ReplayResult
 from arena_humansim.core.robot_services import RobotServiceAdvertiser
 from arena_humansim.core.spawn_scheduler import SpawnScheduler
-from arena_humansim.core.teleport_zones import TeleportZones, Zone
+from arena_humansim.core.teleport_zones import HOLD_CLEARANCE, TeleportZones, Zone
 from arena_humansim.core.viz import MarkerPublisher, publish_infrastructure, publish_module_markers
 from arena_humansim.core.world_knowledge import FormationSpec, WorldKnowledge, WorldObject
 from arena_humansim.global_planner import LANE_OFFSET_M, LANE_SIDES, GlobalPlanner
@@ -1927,7 +1927,8 @@ class AgentManager(Node):
         for aid, x, y, theta in self._zones.hold(pool, self._tick_count, self._zone_wait_ticks, self._dt, self._zone_let_out_ticks):
             idx = pool.idx(aid)
             self._teleport_agent(aid, x, y, theta, float(pool.agent_radius[idx]))
-            self._zones.forget(aid)
+            if aid not in self._zones.flying:
+                self._zones.forget(aid)
         heading_goals = dict(self._interaction_manager.formation_headings())
         for aid, agent in self._agents.items():
             if aid in heading_goals:
@@ -3504,6 +3505,15 @@ class AgentManager(Node):
             )
             for z in request.zones
         ]
+        walls = self._all_wall_segments()
+        unreachable = self._zones.unreachable(zones, walls)
+        if unreachable:
+            response.success = False
+            response.message = f"Rejected teleport zones: stair half hold(s) {unreachable} outside the footprint or closer than {HOLD_CLEARANCE} m to a wall, so no one ever crosses (put the hold inside the half, before the seam wall)"
+            self._logger.error(response.message)
+            return response
+        if not walls and any(z.kind for z in zones):
+            self._logger.warning("teleport zones set before any wall: stair half holds are not checked against the walls")
         self._zones.set_zones(zones, [z.open for z in request.zones])
         response.success = True
         response.message = f"Set {len(zones)} teleport zone(s)"

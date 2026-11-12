@@ -135,3 +135,36 @@ def test_same_seed_same_run_with_route_choice(manager_factory: Callable[..., Age
         assert ids_a == ids_b
         assert np.array_equal(pos_a, pos_b)
         assert tr_a == tr_b
+
+
+def test_a_stair_half_whose_hold_lies_on_the_seam_wall_is_refused(manager_factory: Callable[..., AgentManager]) -> None:
+    mgr = _manager(manager_factory, "route_choice_refuse", True, [])
+    bad = _half("st_a", "st_b", (10.0, 5.0, 0.0), (14.0, 5.0), (10.0, 4.0, 14.0, 6.0))
+    good = _half("st_b", "st_a", (20.0, 5.0, math.pi), (16.45, 5.0), (16.0, 4.0, 20.0, 6.0))
+    response = mgr._set_teleport_zones_callback(SetTeleportZones.Request(zones=[bad, good]), SetTeleportZones.Response())
+    assert not response.success
+    assert "st_a" in response.message and "st_b" not in response.message.split("[")[1].split("]")[0]
+    assert set(mgr._zones.zones) == {"st_a", "st_b"}  # the zones set before stay
+
+
+def test_a_stair_flight_takes_its_delay_between_the_seam_and_the_landing(manager_factory: Callable[..., AgentManager]) -> None:
+    mgr = _manager(manager_factory, "route_choice_flight", True, _pair()[:1])
+    zones = [_half("st_a", "st_b", (10.0, 5.0, 0.0), (13.55, 5.0), (10.0, 4.0, 14.0, 6.0)), _half("st_b", "st_a", (20.0, 5.0, math.pi), (16.45, 5.0), (16.0, 4.0, 20.0, 6.0))]
+    zones[0].delay = 3.0
+    assert mgr._set_teleport_zones_callback(SetTeleportZones.Request(zones=zones), SetTeleportZones.Response()).success
+    boarded = landed = None
+    between = []
+    for n in range(1200):
+        mgr.tick()
+        if 1 in mgr._zones.flying and boarded is None:
+            boarded = n
+        x, y = _pos(mgr, 1)
+        if boarded is not None and landed is None and 14.0 < x < 16.0:
+            between.append(x)
+        if boarded is not None and landed is None and 1 not in mgr._zones.flying:
+            landed = n
+            assert 16.0 <= x <= 20.0
+            break
+    assert boarded is not None and landed is not None
+    assert (landed - boarded) * 0.05 >= 3.0 - 1e-9
+    assert len(between) > 10 and between == sorted(between)

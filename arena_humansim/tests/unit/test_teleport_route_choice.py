@@ -222,3 +222,16 @@ def test_forget_drops_the_choice(agent_factory: Callable[..., BaseAgent], planne
     tz.forget(1)
     assert 1 not in tz.transfers
     assert 1 not in tz._choices
+
+
+def test_the_stair_flight_counts_in_the_stair_cost(agent_factory: Callable[..., BaseAgent]) -> None:
+    landing = (round(16.45 + LANDING_BACKOFF, 2), 5.0)
+    priced = _Priced({(25.0, 5.0): 40.0, (13.55, 5.0): 9.0, (16.45, 5.0): 60.0}, {(landing, (25.0, 5.0)): 9.0})
+    walker = _walker(agent_factory, priced, 1, 5.0, 5.0)
+    fast = _zones(_stairs())
+    fast.steer([walker], _go([walker], IN_B), now=0.0)
+    assert fast.transfers[1].zone == "st_a"
+    zones = _stairs()
+    slow = _zones([attrs.evolve(zones[0], delay=20.0), zones[1]])
+    slow.steer([walker], _go([walker], IN_B), now=0.0)
+    assert 1 not in slow.transfers
