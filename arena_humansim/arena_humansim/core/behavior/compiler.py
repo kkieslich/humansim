@@ -8,7 +8,7 @@ import py_trees
 from rclpy.logging import get_logger
 
 from arena_humansim.core.agents import AgentType, BaseAgent, ParamDist
-from arena_humansim.core.agents.types import ActionDef, AttentionDef, AttentionStepDef, ClipDef, GoToStepDef, SequenceDef, StepDef, TuneDef
+from arena_humansim.core.agents.types import ActionDef, AttentionDef, AttentionStepDef, ClipDef, GoToStepDef, RobotStepDef, SequenceDef, StepDef, TuneDef
 from arena_humansim.core.interaction_kinds import HandleKind, InteractionType, is_object_bound_name
 from arena_humansim.core.interaction_manager import InteractionManager
 from arena_humansim.core.pool import AgentPool
@@ -33,6 +33,7 @@ from .nodes import (
     PatienceWatchdogNode,
     ResolveObjectNode,
     RiderStep,
+    RobotNode,
     SatisfyNode,
     SeekNode,
     SequenceRiderNode,
@@ -412,10 +413,28 @@ def _expand_attention_step(
     return _watched(node_name, watchdog, children)
 
 
+def _expand_robot_step(
+    node_name: str,
+    step: RobotStepDef,
+    agent: BaseAgent,
+    rng: np.random.Generator,
+    dt: float,
+    pool: AgentPool | None,
+) -> py_trees.composites.Parallel:
+    if pool is None:
+        raise ValueError(f"{node_name}: a robot step requires pool to be threaded into BehaviorTreeFactory.build")
+    watchdog = PatienceWatchdogNode(name=f"{node_name}/watchdog", patience_source=step.patience, rng=rng, dt=dt)
+    children = _head(node_name, agent)
+    children.append(RobotNode(name=f"{node_name}/robot", agent=agent, pool=pool, step=step, rng=rng, dt=dt))
+    if step.satisfies:
+        children.append(SatisfyNode(name=f"{node_name}/satisfy", agent=agent, satisfies=step.satisfies))
+    return _watched(node_name, watchdog, children)
+
+
 class _StepRecipe:
     __slots__ = ("autonomous", "node_name", "step_def", "action_defs", "utility_weights")
 
-    def __init__(self, autonomous: bool, node_name: str, step_def: StepDef | GoToStepDef | AttentionStepDef, action_defs: Mapping[str, ActionDef], utility_weights: Mapping[str, float]) -> None:
+    def __init__(self, autonomous: bool, node_name: str, step_def: StepDef | GoToStepDef | AttentionStepDef | RobotStepDef, action_defs: Mapping[str, ActionDef], utility_weights: Mapping[str, float]) -> None:
         self.autonomous = autonomous
         self.node_name = node_name
         self.step_def = step_def
@@ -428,6 +447,8 @@ class _StepRecipe:
         step = self.step_def
         if isinstance(step, AttentionStepDef):
             return _expand_attention_step(self.node_name, step, agent, world, rng, dt, is_bound_lookup=is_bound_lookup, im=im, agent_lookup=agent_lookup, name_lookup=name_lookup)
+        if isinstance(step, RobotStepDef):
+            return _expand_robot_step(self.node_name, step, agent, rng, dt, pool)
         if isinstance(step, GoToStepDef):
             return _expand_go_to_step(self.node_name, step, agent, world, rng, dt, pool=pool, is_bound_lookup=is_bound_lookup, im=im, agent_lookup=agent_lookup, name_lookup=name_lookup)
         if step.autonomous:

@@ -112,11 +112,18 @@ def _load_walk() -> type[Formation]:
     return WalkFormation
 
 
+def _load_push() -> type[Formation]:
+    from .push import PushFormation
+
+    return PushFormation
+
+
 _registry.register("line", "Line")(_load_line)
 _registry.register("cluster", "Cluster")(_load_cluster)
 _registry.register("f_formation", "F-formation")(_load_f_formation)
 _registry.register("dyad", "Dyad")(_load_dyad)
 _registry.register("walk", "Walk")(_load_walk)
+_registry.register("push", "Push")(_load_push)
 
 
 __all__ = [

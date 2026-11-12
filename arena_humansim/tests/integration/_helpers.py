@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from arena_humansim.core.agent_manager import AgentManager
+from arena_humansim.params import MODE_SUBSYSTEM
 from arena_humansim.utils.scenario import ScenarioConfig
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -24,7 +25,7 @@ def build_manager(
         Parameter("global_planner", Parameter.Type.STRING, str(mods.global_planner)),
         Parameter("local_planner", Parameter.Type.STRING, str(mods.local_planner)),
         Parameter("animation", Parameter.Type.STRING, str(mods.animation)),
-        Parameter("mode", Parameter.Type.STRING, AgentManager.MODE_SUBSYSTEM),
+        Parameter("mode", Parameter.Type.STRING, MODE_SUBSYSTEM),
         Parameter("publish_markers", Parameter.Type.INTEGER, 0),
         Parameter("profile_phases", Parameter.Type.BOOL, True),
     ]

@@ -70,7 +70,7 @@ class AnchorKind(enum.StrEnum):
     LEADER = "leader"
 
 
-_VALID_FORMATION_TYPES = ("line", "cluster", "f_formation", "dyad", "walk")
+_VALID_FORMATION_TYPES = ("line", "cluster", "f_formation", "dyad", "walk", "push")
 
 
 @attrs.define

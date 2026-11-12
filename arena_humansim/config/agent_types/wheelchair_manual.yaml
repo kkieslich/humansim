@@ -52,3 +52,8 @@ pose:
   run:
     same_as: walk
     gain: {factor: 1.0}
+  while:
+    PUSH_WHEELCHAIR:  # pushed by a caregiver: hands resting on the thighs, the wheels roll on their own
+      walk: {base: seated_wheelchair_lap}
+      run: {same_as: walk}
+      idle: {base: seated_wheelchair_lap}

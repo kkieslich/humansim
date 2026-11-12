@@ -10,7 +10,7 @@ import yaml
 
 from ..core.agents import AgentType, VarDef
 from ..core.agents.loader import _load_default_agent_types_raw, _structure_raw, load_agent_types_raw_from_dir, resolve_extends
-from ..core.agents.types import AttentionStepDef, GoToStepDef
+from ..core.agents.types import AttentionStepDef, GoToStepDef, RobotStepDef
 from ..core.interaction_kinds import InteractionType, is_object_bound_name
 from .scenario_loader import converter
 from .types import Pose2D, WaypointMode
@@ -144,7 +144,7 @@ class AnchorConfig:
 
 @attrs.define
 class FormationConfig:
-    type: str = ""  # "line" | "cluster" | "f_formation" | "dyad" | "walk"
+    type: str = ""  # "line" | "cluster" | "f_formation" | "dyad" | "walk" | "push"
     anchor: AnchorConfig | None = None  # defaults to OBJECT anchor on the owning object
     params: dict[str, float] = attrs.Factory(dict)  # strategy-specific (base_step, radius, etc)
 
@@ -522,7 +522,7 @@ def _validate_target_object_refs(config: ScenarioConfig) -> None:
     for atype_name, atype in config.agent_types.items():
         for seq_name, seq in atype.sequences.items():
             for step_name, step in seq.steps.items():
-                if isinstance(step, (GoToStepDef, AttentionStepDef)):
+                if isinstance(step, (GoToStepDef, AttentionStepDef, RobotStepDef)):
                     continue
                 interaction = step.interaction
                 target = step.target

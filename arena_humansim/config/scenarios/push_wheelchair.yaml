@@ -1,0 +1,75 @@
+# push_wheelchair.yaml
+# A caregiver walks up behind a wheelchair user, takes the push handles, pushes the chair along a wall, parks it there
+# and walks off on her own.
+
+name: push_wheelchair
+description: >-
+  Agent 1 sits in a manual wheelchair and offers PUSH_WHEELCHAIR (service tag wheelchair_push). Agent 2, a caregiver,
+  seeks it, walks to the push handles and steers the pair to a spot beside the north wall with the chair carried at
+  her hands, lets go (cancel) and walks away. The rider stays parked where she left him.
+
+simulation:
+  seed: 3
+  dt: 0.05
+  bt_tick_interval: 5
+  max_ticks: 900
+  execution_mode: master
+
+modules:
+  global_planner: navmesh
+
+agent_types:
+  rider:
+    extends: wheelchair_manual
+    mode: behavior_tree
+    initial_sequence: default
+    sequences:
+      default:
+        steps:
+          wait_for_pusher:
+            interaction: PUSH_WHEELCHAIR
+            target: wheelchair_push
+            offer: true
+            wait_for_outcome: true
+        then: parked
+        on_failure: parked
+      parked:
+        steps:
+          stay: {duration: {mean: 1000000.0, std: 0.0, clip_low: 1000000.0, clip_high: 1000000.0}}
+        then: parked
+
+  pusher:
+    extends: caregiver
+    mode: behavior_tree
+    initial_sequence: default
+    sequences:
+      default:
+        steps:
+          take_handles:
+            interaction: PUSH_WHEELCHAIR
+            target: wheelchair_push
+            patience: {mean: 60.0, std: 0.0, clip_low: 60.0, clip_high: 60.0}
+          push_to_wall: {kind: go_to, target_pose: {x: 8.0, y: 2.35, theta: 0.0}}
+          let_go: {cancel: true}
+          walk_off: {kind: go_to, target_pose: {x: 4.0, y: -3.0, theta: 0.0}}
+        then: done
+        on_failure: done
+      done:
+        steps:
+          stand: {duration: {mean: 1000000.0, std: 0.0, clip_low: 1000000.0, clip_high: 1000000.0}}
+        then: done
+
+agents:
+  - agent_id: 1
+    agent_type: rider
+    spawn_pose: {x: 0.0, y: 0.0, theta: 0.0}
+
+  - agent_id: 2
+    agent_type: pusher
+    spawn_pose: {x: -3.0, y: -1.0, theta: 0.0}
+
+walls:
+  - {name: north, start: {x: -6.0, y: 3.0}, end: {x: 14.0, y: 3.0}}
+  - {name: south, start: {x: -6.0, y: -6.0}, end: {x: 14.0, y: -6.0}}
+  - {name: west,  start: {x: -6.0, y: -6.0}, end: {x: -6.0, y: 3.0}}
+  - {name: east,  start: {x: 14.0, y: -6.0}, end: {x: 14.0, y: 3.0}}

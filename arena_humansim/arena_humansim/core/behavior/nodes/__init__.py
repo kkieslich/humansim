@@ -20,6 +20,7 @@ from arena_humansim.core.behavior.nodes.primitives import (
     SatisfyNode,
     TuneNode,
 )
+from arena_humansim.core.behavior.nodes.robot import RobotNode
 from arena_humansim.core.behavior.nodes.state_machine import SequenceStateMachine
 from arena_humansim.core.behavior.nodes.utility import check_condition, preconditions_met, score_actions
 
@@ -36,6 +37,7 @@ __all__ = [
     "PatienceWatchdogNode",
     "ResolveObjectNode",
     "RiderStep",
+    "RobotNode",
     "SatisfyNode",
     "SeekNode",
     "SequenceRiderNode",

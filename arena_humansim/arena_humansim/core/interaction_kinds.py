@@ -34,6 +34,7 @@ class InteractionType(enum.IntEnum):
     HUG = 10
     SHAKE_HAND = 11
     GROUP_WALK = 12
+    PUSH_WHEELCHAIR = 13
 
     @property
     def kind(self) -> InteractionKind:
@@ -133,6 +134,7 @@ class InteractionKind:
     clips: tuple[ClipSet, ...] = ()  # one drawn per interaction, shown while a participant, authored attention.clip overrides
     posture: str = "standing"  # standing | seated | prone while a participant
     render_pose_override: bool = False  # display the formation target instead of the physics pose (contact kinds)
+    engaged_on_arrival: bool = False  # bound and shown only once the formation reports the member arrived (a grip, not a meeting)
 
     @property
     def is_object_bound(self) -> bool:
@@ -330,6 +332,17 @@ def _registry() -> dict[InteractionType, InteractionKind]:
             contract_defaults=ContractDefaults(min_participants=2, max_participants=-1, queueable=False),
             formation_default=_fs("walk", AnchorKind.LEADER),
             interaction_radius=3.0,
+        ),
+        # The rider offers (`offer: true`, a service tag), a pusher seeks it, walks to the push handles and steers the
+        # pair from then on, the chair carried at the handles (core/carry.py). Bound for both once she holds them.
+        InteractionType.PUSH_WHEELCHAIR: InteractionKind(
+            label="PUSH",
+            handle=_TAG_HANDLE,
+            contract_defaults=ContractDefaults(min_participants=2, max_participants=2, queueable=False),
+            formation_default=_fs("push", AnchorKind.PROVIDER),
+            allows_offer=True,
+            interaction_radius=3.0,
+            engaged_on_arrival=True,
         ),
         InteractionType.BLOCK: InteractionKind(
             label="BLOCK",

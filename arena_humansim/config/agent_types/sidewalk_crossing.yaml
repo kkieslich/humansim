@@ -1,0 +1,24 @@
+# A pedestrian at a crosswalk end who walks the crosswalk toward the robot's position once the robot is within 8 m, or the robot_in_zone stimulus fires.
+name: sidewalk_crossing
+extends: adult
+mode: behavior_tree
+initial_sequence: idle
+needs:
+  robot_in_zone:
+    initial: {mean: 0.0, clip_low: 0.0, clip_high: 0.0}
+    decay_rate: {mean: 0.0, clip_low: 0.0, clip_high: 0.0}
+sequences:
+  idle:
+    steps:
+      watch: {kind: robot, when: {within: 8.0, lateral: 8.0}}
+    then: cross
+    transitions:
+      - when: {robot_in_zone: {above: 50.0}}
+        goto: cross
+  cross:
+    then: done
+    steps:
+      traverse: {kind: robot, act: traverse, lead: 8.0, duration: {mean: 60.0}}
+  done:
+    steps:
+      rest: {duration: {mean: 3600.0}}

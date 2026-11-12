@@ -27,7 +27,7 @@ Four `HandleKind`s, one strategy each, all in `interaction_kinds.py`:
 | Kind | Target shape | `find` scan | `populate_state` writes |
 |---|---|---|---|
 | `NONE` (symmetric: TALK_TO, GROUP_CONVERSATION, GROUP_WALK, WAVE_AT) | omitted | `_scan_symmetric` - visible peer of same type | - |
-| `TAG` (SERVICE) | `str` tag | `_scan_tag` - visible provider with matching `service_tag`; requires `offer=True` to create | `state["service_tag"]` |
+| `TAG` (SERVICE, PUSH_WHEELCHAIR) | `str` tag | `_scan_tag` - visible provider with matching `service_tag`; requires `offer=True` to create | `state["service_tag"]` |
 | `AGENT` (BLOCK) | `int` agent id | `_scan_agent` - interaction with matching `target_agent` | `state["target_agent"]` |
 | `OBJECT` (SIT_ON, LIE_ON, USE, QUEUE_USE) | `str` object or type | `_find_object_bound` - `_interaction_by_object_type[(object_id, type)]`, then retry via `WorldKnowledge.resolve` | returns `object_id` (stored on `InteractionState.object_id`, not `state[]`) |
 
@@ -91,7 +91,7 @@ A formation tick is an `update(..., formations=True)` call. The agent manager ma
 
 - `OBJECT` -> `ObjectAnchor` on `spec.anchor_ref or interaction.object_id`.
 - `AGENT` -> `AgentAnchor` on `int(spec.anchor_ref)`.
-- `PROVIDER` -> `AgentAnchor` on `interaction.provider` (used by SERVICE's `f_formation`).
+- `PROVIDER` -> `AgentAnchor` on `interaction.provider` (used by SERVICE's `f_formation` and PUSH_WHEELCHAIR's `push`).
 - `POSE` -> `PoseAnchor` on `spec.anchor_pose`.
 - `CENTROID` -> `CentroidAnchor` over live participants.
 - `LEADER` -> `AgentAnchor` on the creator, `participants[0]` (used by GROUP_WALK's `walk`).

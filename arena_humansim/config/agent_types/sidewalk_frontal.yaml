@@ -1,0 +1,17 @@
+# A pedestrian who walks toward the robot's position and past it once the robot is within 20 m ahead.
+name: sidewalk_frontal
+extends: adult
+mode: behavior_tree
+initial_sequence: idle
+sequences:
+  idle:
+    steps:
+      watch: {kind: robot, when: {ahead: 20.0}}
+    then: approach
+  approach:
+    then: done
+    steps:
+      walk_at_robot: {kind: robot, act: approach, lead: 3.0, duration: {mean: 120.0}}
+  done:
+    steps:
+      rest: {duration: {mean: 3600.0}}

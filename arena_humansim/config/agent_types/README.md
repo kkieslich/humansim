@@ -59,7 +59,7 @@ Declaring the block at all (even empty) activates the locomotion profile for the
 
 The zero-means-off fields (`footprint_length`, `recovery.*`) take a bare number for `0`, since the dict form's `clip_low` default of `0.01` would lift a `{mean: 0}` to `0.01`.
 
-Pose (`pose:`, optional): passed through untouched to the renderer (arena_runtime's human animation), humansim never reads it. Per-state (`walk`, `idle`, `run`) joint profiles keyed to the published gait phase, see the renderer's profile docs. `hold: {l|r: <grip radius m> | {radius, angle, curls, wrap}}` closes each named hand on a prop of that radius (cane, pole, walker handle): the renderer solves the finger curls from the template hand skeleton; `angle` turns the grip in the palm (deg), `curls` (thumb to pinky) gives a character's own curls instead (the retarget's `--hold` reports them), `wrap: true` closes the thumb over the fingers.
+Pose (`pose:`, optional): passed through untouched to the renderer (arena_runtime's human animation), humansim never reads it. Per-state (`walk`, `idle`, `run`) joint profiles keyed to the published gait phase, see the renderer's profile docs. `hold: {l|r: <grip radius m> | {radius, angle, curls, wrap}}` closes each named hand on a prop of that radius (cane, pole, walker handle): the renderer solves the finger curls from the template hand skeleton; `angle` turns the grip in the palm (deg), `curls` (thumb to pinky) gives a character's own curls instead (the retarget's `--hold` reports them), `wrap: true` closes the thumb over the fingers. `while: {<interaction>: <pose section>}` gives the whole profile the agent takes while in that interaction (e.g. `caregiver` pushing a wheelchair, `wheelchair_manual` being pushed).
 
 Interaction class (`interaction_class:`, optional name string): social-force class of the type for the local planners' per-class gain matrices. Unset = `human`, robots are always `robot`, any other word (e.g. `wheelchair`) registers a new class on first sight, see [../../arena_humansim/core/interaction_classes.py](../../arena_humansim/core/interaction_classes.py).
 
@@ -118,7 +118,7 @@ Candidate actions the autonomous selector can pick from. Fields:
 | Field | Meaning |
 |---|---|
 | `when` | `{need: {below\|above: X}}` - preconditions gating the action. |
-| `interaction` | One of `TALK_TO`, `GROUP_CONVERSATION`, `GROUP_WALK`, `SIT_ON`, `LIE_ON`, `USE`, `QUEUE_USE`, `WAVE_AT`, `BLOCK`, `SERVICE`. Omit for nav-only. |
+| `interaction` | One of `TALK_TO`, `GROUP_CONVERSATION`, `GROUP_WALK`, `SIT_ON`, `LIE_ON`, `USE`, `QUEUE_USE`, `WAVE_AT`, `BLOCK`, `SERVICE`, `PUSH_WHEELCHAIR`. Omit for nav-only. |
 | `target` | Object id / object type / service tag / agent id, per the interaction's handle kind. |
 | `duration` | Distribution (seconds). |
 | `patience` | Distribution (seconds) capping the whole action (nav + execute). |
@@ -216,7 +216,7 @@ Each step is either a `StepDef` (interaction, pure-wait, cancel) or a `GoToStepD
 
 | Field | Meaning |
 |---|---|
-| `interaction` | `TALK_TO` / `GROUP_CONVERSATION` / `GROUP_WALK` / `WAVE_AT` / `SIT_ON` / `LIE_ON` / `USE` / `QUEUE_USE` / `BLOCK` / `SERVICE`. Omit for a pure-wait step. |
+| `interaction` | `TALK_TO` / `GROUP_CONVERSATION` / `GROUP_WALK` / `WAVE_AT` / `SIT_ON` / `LIE_ON` / `USE` / `QUEUE_USE` / `BLOCK` / `SERVICE` / `PUSH_WHEELCHAIR`. Omit for a pure-wait step. |
 | `target` | Interpreted per the interaction's handle kind: object id/type for `OBJECT`, service tag (str) for `SERVICE`, agent id (int) for `BLOCK`, omit for symmetric types. |
 | `offer` | SERVICE provider side. `true` makes this step create-and-wait rather than find-and-join. Required when a SERVICE interaction has no existing provider. |
 | `cancel` | `true` => emit STOP with `reason=CANCELED` on the agent's current interaction. Mutually exclusive with `interaction:`. |
@@ -235,7 +235,7 @@ Each step is either a `StepDef` (interaction, pure-wait, cancel) or a `GoToStepD
 | `on_failure` | Accepted (default `"abort"`) but not read by the compiler - a step FAILURE always propagates to the enclosing sequence's own `on_failure`. |
 | `interruptible` | Accepted (bool, default unset) but not read anywhere. |
 
-`offer: true` is only valid for interactions that allow it (only `SERVICE`). Provider-side fields (`queueable`, `min_participants`, `max_participants`, `formation_spec`) require `offer: true`, or loading fails. Unknown step fields fail to load with the offending key names. A few older field names are explicitly rejected with a migration hint: `accept`, `interaction: FOLLOW`, `target_object_id`, `target_object_type`, `target_agent`, `service_tag` (use `target:` and, for FOLLOW, `interaction: SERVICE` with `offer: true`).
+`offer: true` is only valid for interactions that allow it (`SERVICE`, `PUSH_WHEELCHAIR`). Provider-side fields (`queueable`, `min_participants`, `max_participants`, `formation_spec`) require `offer: true`, or loading fails. Unknown step fields fail to load with the offending key names. A few older field names are explicitly rejected with a migration hint: `accept`, `interaction: FOLLOW`, `target_object_id`, `target_object_type`, `target_agent`, `service_tag` (use `target:` and, for FOLLOW, `interaction: SERVICE` with `offer: true`).
 
 `GoToStepDef` (`kind: go_to`) takes exactly one of:
 
@@ -243,6 +243,43 @@ Each step is either a `StepDef` (interaction, pure-wait, cancel) or a `GoToStepD
 - `target: <str>` - object id/type, the compiler emits `Resolve -> GoTo`.
 
 Plus `duration:` (optional hold on arrival), `patience:`, `satisfies:`, `on_failure:` and `interruptible:` (both accepted, neither read by the compiler).
+
+### Robot step
+
+`kind: robot` gates and drives a step on the nearest robot (an agent of kind robot, fed from the world state). It needs the agent pool, so it only compiles through `BehaviorTreeFactory.build(pool=...)`.
+
+```yaml
+sequences:
+  idle:
+    steps:
+      watch: {kind: robot, when: {ahead: 10.0}}   # SUCCESS once the robot is within 10 m ahead
+    then: block
+  block:
+    steps:
+      stand: {kind: robot, act: stand, face: robot, gesture: halt, duration: {mean: 30.0}}
+```
+
+The frame is the robot's: its heading is its velocity direction above 0.1 m/s, else its pose theta. `ahead: D` holds while the agent is `0 < along <= D` metres in front of the robot, `behind: D` while it is `D >= -along > 0` behind it, `within: D` while the plain distance is at most `D`, and `lateral: L` (default 5) bounds the sideways offset. Every set field must hold. Until the trigger holds the agent stands still. Leave `patience:` off, it also times the wait. A step without `when:` triggers at once.
+
+| Field | Meaning |
+|---|---|
+| `when` | Trigger `{ahead, behind, within, lateral}`, at least one of the first three. |
+| `act` | `wait` (default, SUCCESS at the trigger), `stand`, `approach`, `cross`, `traverse`, `pass`. |
+| `face` | Not valid with `act: wait`. `robot` keeps the heading on the robot, a number is a bearing in degrees in the robot frame latched at the trigger. |
+| `gesture` | `halt`, `halt_l` or `halt_r`: the stop gesture, published on the `gestures` channel at the robot's position with the agent's handedness for `halt`. Not valid with `act: wait`. |
+| `lead` | `approach`: metres walked past the robot. `pass`: metres ahead of the robot aimed at. `traverse`: metres walked toward the robot's position. Default 3. |
+| `clearance` | `cross`: minimum metres past the robot's path. `pass`: sideways metres from the robot's path. `traverse`: sideways shift. Default 1. |
+| `duration`, `patience`, `satisfies`, `tune` | As on any step. `duration` caps the act, not the wait. |
+
+Acts after the trigger:
+
+- `stand` holds the pose for `duration`, faces and gestures.
+- `approach` walks at the robot's current position extended `lead` metres along the line from the agent to it at the trigger. SUCCESS once the agent is a metre past the robot.
+- `cross` latches the point mirrored across the robot's path line (the line through the robot along its heading at the trigger) and walks there. SUCCESS once across the line by 0.3 m or at the point.
+- `traverse` latches the point `lead` metres from the agent toward the robot's position at the trigger, shifted sideways by `clearance`, and walks there.
+- `pass` aims at the point `lead` metres ahead of the robot and `clearance` to the side the agent is on, re-aimed every tick. SUCCESS once the agent is a metre ahead of the robot. Pair it with a sequence `tune:` for the higher speed.
+
+The act ends with SUCCESS when `duration` runs out or the robot disappears. Facing and gestures are released when the step ends.
 
 ### Pure-wait step
 
@@ -301,6 +338,21 @@ For a `dynamic:` scenario entry, `ArenaHumanDynamicObstacle.sample_params` (in [
 - `interested` - curious pedestrian watching or approaching the robot (`robot_awareness: 1.0`, `robot_repulsion_gain: 0.6`).
 - `aggressive` - assertive pedestrian with reduced robot avoidance clearance and assertive cutting across (`robot_repulsion_gain: 0.4`, `robot_fov_gain: 0.8`, `robot_reaction_gain: 1.2`).
 - `scared` - cautious pedestrian yielding early with wide clearance (`robot_repulsion_gain: 2.0`, `robot_fov_gain: 1.2`, `robot_reaction_gain: 0.7`).
+- `sidewalk_obstructing`, `sidewalk_conversing`, `sidewalk_queueing`, `sidewalk_frontal`, `sidewalk_lateral`, `sidewalk_overtaking`, `sidewalk_crossing`, `sidewalk_gesturing` - the eight SidewalkBench pedestrian behaviors, each `extends: adult` in `behavior_tree` mode. A type idles in sequence `idle` on a robot step until its trigger holds, runs the behavior, then parks in `done`.
+
+| Type | Trigger | Behavior |
+|---|---|---|
+| `sidewalk_obstructing` | `ahead: 10` | stands, facing the robot |
+| `sidewalk_conversing` | `ahead: 10` | `GROUP_CONVERSATION` with the peers that fire together |
+| `sidewalk_queueing` | `ahead: 10` | stands facing 90 degrees left of the robot's heading, so a lateral line becomes a queue |
+| `sidewalk_frontal` | `ahead: 20` | `approach` |
+| `sidewalk_lateral` | `ahead: 4` | `cross`, 1.3 times faster |
+| `sidewalk_overtaking` | `behind: 6` | `pass`, 1.5 times faster |
+| `sidewalk_crossing` | `within: 8`, or the `robot_in_zone` need above 50 | `traverse` 8 m toward the robot |
+| `sidewalk_gesturing` | `ahead: 10` | stands, faces the robot, `halt` gesture |
+
+`sidewalk_crossing` declares the need `robot_in_zone`, so a runtime that knows the crosswalk zone can send the stimulus `robot_in_zone` at 1 to fire the crossing when the robot enters it.
+
 - `robot` - fixed (non-distribution) values for a robot-driven agent: zero `min_turning_radius`, 360deg FOV, no `idle_gaze_rate`.
 - `wheelchair_manual` - manually propelled wheelchair user: `extends: adult`, `along_heading` kinematics on `hsfm` with `heading_source: total`, a 1.1 m capsule footprint, push-stroke speed modulation (two harmonics), stall recovery with a 0.3 m reverse, seated pose with arm push strokes and the `human::mobility::wheelchair` asset. Every number in the file is a placeholder pending literature values (push cadence, stroke speed profile, footprint), not a measured profile.
 - `adult_limp_right` - adult with a right-leg limp: `extends: adult`, uneven cycle timing (`phase_warp.split`), one speed dip and one lateral lurch per cycle, and an asymmetric walk pose (stiff right knee, shortened right hip swing, trunk lean). Every number in the file is a placeholder pending a fitted profile.

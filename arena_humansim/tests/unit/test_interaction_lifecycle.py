@@ -11,11 +11,10 @@ pytest.importorskip("rclpy")
 
 from arena_humansim.core.interaction_kinds import InteractionType
 from arena_humansim.core.interaction_manager import (
-    CONTACT_ENABLED,
-    CONTACT_LOCOMOTION_ONLY,
     InteractionManager,
     LifecycleEdge,
 )
+from arena_humansim.params import CONTACT_ENABLED, CONTACT_LOCOMOTION_ONLY
 from arena_humansim.core.world_knowledge import WorldKnowledge, WorldObject
 from arena_humansim.utils.rng import RNG
 from arena_humansim.utils.types import AnchorKind, BehaviorTreeMovement, CommandType, FormationSpec, HighLevelCommand, Pose2D, SeekSpec

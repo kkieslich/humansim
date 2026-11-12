@@ -7,6 +7,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from arena_humansim.params import WAYPOINT_MODES
 from arena_humansim.utils.evaluation.cli._resume import latest_sweep_dir, peds_root
 from arena_humansim.utils.evaluation.cli.sweep import _trial_dir_name
 from arena_humansim.utils.scenario_discovery import scenario_roots
@@ -68,7 +69,7 @@ def main() -> None:
     parser.add_argument("--cop", action="store_true", help="Mark this as a cognitive-object-permanence ablation run. Requires --robot_policies. Recorded in the manifest as cop=true so the COP analyzer can gate on it.")
     parser.add_argument(
         "--force_waypoint_mode",
-        choices=("", "once", "repeat", "reverse", "random"),
+        choices=WAYPOINT_MODES.values,
         default="reverse",
         help="Override scenario waypoint_mode for every kind=human agent (robots untouched). Default 'reverse' keeps single-waypoint pedestrians cycling for the full sim_duration instead of freezing at the goal. Pass '' to use scenario values.",
     )

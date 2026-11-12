@@ -9,7 +9,7 @@ import pytest
 py_trees = pytest.importorskip("py_trees")
 
 from arena_humansim.core.agents import BaseAgent
-from arena_humansim.core.agents.types import AgentType, GoToStepDef, ParamDist, SequenceDef, StepDef
+from arena_humansim.core.agents.types import AgentType, GoToStepDef, ParamDist, RobotStepDef, SequenceDef, StepDef
 from arena_humansim.core.behavior.compiler import BehaviorTreeFactory
 from arena_humansim.core.behavior.nodes import CancelNode, HoldNode, SeekNode
 from arena_humansim.core.behavior.nodes.primitives import ClearOutcomeNode
@@ -22,8 +22,8 @@ _SCENARIOS_DIR = Path(__file__).resolve().parents[2] / "config" / "scenarios"
 _SCENARIO_PATHS = sorted(_SCENARIOS_DIR.glob("*.yaml"))
 
 
-def _hold_node_step(step: StepDef | GoToStepDef) -> bool:
-    if isinstance(step, GoToStepDef):
+def _hold_node_step(step: StepDef | GoToStepDef | RobotStepDef) -> bool:
+    if isinstance(step, (GoToStepDef, RobotStepDef)):
         return False
     if step.autonomous:
         return False

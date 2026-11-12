@@ -1,0 +1,17 @@
+# A pedestrian who faces the robot and holds up a stop gesture once the robot is within 10 m ahead.
+name: sidewalk_gesturing
+extends: adult
+mode: behavior_tree
+initial_sequence: idle
+sequences:
+  idle:
+    steps:
+      watch: {kind: robot, when: {ahead: 10.0}}
+    then: gesture
+  gesture:
+    then: done
+    steps:
+      stop_gesture: {kind: robot, act: stand, face: robot, gesture: halt, duration: {mean: 300.0}}
+  done:
+    steps:
+      rest: {duration: {mean: 3600.0}}

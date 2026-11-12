@@ -20,6 +20,8 @@ __all__ = [
     "Pose3",
     "RelativeRef",
     "RobotRef",
+    "RobotStepDef",
+    "RobotTrigger",
     "SampledLocomotion",
     "SampledNeed",
     "SampledParams",
@@ -418,8 +420,39 @@ class GoToStepDef:
 
 
 @attrs.frozen
+class RobotTrigger:
+    """Robot-relative gate where every set field must hold."""
+
+    ahead: float | None = None
+    behind: float | None = None
+    within: float | None = None
+    lateral: float = 5.0
+
+
+ROBOT_ACTS = ("wait", "stand", "approach", "cross", "traverse", "pass")
+ROBOT_GESTURES = ("", "halt", "halt_l", "halt_r")
+
+
+@attrs.frozen
+class RobotStepDef:
+    when: RobotTrigger | None = None
+    act: str = "wait"
+    face: str | float | None = None
+    gesture: str = ""
+    lead: float = 3.0
+    clearance: float = 1.0
+    duration: ParamDist | None = attrs.field(default=None, converter=_as_paramdist)
+    patience: ParamDist | None = attrs.field(default=None, converter=_as_paramdist)
+    satisfies: dict[str, float] = attrs.Factory(dict)
+    on_failure: str = "abort"
+    interruptible: bool | None = None
+    tune: TuneDef | None = None
+    attention: None = attrs.field(default=None, init=False)
+
+
+@attrs.frozen
 class SequenceDef:
-    steps: dict[str, StepDef | GoToStepDef | AttentionStepDef]
+    steps: dict[str, StepDef | GoToStepDef | AttentionStepDef | RobotStepDef]
     then: str | None = None
     on_failure: str | None = None
     interruptible: bool = True

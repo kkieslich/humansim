@@ -1,0 +1,20 @@
+# A pedestrian behind the robot who speeds up and passes it on one side once the robot is within 6 m ahead of them.
+name: sidewalk_overtaking
+extends: adult
+mode: behavior_tree
+initial_sequence: idle
+sequences:
+  idle:
+    steps:
+      watch: {kind: robot, when: {behind: 6.0}}
+    then: overtake
+  overtake:
+    then: done
+    tune:
+      desired_velocity: {mul: 1.5}
+      max_velocity: 2.4
+    steps:
+      pass_robot: {kind: robot, act: pass, lead: 3.0, clearance: 1.0, duration: {mean: 60.0}}
+  done:
+    steps:
+      rest: {duration: {mean: 3600.0}}
