@@ -86,6 +86,7 @@ class AgentPool:
         self.kind = np.zeros(capacity, dtype=np.uint8)
         self.interaction_class = np.zeros(capacity, dtype=np.int32)
         self.axial_offset = np.zeros(capacity, dtype=np.float64)
+        self.steer_to_goal = np.zeros(capacity, dtype=np.bool_)  # rows whose heading follows the bearing to their goal (core/locomotion.py)
         self.policy_idx = np.full(capacity, -1, dtype=np.int32)
         self.animation_state = np.zeros(capacity, dtype=np.uint8)
 
@@ -144,6 +145,7 @@ class AgentPool:
         self.kind[i] = 0
         self.interaction_class[i] = 0
         self.axial_offset[i] = 0.0
+        self.steer_to_goal[i] = False
         self.policy_idx[i] = -1
         self.animation_state[i] = agent.state.animation_state
 
@@ -209,6 +211,7 @@ class AgentPool:
                 self.kind,
                 self.interaction_class,
                 self.axial_offset,
+                self.steer_to_goal,
                 self.policy_idx,
                 self.animation_state,
             ):
@@ -331,6 +334,7 @@ class AgentPool:
         self.kind = kind_new
         self.interaction_class = _resize_1d(self.interaction_class)
         self.axial_offset = _resize_1d(self.axial_offset)
+        self.steer_to_goal = _resize_1d(self.steer_to_goal)
         pidx_new = np.full(new_cap, -1, dtype=self.policy_idx.dtype)
         pidx_new[:old] = self.policy_idx[:old]
         self.policy_idx = pidx_new

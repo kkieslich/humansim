@@ -101,7 +101,7 @@ from arena_humansim.core.spawn_scheduler import SpawnScheduler
 from arena_humansim.core.teleport_zones import HOLD_CLEARANCE, TeleportZones, Zone
 from arena_humansim.core.viz import MarkerPublisher, publish_infrastructure, publish_module_markers
 from arena_humansim.core.world_knowledge import FormationSpec, WorldKnowledge, WorldObject
-from arena_humansim.global_planner import LANE_OFFSET_M, LANE_SIDES, GlobalPlanner
+from arena_humansim.global_planner import LANE_OFFSET_M, LANE_SIDES, GlobalPlanner, PassageCommand
 from arena_humansim.local_planner import LocalPlanner
 from arena_humansim.occlusion import Occluder
 from arena_humansim.params import AGENT_MANAGER_PARAMS, GESTURE_ENABLED, MODE_MASTER, MODE_SUBSYSTEM
@@ -1746,8 +1746,11 @@ class AgentManager(Node):
                 planner.compute(group, steered)
 
             self._cached_intermediate_goals = {}
+            passage_commands: dict[int, PassageCommand] = {}
             for planner, _group in _group_by(subgoal_agents, key=lambda a: a.global_planner):
                 self._cached_intermediate_goals.update(planner.get_cached_goals())
+                passage_commands.update(planner.passage_commands())
+            self._locomotion.set_passage(pool, passage_commands)
 
             for aid in self._high_level_cmds:
                 if aid not in needs_subgoal_ids:

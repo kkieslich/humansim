@@ -67,6 +67,16 @@ Assets (`assets:`, optional list of ASA tags): tag query that selects the visual
 
 Climbs (`climbs:`, optional list among `stairs` and `escalator`, default both): the teleport zone stair kinds the type is routed over, see the [teleport zones](../../../README.md#stairs) section. A pedestrian whose type does not climb a kind takes a route over cabins and other stairs, or stays on its level when none exists. `wheelchair_manual` climbs `[]`. Any other word rejects the type.
 
+Wall trailing (`wall_trailing:`, optional, `navmesh` only): `{offset, reach}` in metres, literal numbers. A type with both above 0 walks `offset` from a wall wherever one runs along its route within `reach` of it, on the crowd's side (`global_planner.lane_side`) where both sides have one, crosses doors and side passages straight, goes round what stands against the wall, and crosses open floor only between walls. `offset: 0` or no block leaves the routes as they are. `blind_white_cane` sets it. See [global_planner/README.md](../../arena_humansim/global_planner/README.md#walls-lanes-and-narrow-passages).
+
+Passage (`passage:`, optional, `navmesh` only, for a type with a `locomotion` block): `{lane_width, corridor_width, two_way_width, hold_back, queue_space}` in metres, literal numbers, for a walker that cannot sidestep. Each part is off at 0, and no block leaves the type as it is.
+
+- `lane_width`, `corridor_width` - between walls less than `corridor_width` apart the route runs in the middle of a lane `lane_width` wide on the crowd's side, entered and left in line with the corridor. In the lane the heading follows the route (`hsfm`), not the push of the crowd.
+- `two_way_width`, `hold_back` - a stretch narrower than `two_way_width` is taken by one direction of such walkers at a time: the end that came first goes first, with those behind it. The others stop `hold_back` before the stretch or further out, beside its mouth where the floor allows. Two that met inside: the one that came less far rolls back out.
+- `queue_space` - the walker stays this far (body middle to body middle) behind another of its kind on its route, and where two routes join one gives way.
+
+No shipped type sets it: with the values noted in `wheelchair_manual.yaml` a crowd with many wheelchair users got worse on a large site. The sources of both blocks' values, and which of them have none, are in the two type files.
+
 Module selection (name strings, not distributions):
 
 - `local_planner` - one of [local_planner/README.md](../../arena_humansim/local_planner/README.md)'s `Available` table (default: launch param, normally `sfm`).
