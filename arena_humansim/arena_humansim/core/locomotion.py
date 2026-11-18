@@ -10,7 +10,10 @@ from arena_humansim.core.agents.types import MAX_HARMONICS
 from arena_humansim.core.pool import AgentPool, PoolAware
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from arena_humansim.core.agents import BaseAgent
+    from arena_humansim.global_planner import PassageCommand
 
 MODE_NORMAL = 0
 MODE_ROTATE = 1
@@ -31,6 +34,7 @@ class LocomotionExtension(PoolAware):
     """Gait phase, speed and sway profiles, kinematics modes and stall recovery for the pool's active rows."""
 
     _pool: AgentPool
+    _commanded: bool = False
 
     def attach(self, pool: AgentPool) -> None:
         self._pool = pool
@@ -68,6 +72,9 @@ class LocomotionExtension(PoolAware):
         self.overlay_sway = np.zeros((capacity, 2), dtype=f64)
         self.overlay_vel = np.zeros((capacity, 2), dtype=f64)
         self.pre_theta = np.zeros(capacity, dtype=f64)
+        self.hold = np.zeros(capacity, dtype=np.bool_)
+        self.hold_at = np.zeros((capacity, 4), dtype=f64)
+        self.back = np.zeros(capacity, dtype=np.bool_)
 
     def _arrays(self) -> tuple[np.ndarray, ...]:
         return (
@@ -100,6 +107,9 @@ class LocomotionExtension(PoolAware):
             self.overlay_sway,
             self.overlay_vel,
             self.pre_theta,
+            self.hold,
+            self.hold_at,
+            self.back,
         )
 
     def on_pool_grow(self, new_capacity: int, old_capacity: int) -> None:
@@ -148,6 +158,9 @@ class LocomotionExtension(PoolAware):
         self.overlay_factor[idx] = 1.0
         self.overlay_sway[idx] = 0.0
         self.overlay_vel[idx] = 0.0
+        self.hold[idx] = False
+        self.hold_at[idx] = 0.0
+        self.back[idx] = False
         pool = self._pool
         self.pre_theta[idx] = pool.theta[idx]
         pool.axial_offset[idx] = max(0.0, loc.footprint_length / 2.0 - agent.params.agent_radius)
@@ -191,6 +204,44 @@ class LocomotionExtension(PoolAware):
         self.overlay_factor[rows] = 1.0
         self.overlay_sway[rows] = 0.0
 
+    def set_passage(self, pool: AgentPool, commands: Mapping[int, PassageCommand]) -> None:
+        """Take the planner's lane and hold commands for the rows with a locomotion profile, until the next call: a row in a
+        lane steers its heading at its goal (`pool.steer_to_goal`), a held row slows down to stop at its hold point and
+        makes no stall recovery there, a row told to roll back does so until it is behind the point."""
+        n = pool.n
+        if not commands and not self._commanded:
+            return
+        self._commanded = bool(commands)
+        self.hold[:n] = False
+        self.back[:n] = False
+        pool.steer_to_goal[:n] = False
+        for aid, command in commands.items():
+            idx = pool._id_to_idx.get(aid)
+            if idx is None or not self.active[idx]:
+                continue
+            pool.steer_to_goal[idx] = command.lane
+            if command.hold is not None:
+                self.hold[idx] = True
+                self.hold_at[idx] = command.hold
+                self.back[idx] = command.back
+
+    def _hold(self, pool: AgentPool, rows: np.ndarray, dt: float) -> None:
+        """Slow each held row so that it stops at its hold point (at its `max_acceleration`, never past it), or roll it
+        back behind it."""
+        held = rows[self.hold[rows] & (self.mode[rows] == MODE_NORMAL)]
+        if held.size == 0:
+            return
+        at = self.hold_at[held]
+        left = (at[:, 0] - pool.pos[held, 0]) * at[:, 2] + (at[:, 1] - pool.pos[held, 1]) * at[:, 3]
+        vel = pool.vel[held]
+        along = vel[:, 0] * at[:, 2] + vel[:, 1] * at[:, 3]
+        cap = np.minimum(np.sqrt(2.0 * pool.max_acceleration[held] * np.maximum(left, 0.0)), np.maximum(left, 0.0) / dt)
+        pool.vel[held] = vel * np.where(along > cap, cap / np.maximum(along, 1e-9), 1.0)[:, None]
+        rolling = self.back[held] & (left < 0.0)
+        if rolling.any():
+            theta = pool.theta[held[rolling]]
+            pool.vel[held[rolling]] = -np.minimum(REVERSE_SPEED, -left[rolling] / dt)[:, None] * np.column_stack([np.cos(theta), np.sin(theta)])
+
     def constrain(self, pool: AgentPool, dt: float, provides_heading: np.ndarray) -> None:
         rows = self._rows()
         if rows.size == 0:
@@ -223,6 +274,8 @@ class LocomotionExtension(PoolAware):
         reverse = mode == MODE_REVERSE
         if reverse.any():
             pool.vel[rows[reverse]] = -REVERSE_SPEED * f[reverse]
+        if self._commanded:
+            self._hold(pool, rows, dt)
 
     def _recover(self, pool: AgentPool, rows: np.ndarray, dt: float) -> None:
         rec = rows[self.stall_after[rows] > 0.0]
@@ -233,6 +286,8 @@ class LocomotionExtension(PoolAware):
         delta = goal - pool.pos[rec]
         dist = np.hypot(delta[:, 0], delta[:, 1])
         tracked = pool.has_goal[rec] & (pool.desired_vel[rec] > 0.0) & (dist > GOAL_NEAR_M)
+        if self._commanded:
+            tracked &= ~self.hold[rec]
         new_goal = np.any(goal != self.goal_seen[rec], axis=1)
         self.goal_seen[rec] = goal
         improved = dist < self.best_goal_dist[rec] - IMPROVE_M

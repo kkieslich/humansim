@@ -15,6 +15,28 @@ local_planner_params:
   lateral_gain: 0.0
   heading_source: total
 
+# Corridors and narrow passages (global_planner/navmesh.py and wall_following.py, core/locomotion.py). Off: every field
+# 0, or no block, gives the behaviour the type had before.
+#   lane_width 0.915 m: clear width of an accessible route, 36 in (2010 ADA Standards 403.5.1). The chair keeps the
+#     middle of a lane this wide on the crowd's side (global_planner.lane_side) of a corridor.
+#   corridor_width 3.6 m: a lane is kept between walls closer than this. No source, our choice (twice two_way_width).
+#   two_way_width 1.8 m: a narrower stretch is taken by one direction of wheelchair users at a time. "A clear width of
+#     1800mm will allow two wheelchair users to pass each other" (Singapore BCA Code on Accessibility in the Built
+#     Environment 2019, Fig. 15, and 4.2.1.2 passing spaces). The ADA figure is 60 in, 1525 mm (2010 ADA 403.5.3).
+#     ISO 21542 and DIN 18040-1 (1.8 m) were seen in secondary sources only: not verified.
+#   hold_back 1.5 m: a waiting chair stops at least this far before the stretch. No source, our choice (the size of a
+#     turning space, 2010 ADA 304.3.1, by analogy).
+#   queue_space 1.22 m: floor one chair takes in a queue, 48 in (2010 ADA 305.3, clear floor space 30 x 48 in).
+# That wheelchair users wait is observed ("much more likely to stop and wait", Geoerg, Schumann, Boltes & Kinateder
+# 2022, Sci. Rep. 12:14273, one-way bottlenecks). Who goes first (the end that came first) is our rule: no study of
+# wheelchair users in two-way passages was found.
+passage:
+  lane_width: 0.915
+  corridor_width: 3.6
+  two_way_width: 1.8
+  hold_back: 1.5
+  queue_space: 1.22
+
 locomotion:
   kinematics: along_heading
   cadence: {base: 0.6, per_speed: 0.4, min: 0.6, max: 1.4}

@@ -97,6 +97,10 @@ class HSFMPlanner(SFMPlanner):
             bearing = np.arctan2(d_goal[:, 1], d_goal[:, 0])
             limited = bearing + np.clip(_wrap(total_dir - bearing), -_MAX_TOTAL_DEVIATION, _MAX_TOTAL_DEVIATION)
             theta_des = np.where(from_total, np.where(at_goal, total_dir, limited), theta_des)
+        steered = pool.steer_to_goal[:n] & ~at_goal
+        if np.any(steered):
+            d_goal = pool.goal_pos[:n] - pool.pos[:n]
+            theta_des = np.where(steered, np.arctan2(d_goal[:, 1], d_goal[:, 0]), theta_des)
         return theta_des
 
     def compute_pool(self, pool: AgentPool, store_forces: bool = False, dt: float = 1.0) -> None:

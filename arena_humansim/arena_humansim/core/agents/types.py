@@ -16,6 +16,7 @@ __all__ = [
     "NeedCondition",
     "NeedDist",
     "ParamDist",
+    "Passage",
     "PerceptionDist",
     "Pose3",
     "RelativeRef",
@@ -33,6 +34,7 @@ __all__ = [
     "TransitionDef",
     "TuneDef",
     "VarDef",
+    "WallTrailing",
     "sample_agent_type",
 ]
 
@@ -515,6 +517,61 @@ class LocomotionDist:
     recovery_reverse_m: ParamDist = attrs.field(factory=_zero_dist, converter=_as_paramdist)
 
 
+def _block(cls: type, name: str):  # noqa: ANN202
+    def convert(val: object) -> object:
+        if val is None:
+            return cls()
+        if isinstance(val, cls):
+            return val
+        if not isinstance(val, Mapping):
+            raise ValueError(f"{name} must be a mapping, got {type(val).__name__}")
+        unknown = set(val) - {f.name for f in attrs.fields(cls)}
+        if unknown:
+            raise ValueError(f"unknown {name} fields: {sorted(unknown)}, expected {[f.name for f in attrs.fields(cls)]}")
+        return cls(**{k: float(v) for k, v in val.items()})
+
+    return convert
+
+
+@attrs.frozen
+class WallTrailing:
+    """A walker that keeps a wall within reach of its cane: its route runs `offset` from a wall wherever one runs along it."""
+
+    offset: float = attrs.field(default=0.0, validator=attrs.validators.ge(0.0))
+    reach: float = attrs.field(default=0.0, validator=attrs.validators.ge(0.0))
+
+    @property
+    def active(self) -> bool:
+        return self.offset > 0.0 and self.reach > 0.0
+
+
+@attrs.frozen
+class Passage:
+    """How a walker that cannot sidestep takes corridors: a lane on the crowd's side, and narrow passages one direction at a time."""
+
+    lane_width: float = attrs.field(default=0.0, validator=attrs.validators.ge(0.0))
+    corridor_width: float = attrs.field(default=0.0, validator=attrs.validators.ge(0.0))
+    two_way_width: float = attrs.field(default=0.0, validator=attrs.validators.ge(0.0))
+    hold_back: float = attrs.field(default=0.0, validator=attrs.validators.ge(0.0))
+    queue_space: float = attrs.field(default=0.0, validator=attrs.validators.ge(0.0))
+
+    @property
+    def lanes(self) -> bool:
+        return self.lane_width > 0.0 and self.corridor_width > 0.0
+
+    @property
+    def takes_turns(self) -> bool:
+        return self.two_way_width > 0.0 and self.hold_back > 0.0
+
+    @property
+    def queues(self) -> bool:
+        return self.queue_space > 0.0
+
+    @property
+    def active(self) -> bool:
+        return self.lanes or self.takes_turns or self.queues
+
+
 @attrs.frozen
 class AgentType:
     name: str
@@ -543,6 +600,8 @@ class AgentType:
     interaction_class: str = ""
     assets: tuple[str, ...] = ()
     climbs: tuple[str, ...] = attrs.field(default=STAIRS_KINDS, converter=tuple, validator=attrs.validators.deep_iterable(attrs.validators.in_(STAIRS_KINDS)))
+    wall_trailing: WallTrailing = attrs.field(factory=WallTrailing, converter=_block(WallTrailing, "wall_trailing"))
+    passage: Passage = attrs.field(factory=Passage, converter=_block(Passage, "passage"))
 
     perception_stack: tuple[str, ...] = ("default",)
     local_planner: str | None = None
@@ -616,6 +675,8 @@ class SampledParams:
     locomotion: SampledLocomotion = attrs.Factory(SampledLocomotion)
     interaction_class: str = ""
     climbs: tuple[str, ...] = STAIRS_KINDS
+    wall_trailing: WallTrailing = attrs.field(factory=WallTrailing, converter=_block(WallTrailing, "wall_trailing"))
+    passage: Passage = attrs.field(factory=Passage, converter=_block(Passage, "passage"))
 
     perception_stack: tuple[str, ...] = ("default",)
     local_planner: str | None = None
@@ -735,6 +796,8 @@ def sample_agent_type(
         locomotion=locomotion,
         interaction_class=agent_type.interaction_class,
         climbs=agent_type.climbs,
+        wall_trailing=agent_type.wall_trailing,
+        passage=agent_type.passage,
         perception_stack=agent_type.perception_stack,
         local_planner=agent_type.local_planner,
         global_planner=agent_type.global_planner,
