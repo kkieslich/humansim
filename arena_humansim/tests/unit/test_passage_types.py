@@ -82,19 +82,15 @@ def test_shipped_long_cane_type_trails_walls() -> None:
     assert BUILTIN_AGENTS["blind_white_cane"].wall_trailing == at.wall_trailing
 
 
-def test_shipped_manual_wheelchair_takes_passages_by_rule() -> None:
+def test_shipped_manual_wheelchair_keeps_its_behaviour() -> None:
     at = load_agent_type_from_file(CONFIG_DIR / "wheelchair_manual.yaml")
-    assert at.passage == Passage(lane_width=0.915, corridor_width=3.6, two_way_width=1.8, hold_back=1.5, queue_space=1.22)
+    assert not at.passage.active
     assert not at.wall_trailing.active
-    params = sample_agent_type(at, np.random.default_rng(1))
-    assert params.passage == at.passage
-    assert at.passage.lane_width >= 2.0 * params.agent_radius
-    assert at.passage.queue_space >= params.locomotion.footprint_length
-    assert BUILTIN_AGENTS["wheelchair_manual"].passage == at.passage
+    assert "heading_max_dev" not in at.local_planner_params
 
 
 def test_the_other_shipped_types_are_as_before() -> None:
     for name, agent_type in BUILTIN_AGENTS.items():
-        if name not in ("blind_white_cane", "wheelchair_manual"):
+        if name != "blind_white_cane":
             assert not agent_type.wall_trailing.active, name
             assert not agent_type.passage.active, name

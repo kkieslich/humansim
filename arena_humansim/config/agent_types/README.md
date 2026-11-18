@@ -75,7 +75,7 @@ Passage (`passage:`, optional, `navmesh` only, for a type with a `locomotion` bl
 - `two_way_width`, `hold_back` - a stretch narrower than `two_way_width` is taken by one direction of such walkers at a time: the end that came first goes first, with those behind it. The others stop `hold_back` before the stretch or further out, beside its mouth where the floor allows. Two that met inside: the one that came less far rolls back out.
 - `queue_space` - the walker stays this far (body middle to body middle) behind another of its kind on its route, and where two routes join one gives way.
 
-`wheelchair_manual` sets all of them. The sources of both blocks' values, and which of them have none, are in the two type files.
+No shipped type sets it: with the values noted in `wheelchair_manual.yaml` a crowd with many wheelchair users got worse on a large site. The sources of both blocks' values, and which of them have none, are in the two type files.
 
 Module selection (name strings, not distributions):
 
