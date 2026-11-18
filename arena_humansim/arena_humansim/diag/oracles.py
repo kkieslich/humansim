@@ -124,3 +124,69 @@ class YieldOracle:
                 oracle.yield_ticks += int((pool.has_goal[rows]).sum())
 
         return compute_pool
+
+
+class GoalSpread:
+    """Capacity ablation (not a behaviour proposal): every walker aims at its own point across the passage instead of the
+    shared route corner. Each walker draws a fixed u in [-1, 1]; its subgoal moves perpendicular to the line from the
+    walker to the subgoal by u * s, s = the free half-width at the subgoal on that side (ray cast to the walls) minus the
+    walker's radius and 0.15 m, capped at `cap`. Applied to `pool.set_goals` after the global planner, so the planner's
+    routes, its replanning and every other module see their own subgoals unchanged; only the local planner's target
+    moves. `types`: the walker types it applies to (empty = all)."""
+
+    def __init__(self, mgr: AgentManager, cap: float = 1.5, types: set[str] | None = None, seed: int = 7) -> None:
+        from arena_humansim.utils.wall_grid import WallGrid
+
+        self.mgr = mgr
+        self.cap = cap
+        self.types = types or set()
+        self.rng = np.random.default_rng(seed)
+        self.u: dict[int, float] = {}
+        gp = mgr._global_planner
+        segs = np.asarray(getattr(gp, "_wall_segments", []), dtype=np.float64).reshape(-1, 4)
+        self.grid = WallGrid(segs) if len(segs) else None
+        pool = mgr._pool
+        orig = pool.set_goals
+        spread = self
+
+        def set_goals(goals):
+            orig(goals)
+            spread._shift(pool, goals)
+
+        pool.set_goals = set_goals
+
+    def _shift(self, pool, goals) -> None:
+        from arena_humansim.utils.wall_grid import cast_rays
+
+        if self.grid is None:
+            gp = self.mgr._global_planner
+            segs = np.asarray(getattr(gp, "_wall_segments", []), dtype=np.float64).reshape(-1, 4)
+            if not len(segs):
+                return
+            from arena_humansim.utils.wall_grid import WallGrid
+
+            self.grid = WallGrid(segs)
+        rows, aids = [], []
+        for aid in goals:
+            i = pool._id_to_idx.get(aid)
+            if i is None:
+                continue
+            if self.types:
+                ag = self.mgr._agents.get(aid)
+                if ag is None or ag.params.name not in self.types:
+                    continue
+            rows.append(i)
+            aids.append(aid)
+        if not rows:
+            return
+        rows = np.array(rows)
+        g = pool.goal_pos[rows].copy()
+        d = g - pool.pos[rows]
+        dn = np.hypot(d[:, 0], d[:, 1])
+        ok = dn > 0.5
+        perp = np.column_stack([-d[:, 1], d[:, 0]]) / np.maximum(dn, 1e-9)[:, None]
+        u = np.array([self.u.setdefault(a, float(self.rng.uniform(-1.0, 1.0))) for a in aids])
+        side = np.where(u >= 0, 1.0, -1.0)[:, None] * perp
+        free = cast_rays(self.grid, g, side, self.cap + 1.0)
+        s = np.clip(free - pool.agent_radius[rows] - 0.15, 0.0, self.cap)
+        pool.goal_pos[rows] = np.where(ok[:, None], g + (np.abs(u) * s)[:, None] * side, g)
