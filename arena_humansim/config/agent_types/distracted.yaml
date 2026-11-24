@@ -3,7 +3,7 @@
 # Speed is a little under adult; the difference is perception. A vision range of 2 m and a
 # 90 degree field of view mean the robot enters this agent's awareness at about the distance
 # where an evasive step is already too late, and a long relaxation time means the step,
-# when it comes, is slow. Repulsion is nominal - once they do see you, they yield like anyone.
+# when it comes, is slow. Once they do see you, they yield less urgently than anyone, and they react late.
 name: distracted
 extends: adult
 desired_velocity: {mean: 0.95, std: 0.12, clip_low: 0.5, clip_high: 1.3}
@@ -13,10 +13,10 @@ idle_gaze_rate: {mean: 0.05, std: 0.03, clip_low: 0.0, clip_high: 0.2}
 perception:
   vision_range: {mean: 2.0, std: 0.4, clip_low: 1.0, clip_high: 3.5}
   vision_fov: {mean: 90.0, std: 15.0, clip_low: 60.0, clip_high: 130.0}
-  robot_awareness: 0.3
-  robot_repulsion_gain: 0.6
-  robot_fov_gain: 0.3
-  robot_reaction_gain: 0.5
+  robot_awareness:
+    detection: -0.75
+    repulsion: -3.0
+    reaction: -3.0
 local_planner_params:
   relaxation_time: {mean: 0.9, std: 0.1, clip_low: 0.5, clip_high: 1.5}
   repulsion_strength: {mean: 1.8, std: 0.2, clip_low: 0.5, clip_high: 4.0}

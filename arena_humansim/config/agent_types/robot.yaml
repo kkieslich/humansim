@@ -12,3 +12,9 @@ idle_gaze_rate: 0.0
 perception:
   vision_range: 6.0
   vision_fov: 360.0
+
+local_planner_params:
+  relaxation_time: 0.5
+  repulsion_strength: 2.1
+  repulsion_range: 0.3
+  anisotropy: 0.5

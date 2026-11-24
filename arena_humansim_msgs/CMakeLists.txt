@@ -21,6 +21,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/InteractionContract.msg"
   "msg/InteractionEvent.msg"
   "msg/InteractionFrame.msg"
+  "msg/LaneConfig.msg"
+  "msg/LaneSegment.msg"
   "msg/ObstacleConfig.msg"
   "msg/PerceptionEvent.msg"
   "msg/PerceptionEvents.msg"

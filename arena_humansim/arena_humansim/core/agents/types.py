@@ -38,8 +38,9 @@ __all__ = [
     "sample_agent_type",
 ]
 
+import json
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import overload
 
@@ -62,17 +63,6 @@ class ParamDist:
         return attrs.evolve(self, mean=mean, clip_low=max(self.clip_low + delta, min(self.clip_low, mean)), clip_high=self.clip_high + delta)
 
 
-# Preset mappings: (robot_awareness, robot_repulsion_gain, robot_fov_gain, robot_reaction_gain)
-AWARENESS_PRESETS: dict[str, tuple[float, float, float, float]] = {
-    "blind": (0.0, 0.0, 0.0, 1.0),
-    "distracted": (0.3, 0.6, 0.3, 0.5),
-    "normal": (1.0, 1.0, 1.0, 1.0),
-    "interested": (1.0, 0.6, 1.0, 1.0),
-    "aggressive": (1.0, 0.4, 0.8, 1.2),
-    "scared": (1.0, 2.0, 1.2, 0.7),
-}
-
-
 @overload
 def _as_paramdist(val: None) -> None: ...
 @overload
@@ -92,141 +82,161 @@ def _as_paramdist(val: object) -> "ParamDist | None":
     return val  # type: ignore[return-value]
 
 
-@overload
-def _as_awareness_dist(val: None) -> None: ...
-@overload
-def _as_awareness_dist(val: "ParamDist | float | str | bool | Mapping[str, float]") -> "ParamDist": ...
-@overload
-def _as_awareness_dist(val: object) -> "ParamDist | None": ...
-def _as_awareness_dist(val: object) -> "ParamDist | None":
-    if val is None:
-        return None
-    if isinstance(val, bool):
-        v = 1.0 if val else 0.0
-        return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=1.0)
-    if isinstance(val, str):
-        key = val.strip().lower()
-        if key in AWARENESS_PRESETS:
-            v = AWARENESS_PRESETS[key][0]
-            return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=1.0)
-        try:
-            v = float(key)
-            return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=1.0)
-        except ValueError:
-            raise ValueError(f"unknown awareness preset or value {val!r}; valid presets: {', '.join(sorted(AWARENESS_PRESETS))}") from None
-    if isinstance(val, (int, float)):
-        v = float(val)
-        return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=1.0)
+_DIST_FIELDS: tuple[str, ...] = ("mean", "std", "clip_low", "clip_high")
+
+
+def _as_shift_dist(val: object) -> ParamDist:
     if isinstance(val, ParamDist):
         return val
-    if isinstance(val, dict):
-        d = dict(val)
-        d.setdefault("clip_low", 0.0)
-        d.setdefault("clip_high", 1.0)
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        v = float(val)
+        return ParamDist(mean=v, std=0.0, clip_low=v, clip_high=v)
+    if isinstance(val, Mapping) and "mean" in val:
+        unknown = sorted(str(key) for key in val if key not in _DIST_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown robot awareness distribution field {unknown[0]!r}; valid fields: {', '.join(_DIST_FIELDS)}")
+        try:
+            d = {str(key): float(value) for key, value in val.items()}
+        except (TypeError, ValueError):
+            raise ValueError(f"robot awareness distribution values must be numbers, got {dict(val)!r}") from None
+        if d.get("std", 0.0) < 0.0:
+            raise ValueError(f"robot awareness distribution std must be non-negative, got {d['std']!r}")
+        d.setdefault("clip_low", -math.inf)
+        d.setdefault("clip_high", math.inf)
         return ParamDist(**d)
-    return None
+    raise ValueError(f"robot awareness shift must be a number or a mapping with a mean, got {val!r}")
 
 
-@overload
-def _as_repulsion_dist(val: None) -> None: ...
-@overload
-def _as_repulsion_dist(val: "ParamDist | float | str | bool | Mapping[str, float]") -> "ParamDist": ...
-@overload
-def _as_repulsion_dist(val: object) -> "ParamDist | None": ...
-def _as_repulsion_dist(val: object) -> "ParamDist | None":
+def _as_blind(val: object) -> bool:
+    if not isinstance(val, bool):
+        raise ValueError(f"robot awareness blind must be true or false, got {val!r}")
+    return val
+
+
+@attrs.frozen
+class AwarenessShift:
+    detection: ParamDist = attrs.field(default=ParamDist(0.0, clip_low=0.0, clip_high=0.0), converter=_as_shift_dist)
+    fov: ParamDist = attrs.field(default=ParamDist(0.0, clip_low=0.0, clip_high=0.0), converter=_as_shift_dist)
+    repulsion: ParamDist = attrs.field(default=ParamDist(0.0, clip_low=0.0, clip_high=0.0), converter=_as_shift_dist)
+    reaction: ParamDist = attrs.field(default=ParamDist(0.0, clip_low=0.0, clip_high=0.0), converter=_as_shift_dist)
+    blind: bool = attrs.field(default=False, converter=_as_blind)
+
+
+@attrs.frozen
+class AwarenessMixture:
+    components: tuple[tuple[float, AwarenessShift], ...]
+
+
+AwarenessSpec = AwarenessShift | AwarenessMixture
+
+_SHIFT_FIELDS: tuple[str, ...] = ("detection", "fov", "repulsion", "reaction", "blind")
+
+AWARENESS_PRESETS: dict[str, AwarenessShift] = {
+    "blind": AwarenessShift(blind=True),
+    "distracted": AwarenessShift(detection=-5.0, fov=-8.0, repulsion=-3.0, reaction=-3.0),
+    "normal": AwarenessShift(),
+    "interested": AwarenessShift(repulsion=-3.0, reaction=-1.5),
+    "aggressive": AwarenessShift(fov=-1.0, repulsion=-4.0, reaction=-2.0),
+    "scared": AwarenessShift(fov=2.0, repulsion=6.0, reaction=3.0),
+}
+
+
+def _as_mixture(items: Sequence[object]) -> AwarenessMixture:
+    components: list[tuple[float, AwarenessShift]] = []
+    for item in items:
+        if not isinstance(item, Mapping) or "awareness" not in item:
+            raise ValueError(f"robot awareness mixture entries need an awareness key, got {item!r}")
+        try:
+            weight = float(item.get("weight", 1.0))
+        except (TypeError, ValueError):
+            raise ValueError(f"mixture weights must be numbers, got {item.get('weight')!r}") from None
+        if weight < 0.0:
+            raise ValueError(f"mixture weights must be non-negative and sum above zero, got {weight!r}")
+        shift = as_awareness_spec(item["awareness"])
+        if not isinstance(shift, AwarenessShift):
+            raise ValueError("robot awareness mixtures cannot nest mixtures")
+        components.append((weight, shift))
+    if not components or sum(weight for weight, _ in components) <= 0.0:
+        raise ValueError(f"mixture weights must be non-negative and sum above zero, got {[weight for weight, _ in components]}")
+    return AwarenessMixture(components=tuple(components))
+
+
+def as_awareness_spec(val: object) -> AwarenessSpec:
     if val is None:
-        return None
+        return AWARENESS_PRESETS["normal"]
+    if isinstance(val, (AwarenessShift, AwarenessMixture)):
+        return val
     if isinstance(val, bool):
-        v = 1.0 if val else 0.0
-        return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=float("inf"))
+        return AWARENESS_PRESETS["normal" if val else "blind"]
     if isinstance(val, str):
         key = val.strip().lower()
-        if key in AWARENESS_PRESETS:
-            v = AWARENESS_PRESETS[key][1]
-            return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=float("inf"))
-        try:
-            v = float(key)
-            return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=float("inf"))
-        except ValueError:
-            raise ValueError(f"unknown repulsion gain preset or value {val!r}; valid presets: {', '.join(sorted(AWARENESS_PRESETS))}") from None
-    if isinstance(val, (int, float)):
-        v = float(val)
-        return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=float("inf"))
-    if isinstance(val, ParamDist):
-        return val
-    if isinstance(val, dict):
-        d = dict(val)
-        d.setdefault("clip_low", 0.0)
-        return ParamDist(**d)
-    return None
+        if key not in AWARENESS_PRESETS:
+            raise ValueError(f"unknown robot awareness preset {val!r}; valid presets: {', '.join(sorted(AWARENESS_PRESETS))}")
+        return AWARENESS_PRESETS[key]
+    if isinstance(val, Mapping):
+        unknown = sorted(str(key) for key in val if key not in _SHIFT_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown robot awareness field {unknown[0]!r}; valid fields: {', '.join(_SHIFT_FIELDS)}")
+        return AwarenessShift(**dict(val))
+    if isinstance(val, (list, tuple)):
+        return _as_mixture(val)
+    raise ValueError(f"robot awareness must be a preset name, a field mapping, a mixture list or a bool, got {val!r}")
 
 
-@overload
-def _as_fov_dist(val: None) -> None: ...
-@overload
-def _as_fov_dist(val: "ParamDist | float | str | bool | Mapping[str, float]") -> "ParamDist": ...
-@overload
-def _as_fov_dist(val: object) -> "ParamDist | None": ...
-def _as_fov_dist(val: object) -> "ParamDist | None":
-    if val is None:
+def awareness_from_text(text: str) -> AwarenessSpec | None:
+    """Text form of a robot awareness spec: empty means no override, JSON a shift mapping or a weighted list, anything else a preset name."""
+    stripped = text.strip()
+    if not stripped:
         return None
-    if isinstance(val, bool):
-        v = 1.0 if val else 0.0
-        return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=float("inf"))
-    if isinstance(val, str):
-        key = val.strip().lower()
-        if key in AWARENESS_PRESETS:
-            v = AWARENESS_PRESETS[key][2]
-            return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=float("inf"))
-        try:
-            v = float(key)
-            return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=float("inf"))
-        except ValueError:
-            raise ValueError(f"unknown fov gain preset or value {val!r}; valid presets: {', '.join(sorted(AWARENESS_PRESETS))}") from None
-    if isinstance(val, (int, float)):
-        v = float(val)
-        return ParamDist(mean=v, std=0.0, clip_low=0.0, clip_high=float("inf"))
-    if isinstance(val, ParamDist):
-        return val
-    if isinstance(val, dict):
-        d = dict(val)
-        d.setdefault("clip_low", 0.0)
-        return ParamDist(**d)
-    return None
+    if stripped[0] in "{[":
+        return as_awareness_spec(json.loads(stripped))
+    return as_awareness_spec(stripped)
 
 
-@overload
-def _as_reaction_dist(val: None) -> None: ...
-@overload
-def _as_reaction_dist(val: "ParamDist | float | str | bool | Mapping[str, float]") -> "ParamDist": ...
-@overload
-def _as_reaction_dist(val: object) -> "ParamDist | None": ...
-def _as_reaction_dist(val: object) -> "ParamDist | None":
-    if val is None:
-        return None
-    if isinstance(val, bool):
-        v = 1.0 if val else 0.0
-        return ParamDist(mean=v, std=0.0, clip_low=0.05, clip_high=float("inf"))
-    if isinstance(val, str):
-        key = val.strip().lower()
-        if key in AWARENESS_PRESETS:
-            v = AWARENESS_PRESETS[key][3]
-            return ParamDist(mean=v, std=0.0, clip_low=0.05, clip_high=float("inf"))
-        try:
-            v = float(key)
-            return ParamDist(mean=v, std=0.0, clip_low=0.05, clip_high=float("inf"))
-        except ValueError:
-            raise ValueError(f"unknown reaction gain preset or value {val!r}; valid presets: {', '.join(sorted(AWARENESS_PRESETS))}") from None
-    if isinstance(val, (int, float)):
-        v = float(val)
-        return ParamDist(mean=v, std=0.0, clip_low=0.05, clip_high=float("inf"))
-    if isinstance(val, ParamDist):
-        return val
+@attrs.frozen
+class AwarenessDraw:
+    detection: float
+    fov: float
+    repulsion: float
+    reaction: float
+    blind: bool
+
+
+def sample_awareness(spec: AwarenessSpec, rng: np.random.Generator) -> AwarenessDraw:
+    if isinstance(spec, AwarenessMixture):
+        weights = np.array([weight for weight, _ in spec.components], dtype=np.float64)
+        shift = spec.components[int(rng.choice(len(spec.components), p=weights / weights.sum()))][1]
+    else:
+        shift = spec
+    return AwarenessDraw(
+        detection=_sample_dist(shift.detection, rng),
+        fov=_sample_dist(shift.fov, rng),
+        repulsion=_sample_dist(shift.repulsion, rng),
+        reaction=_sample_dist(shift.reaction, rng),
+        blind=shift.blind,
+    )
+
+
+def _relative_spread(dist: ParamDist) -> float:
+    """Std over mean: one sigma moves a parameter by this fraction of its value."""
+    return dist.std / dist.mean if dist.mean > 0.0 else 0.0
+
+
+def with_robot_awareness(perception: "SampledPerception", draw: AwarenessDraw) -> "SampledPerception":
+    return attrs.evolve(
+        perception,
+        robot_range_offset=draw.detection * perception.vision_range_sd,
+        robot_fov_offset=draw.fov * perception.vision_fov_sd,
+        robot_repulsion_gain=max(0.0, 1.0 + draw.repulsion * perception.repulsion_rel_sd),
+        robot_reaction_gain=max(0.05, 1.0 + draw.reaction * perception.reaction_rel_sd),
+        robot_blind=draw.blind,
+    )
+
+
+def _as_effort_dist(val: "ParamDist | float | Mapping[str, float]") -> "ParamDist":
     if isinstance(val, dict):
-        d = dict(val)
-        d.setdefault("clip_low", 0.05)
-        return ParamDist(**d)
-    return None
+        return ParamDist(**{"clip_low": 1.0, "clip_high": 3.0, **val})
+    return _as_paramdist(val)
 
 
 @attrs.frozen
@@ -469,10 +479,7 @@ class PerceptionDist:
     vision_fov: ParamDist = attrs.field(default=ParamDist(180.0, 10.0), converter=_as_paramdist)
     proximity_sense: ParamDist = attrs.field(default=ParamDist(1.0, 0.2, clip_low=0.5, clip_high=2.0), converter=_as_paramdist)
     vision_occlusion: bool = True
-    robot_awareness: ParamDist = attrs.field(default=ParamDist(1.0, clip_low=0.0, clip_high=1.0), converter=_as_awareness_dist)
-    robot_repulsion_gain: ParamDist = attrs.field(default=ParamDist(1.0, clip_low=0.0), converter=_as_repulsion_dist)
-    robot_fov_gain: ParamDist = attrs.field(default=ParamDist(1.0, clip_low=0.0), converter=_as_fov_dist)
-    robot_reaction_gain: ParamDist = attrs.field(default=ParamDist(1.0, clip_low=0.05), converter=_as_reaction_dist)
+    robot_awareness: AwarenessSpec = attrs.field(default=AWARENESS_PRESETS["normal"], converter=as_awareness_spec)
 
 
 KINEMATICS = ("holonomic", "along_heading")
@@ -600,6 +607,7 @@ class AgentType:
     interaction_class: str = ""
     assets: tuple[str, ...] = ()
     climbs: tuple[str, ...] = attrs.field(default=STAIRS_KINDS, converter=tuple, validator=attrs.validators.deep_iterable(attrs.validators.in_(STAIRS_KINDS)))
+    stair_effort: ParamDist = attrs.field(default=ParamDist(1.6, 0.5, clip_low=1.0, clip_high=3.0), converter=_as_effort_dist)
     wall_trailing: WallTrailing = attrs.field(factory=WallTrailing, converter=_block(WallTrailing, "wall_trailing"))
     passage: Passage = attrs.field(factory=Passage, converter=_block(Passage, "passage"))
 
@@ -616,6 +624,7 @@ class AgentType:
     tunes: tuple[ConditionalTune, ...] = ()
     vars: dict[str, VarDef] = attrs.Factory(dict)
     extends: str | None = None
+    device: dict = attrs.Factory(dict)
 
     source_path: Path | None = attrs.field(default=None, eq=False, hash=False, repr=False)
 
@@ -632,10 +641,15 @@ class SampledPerception:
     vision_fov: float = 180.0
     proximity_sense: float = 1.0
     vision_occlusion: bool = True
-    robot_awareness: float = 1.0
+    vision_range_sd: float = 0.0
+    vision_fov_sd: float = 0.0
+    repulsion_rel_sd: float = 0.0
+    reaction_rel_sd: float = 0.0
+    robot_range_offset: float = 0.0
+    robot_fov_offset: float = 0.0
     robot_repulsion_gain: float = 1.0
-    robot_fov_gain: float = 1.0
     robot_reaction_gain: float = 1.0
+    robot_blind: bool = False
 
 
 @attrs.frozen
@@ -675,6 +689,7 @@ class SampledParams:
     locomotion: SampledLocomotion = attrs.Factory(SampledLocomotion)
     interaction_class: str = ""
     climbs: tuple[str, ...] = STAIRS_KINDS
+    stair_effort: float = 1.0
     wall_trailing: WallTrailing = attrs.field(factory=WallTrailing, converter=_block(WallTrailing, "wall_trailing"))
     passage: Passage = attrs.field(factory=Passage, converter=_block(Passage, "passage"))
 
@@ -756,16 +771,9 @@ def sample_agent_type(
     pivot_angular_velocity = _sample_dist(agent_type.pivot_angular_velocity, rng)
     reaction_time = _sample_lognormal_dist(agent_type.reaction_time, rng)
     personal_space_min = _sample_dist(agent_type.personal_space_min, rng)
-    sampled_perception = SampledPerception(
-        vision_range=_sample_dist(agent_type.perception.vision_range, rng),
-        vision_fov=_sample_dist(agent_type.perception.vision_fov, rng),
-        proximity_sense=_sample_dist(agent_type.perception.proximity_sense, rng),
-        vision_occlusion=agent_type.perception.vision_occlusion,
-        robot_awareness=_sample_dist(agent_type.perception.robot_awareness, rng),
-        robot_repulsion_gain=_sample_dist(agent_type.perception.robot_repulsion_gain, rng),
-        robot_fov_gain=_sample_dist(agent_type.perception.robot_fov_gain, rng),
-        robot_reaction_gain=_sample_dist(agent_type.perception.robot_reaction_gain, rng),
-    )
+    vision_range = _sample_dist(agent_type.perception.vision_range, rng)
+    vision_fov = _sample_dist(agent_type.perception.vision_fov, rng)
+    proximity_sense = _sample_dist(agent_type.perception.proximity_sense, rng)
 
     from arena_humansim.local_planner import LocalPlanner
 
@@ -775,10 +783,25 @@ def sample_agent_type(
         if key in lp_dists:
             lp_dists[key] = lp_dists[key].with_mean(mean)
     sampled_lp = {k: _sample_dist(d, rng) for k, d in lp_dists.items()}
+    awareness_dists = {**LocalPlanner.get_class("sfm").PARAM_DEFAULTS, **lp_dists}
+    sampled_perception = with_robot_awareness(
+        SampledPerception(
+            vision_range=vision_range,
+            vision_fov=vision_fov,
+            proximity_sense=proximity_sense,
+            vision_occlusion=agent_type.perception.vision_occlusion,
+            vision_range_sd=agent_type.perception.vision_range.std,
+            vision_fov_sd=agent_type.perception.vision_fov.std,
+            repulsion_rel_sd=_relative_spread(awareness_dists["repulsion_strength"]),
+            reaction_rel_sd=_relative_spread(awareness_dists["repulsion_range"]),
+        ),
+        sample_awareness(agent_type.perception.robot_awareness, rng),
+    )
 
     idle_gaze_rate_hz = _sample_dist(agent_type.idle_gaze_rate, rng)
     handedness = _sample_handedness(agent_type.handedness, rng)
     locomotion = _sample_locomotion(agent_type, rng)
+    stair_effort = _sample_dist(agent_type.stair_effort, rng)
 
     return SampledParams(
         name=agent_type.name,
@@ -796,6 +819,7 @@ def sample_agent_type(
         locomotion=locomotion,
         interaction_class=agent_type.interaction_class,
         climbs=agent_type.climbs,
+        stair_effort=stair_effort,
         wall_trailing=agent_type.wall_trailing,
         passage=agent_type.passage,
         perception_stack=agent_type.perception_stack,

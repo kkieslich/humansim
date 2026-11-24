@@ -7,6 +7,8 @@ import math
 from typing import TYPE_CHECKING, Any
 
 import attrs
+import numpy as np
+from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -313,10 +315,68 @@ class AgentTemplate:
     policy: str = ""
     policy_params: str = ""
     robot_awareness: Any = None
-    robot_repulsion_gain: Any = None
-    robot_fov_gain: Any = None
-    robot_reaction_gain: Any = None
     robot_aware: bool | None = None
+
+
+class LaneSide(enum.StrEnum):
+    RIGHT = "right"
+    LEFT = "left"
+    CENTER = "center"
+
+
+@attrs.define
+class LaneConfig:
+    centerlines: list[list[Pose2D]]
+    side: LaneSide
+    two_way: bool = False
+    offset: float | None = None
+    sigma_q: float = 0.5
+    chord_tolerance: float = 0.05
+    track_spacing: float | None = None
+    arrival_radius: float | None = None
+    merge_length: float | None = None
+    spawn_length: float | None = None
+    sweep_length: float | None = None
+
+
+@attrs.frozen
+class LaneSettings:
+    two_way: bool
+    side: LaneSide
+    sigma_q: float
+    chord_tolerance: float
+    track_spacing: float
+    arrival_radius: float
+    merge_length: float
+    spawn_length: float
+    sweep_length: float
+    separation: float
+    clearance: float
+
+
+@attrs.frozen(eq=False)
+class Lane:
+    flow: str
+    settings: LaneSettings
+    s: NDArray[np.float64]
+    x: NDArray[np.float64]
+    y: NDArray[np.float64]
+    nx: NDArray[np.float64]
+    ny: NDArray[np.float64]
+    center: NDArray[np.float64]
+    half_width: NDArray[np.float64]
+    vertex_s: NDArray[np.float64]
+    vertex_x: NDArray[np.float64]
+    vertex_y: NDArray[np.float64]
+    goal_s: NDArray[np.float64]
+    length: float
+    grid_reach: float
+
+
+@attrs.frozen
+class Track:
+    points: list[Pose2D]
+    radii: list[float]
 
 
 @attrs.define
@@ -329,6 +389,8 @@ class SourceConfig:
     max_concurrent: int = -1  # -1 = unlimited
     max_total: int = -1  # -1 = unlimited
     agent: AgentTemplate = attrs.Factory(AgentTemplate)
+    lane_config: LaneConfig | None = None
+    lane: Lane | None = None
 
 
 @attrs.define
@@ -368,10 +430,12 @@ class SpawnRequest:
     agent_type: str = "adult"
     waypoints: list[Pose2D] = attrs.Factory(list)
     lifetime: AgentLifetime = attrs.Factory(AgentLifetime)
-    robot_awareness: float | None = None
-    robot_repulsion_gain: float | None = None
-    robot_fov_gain: float | None = None
-    robot_reaction_gain: float | None = None
+    robot_awareness: Any = None
+    waypoint_radii: list[float] = attrs.Factory(list)
+    waypoint_mode: WaypointMode = WaypointMode.REPEAT
+
+    def waypoint_movement(self) -> WaypointMovement:
+        return WaypointMovement(waypoints=list(self.waypoints), radii=list(self.waypoint_radii), mode=self.waypoint_mode)
 
 
 @attrs.define

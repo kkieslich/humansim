@@ -104,8 +104,8 @@ def test_route_takes_the_stair_whose_entry_is_nearest_among_equal_teleport_count
     out = tz.steer([top, bottom], _go([top, bottom], GOAL_B))
     assert (tz.transfers[1].zone, tz.transfers[1].destination) == ("up", "up_b")
     assert (tz.transfers[2].zone, tz.transfers[2].destination) == ("low", "low_b")
-    assert out[1].target_pose == tz.zones["up"].hold
-    assert out[2].target_pose == tz.zones["low"].hold
+    assert out[1].target_pose == tz.zones["up"].lane
+    assert out[2].target_pose == tz.zones["low"].lane
 
 
 def test_route_keeps_its_stair_while_another_becomes_nearer(agent_factory: Callable[..., BaseAgent], planner: DijkstraPlanner) -> None:
@@ -150,7 +150,7 @@ def test_closed_boarding_half_is_skipped_but_a_pedestrian_on_it_carries_on(agent
     out = tz.steer([outside, aboard], _go([outside, aboard], GOAL_B))
     assert tz.transfers[1].zone == "low"
     assert tz.transfers[2].zone == "up"
-    assert out[2].target_pose == tz.zones["up"].hold
+    assert out[2].target_pose == tz.zones["up"].lane
 
 
 def test_exit_only_half_is_never_routed_into(agent_factory: Callable[..., BaseAgent], planner: DijkstraPlanner) -> None:
@@ -290,6 +290,331 @@ def test_resent_stairs_keep_their_transfers_and_changed_cabins_drop_theirs(agent
     assert sorted(tz.transfers) == [1]
     tz.set_zones([], [])
     assert not tz.transfers
+
+
+def _hall(way_round: bool, *lanes: tuple[float, float, float, float]) -> Segments:
+    """One floor of 30 by 32 m split by a wall along x = 15, open only in the lanes (x0, x1, y0, y1) walled along their sides, and over the last 2 m when there is a way round."""
+    outer = _box(0.0, 0.0, 30.0, 32.0)
+    walls = [*zip(outer, outer[1:] + outer[:1], strict=True)]
+    y = 0.0
+    for x0, x1, y0, y1 in sorted(lanes, key=lambda lane: lane[2]):
+        walls += [((15.0, y), (15.0, y0)), ((x0, y0), (x1, y0)), ((x0, y1), (x1, y1))]
+        y = y1
+    return [*walls, ((15.0, y), (15.0, 30.0 if way_round else 32.0))]
+
+
+ESCALATOR, STEPS = (11.0, 19.0, 1.0, 2.2), (11.0, 19.0, 3.0, 4.2)
+EAST = Pose2D(x=25.0, y=1.6)
+WEST = Pose2D(x=5.0, y=1.6)
+
+
+def _pair(name: str, lane: tuple[float, float, float, float], seam: float, kind: str = "stairs", belt: float = 0.0, inset: float = -0.05) -> list[Zone]:
+    """The two halves of a stair on one floor meeting at x = seam, hold poses as Arena sends them, an escalator boarding on the west half only."""
+    x0, x1, y0, y1 = lane
+    y = (y0 + y1) / 2.0
+    return [
+        _stair(f"{name}_b", (f"{name}_t",), Pose2D(x=x0, y=y), Pose2D(x=seam - inset, y=y), _box(x0, y0, seam, y1), kind, belt),
+        _stair(f"{name}_t", () if belt else (f"{name}_b",), Pose2D(x=x1, y=y, theta=math.pi), Pose2D(x=seam + inset, y=y, theta=math.pi), _box(seam, y0, x1, y1), kind, -belt),
+    ]
+
+
+def _link(belt: float = 0.5) -> list[Zone]:
+    return _pair("link", ESCALATOR, 15.0, "escalator", belt)
+
+
+def _steps() -> list[Zone]:
+    return _pair("steps", STEPS, 15.0)
+
+
+def _gated(walls: Segments, zones: list[Zone]) -> DijkstraPlanner:
+    """A planner over the walls and the seams of the pairs joined in place, as the engine hands them to a global planner."""
+    p = DijkstraPlanner(resolution=0.1)
+    p.set_walls([*walls, *_zones(zones).gates])
+    return p
+
+
+@pytest.fixture(scope="module")
+def floor() -> DijkstraPlanner:
+    """The escalator and the stairs through the wall, and a long way round it."""
+    return _gated(_hall(True, ESCALATOR, STEPS), [*_link(), *_steps()])
+
+
+@pytest.fixture(scope="module")
+def sealed() -> DijkstraPlanner:
+    """The same floor without a way round."""
+    return _gated(_hall(False, ESCALATOR, STEPS), [*_link(), *_steps()])
+
+
+def _length(path: list[Pose2D] | None) -> float:
+    return sum(math.hypot(b.x - a.x, b.y - a.y) for a, b in zip(path, path[1:], strict=False)) if path else math.inf
+
+
+def test_halves_that_meet_in_place_are_joined_and_their_seam_is_a_gate() -> None:
+    tz = _zones([*_link(), *_steps(), _up(), _up_b()])
+    assert tz._joined == {"link_b": "link_t", "link_t": "link_b", "steps_b": "steps_t", "steps_t": "steps_b"}
+    assert sorted(tz.gates) == [((15.0, 1.0), (15.0, 2.2)), ((15.0, 3.0), (15.0, 4.2))]
+    assert _zones([_up(), _up_b(), *_low()]).gates == []
+
+
+def test_no_plan_crosses_a_joined_pair(floor: DijkstraPlanner, sealed: DijkstraPlanner) -> None:
+    around, straight = floor.paths([(WEST, EAST), (Pose2D(x=5.0, y=31.0), Pose2D(x=25.0, y=31.0))])
+    assert _length(around) > 2.0 * math.hypot(10.0, 29.0) - 1.0
+    assert _length(straight) == pytest.approx(20.0, abs=0.5)
+    assert sealed.paths([(WEST, EAST)]) == [None]
+
+
+def test_a_ride_on_the_walkers_own_floor_is_taken_when_quicker_than_walking_round(agent_factory: Callable[..., BaseAgent], floor: DijkstraPlanner) -> None:
+    tz = _zones(_link())
+    walker = _walker(agent_factory, floor, 1, WEST.x, WEST.y)
+    out = tz.steer([walker], _go([walker], EAST))
+    assert (tz.transfers[1].zone, tz.transfers[1].destination, tz.transfers[1].ride) == ("link_b", "link_t", True)
+    half = tz.zones["link_b"]
+    assert half.contains(out[1].target_pose.x, out[1].target_pose.y) and half.along(out[1].target_pose.x, out[1].target_pose.y) <= half.length - 0.5
+    assert not tz.through
+
+
+def test_walking_wins_where_the_ride_is_the_longer_way(agent_factory: Callable[..., BaseAgent], floor: DijkstraPlanner) -> None:
+    tz = _zones(_link())
+    walker = _walker(agent_factory, floor, 1, 5.0, 31.0)
+    goal = Pose2D(x=25.0, y=31.0)
+    out = tz.steer([walker], _go([walker], goal))
+    assert 1 not in tz.transfers and out[1].target_pose == goal
+    assert tz._walks[1][0] == (goal.x, goal.y)
+
+
+def test_an_escalator_is_ridden_only_from_its_boarding_end(agent_factory: Callable[..., BaseAgent], floor: DijkstraPlanner, sealed: DijkstraPlanner) -> None:
+    for planner in (floor, sealed):
+        tz = _zones(_link())
+        walker = _walker(agent_factory, planner, 1, EAST.x, EAST.y)
+        out = tz.steer([walker], _go([walker], WEST))
+        assert 1 not in tz.transfers and out[1].target_pose == WEST
+
+
+def test_a_walker_down_from_the_exit_of_an_up_escalator_takes_the_stairs(agent_factory: Callable[..., BaseAgent], floor: DijkstraPlanner) -> None:
+    tz = _zones([*_link(), *_steps()])
+    walker = _walker(agent_factory, floor, 1, EAST.x, EAST.y)
+    tz.steer([walker], _go([walker], WEST))
+    assert (tz.transfers[1].zone, tz.transfers[1].ride) == ("steps_t", True)
+
+
+def test_a_walk_round_a_shut_stair_is_chosen_anew_when_it_opens_or_its_belt_starts(agent_factory: Callable[..., BaseAgent], floor: DijkstraPlanner) -> None:
+    walker = _walker(agent_factory, floor, 1, WEST.x, WEST.y)
+    cmds = _go([walker], EAST)
+    for reopen in (lambda tz: tz.open.update(link_b=True), lambda tz: tz.set_zones(_link(), [True, True])):
+        tz = _zones(_link(0.0), closed=("link_b",))
+        assert tz.steer([walker], cmds)[1].target_pose == EAST and 1 not in tz.transfers
+        reopen(tz)
+        tz.steer([walker], cmds)
+        assert (tz.transfers[1].zone, tz.transfers[1].ride) == ("link_b", True)
+
+
+@pytest.mark.parametrize(("climbs", "zone"), [(("stairs",), "steps_b"), (("escalator",), "link_b"), ((), None)])
+def test_a_type_is_sent_only_over_the_kinds_it_climbs_and_plans_round_the_others(agent_factory: Callable[..., BaseAgent], floor: DijkstraPlanner, sealed: DijkstraPlanner, climbs: tuple[str, ...], zone: str | None) -> None:
+    for planner in (floor, sealed):
+        tz = _zones([*_link(), *_steps()])
+        walker = _walker(agent_factory, planner, 1, WEST.x, WEST.y, climbs=climbs)
+        out = tz.steer([walker], _go([walker], EAST))
+        assert (tz.transfers[1].zone if 1 in tz.transfers else None) == zone
+        assert zone is not None or out[1].target_pose == EAST
+
+
+@pytest.mark.parametrize(("effort", "zone"), [(1.0, "steps_b"), (2.0, "link_b")])
+def test_a_walker_rides_beside_still_stairs_as_its_stair_effort_makes_the_climb_slower(agent_factory: Callable[..., BaseAgent], floor: DijkstraPlanner, sealed: DijkstraPlanner, effort: float, zone: str) -> None:
+    for planner in (floor, sealed):
+        tz = _zones([*_link(), *_steps()])
+        walker = _walker(agent_factory, planner, 1, 5.0, 2.6)
+        walker.params = attrs.evolve(walker.params, stair_effort=effort)
+        tz.steer([walker], _go([walker], Pose2D(x=25.0, y=2.6)))
+        assert (tz.transfers[1].zone, tz.transfers[1].ride) == (zone, True)
+
+
+def test_riders_are_sent_into_a_joined_half_on_their_own_line_clear_of_its_sides() -> None:
+    tz = _zones([*_pair("wide", (11.0, 19.0, 4.0, 8.0), 15.0), *_steps()])
+    wide, narrow = tz.zones["wide_b"], tz.zones["steps_b"]
+    assert tz._inner(wide).x == pytest.approx(14.0)
+    assert [tz._inner(wide, across).y for across in (-5.0, -1.0, 0.0, 1.2, 5.0)] == pytest.approx([4.5, 5.0, 6.0, 7.2, 7.5])
+    assert [tz._inner(narrow, across).y for across in (-0.4, 0.4)] == pytest.approx([3.5, 3.7])
+
+
+def test_a_rider_keeps_the_line_it_came_on_while_it_walks_in(agent_factory: Callable[..., BaseAgent]) -> None:
+    lane = (11.0, 19.0, 4.0, 8.0)
+    zones = _pair("wide", lane, 15.0)
+    tz = _zones(zones)
+    walker = _walker(agent_factory, _gated(_hall(False, lane), zones), 1, 5.0, 7.0)
+    cmds = _go([walker], Pose2D(x=25.0, y=7.0))
+    first = tz.steer([walker], cmds)[1].target_pose
+    assert (first.x, first.y) == pytest.approx((14.0, 7.0))
+    walker.state.pose = Pose2D(x=8.0, y=5.0)
+    assert tz.steer([walker], cmds)[1].target_pose == first
+
+
+def test_crossing_a_joined_pair_steers_straight_on_until_the_far_half_is_left(agent_factory: Callable[..., BaseAgent], floor: DijkstraPlanner) -> None:
+    tz = _zones(_link())
+    walker = _walker(agent_factory, floor, 1, WEST.x, WEST.y)
+    cmds = _go([walker], EAST)
+    tz.steer([walker], cmds)
+    for x in (13.0, 15.4, 18.5, 14.6):
+        walker.state.pose = Pose2D(x=x, y=1.9)
+        tz.steer([walker], cmds)
+        assert tz.transfers[1].aboard
+        assert (tz.through[1].x, tz.through[1].y) == pytest.approx((20.0, 1.9))
+    walker.state.pose = Pose2D(x=19.2, y=1.9)
+    out = tz.steer([walker], cmds)
+    assert 1 not in tz.transfers and 1 not in tz.through and out[1].target_pose == EAST
+    assert tz._walks[1][0] == (EAST.x, EAST.y)
+
+
+def test_a_walker_pushed_back_out_of_the_mouth_boards_again(agent_factory: Callable[..., BaseAgent], floor: DijkstraPlanner) -> None:
+    tz = _zones(_steps())
+    walker = _walker(agent_factory, floor, 1, 5.0, 3.6)
+    cmds = _go([walker], Pose2D(x=25.0, y=3.6))
+    tz.steer([walker], cmds)
+    walker.state.pose = Pose2D(x=11.5, y=3.6)
+    tz.steer([walker], cmds)
+    assert 1 in tz.through
+    walker.state.pose = Pose2D(x=10.5, y=3.6)
+    out = tz.steer([walker], cmds)
+    assert tz.transfers[1].zone == "steps_b" and not tz.transfers[1].aboard and 1 not in tz.through
+    assert tz.zones["steps_b"].contains(out[1].target_pose.x, out[1].target_pose.y)
+
+
+def test_a_seam_joined_in_place_never_teleports(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones(_pair("steps", STEPS, 15.0, inset=0.45))
+    pool = _pool(agent_factory, (1, 14.7, 3.6))
+    assert tz.hold(pool, tick=0, timeout_ticks=100, dt=0.05, let_out_ticks=0) == []
+    assert tuple(pool.pos[0]) == pytest.approx((14.7, 3.6))
+
+
+def test_a_walker_whose_plan_would_end_on_a_stair_it_does_not_climb_stays_where_it_is(agent_factory: Callable[..., BaseAgent]) -> None:
+    sealed = _gated(_hall(False, STEPS), _steps())
+    tz = _zones(_steps())
+    wheelchair = _walker(agent_factory, sealed, 1, 5.0, 3.6, climbs=())
+    walker = _walker(agent_factory, sealed, 2, 5.0, 3.0, climbs=("escalator",))
+    cmds = _go([wheelchair, walker], Pose2D(x=25.0, y=3.6))
+    sealed.compute([wheelchair, walker], tz.steer([wheelchair, walker], cmds))
+    end = sealed.get_cached_paths()[1][-1]
+    assert tz.zones["steps_b"].contains(end.x, end.y)
+    tz.steer([wheelchair, walker], cmds)
+    assert tz.through == {1: wheelchair.state.pose, 2: walker.state.pose}
+
+
+FLIGHTS = (7.0, 21.0, 3.0, 4.2)
+
+
+def _flights() -> list[Zone]:
+    """Two flights in one lane with a landing between them (x 15 to 17)."""
+    return [*_pair("lower", (7.0, 15.0, 3.0, 4.2), 11.0), *_pair("upper", (17.0, 21.0, 3.0, 4.2), 19.0)]
+
+
+@pytest.fixture(scope="module")
+def flights() -> DijkstraPlanner:
+    walls = [wall for wall in _hall(True, FLIGHTS) if wall[0][0] != 15.0 or wall[1][0] != 15.0]
+    return _gated([*walls, ((14.0, 0.0), (14.0, 3.0)), ((14.0, 4.2), (14.0, 30.0))], _flights())
+
+
+def test_two_flights_are_ridden_one_after_the_other_and_never_back_down_from_the_landing(agent_factory: Callable[..., BaseAgent], flights: DijkstraPlanner) -> None:
+    tz = _zones(_flights())
+    walker = _walker(agent_factory, flights, 1, 5.0, 3.6)
+    cmds = _go([walker], Pose2D(x=25.0, y=3.6))
+    tz.steer([walker], cmds)
+    assert (tz.transfers[1].zone, tz.transfers[1].ride) == ("lower_b", True)
+    walker.state.pose = Pose2D(x=9.0, y=3.6)
+    tz.steer([walker], cmds)
+    walker.state.pose = Pose2D(x=15.5, y=3.6)
+    out = tz.steer([walker], cmds)
+    assert (tz.transfers[1].zone, tz.transfers[1].ride) == ("upper_b", True)
+    assert tz.zones["upper_b"].contains(out[1].target_pose.x, out[1].target_pose.y)
+
+
+def test_a_rider_pushed_back_over_the_seam_it_crossed_takes_that_flight_again(agent_factory: Callable[..., BaseAgent], flights: DijkstraPlanner) -> None:
+    tz = _zones(_flights())
+    walker = _walker(agent_factory, flights, 1, 5.0, 3.6)
+    cmds = _go([walker], Pose2D(x=25.0, y=3.6))
+    for x in (5.0, 9.0, 15.5):
+        walker.state.pose = Pose2D(x=x, y=3.6)
+        tz.steer([walker], cmds)
+    assert tz.transfers[1].zone == "upper_b"
+    walker.state.pose = Pose2D(x=10.3, y=3.6)
+    tz.steer([walker], cmds)
+    assert (tz.transfers[1].zone, tz.transfers[1].ride) == ("lower_b", True)
+
+
+def test_a_stair_half_is_walked_to_on_the_right_of_its_hold_line_and_at_its_hold_pose_when_too_narrow() -> None:
+    tz = _zones([_up(), _up_b()])
+    assert (tz.zones["up"].lane.x, tz.zones["up"].lane.y) == pytest.approx((9.55, 4.9))
+    assert (tz.zones["up_b"].lane.x, tz.zones["up_b"].lane.y) == pytest.approx((22.5, 0.45))
+    wide = _stair("wide", (), Pose2D(x=5.0, y=4.0), Pose2D(x=9.55, y=4.0), _box(5.0, 2.0, 10.0, 6.0))
+    assert (wide.lane.x, wide.lane.y) == pytest.approx((9.55, 3.0))
+    narrow = _stair("narrow", (), Pose2D(x=5.0, y=5.2), Pose2D(x=9.55, y=5.2), _box(5.0, 4.7, 10.0, 5.7))
+    assert narrow.lane == narrow.hold
+
+
+def test_the_two_ways_over_one_stair_walk_to_and_land_on_opposite_sides(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    up, down = tz.zones["up"].lane, tz.zones["up_b"].lane
+    pool = _pool(agent_factory, (1, up.x, up.y), (2, down.x, down.y))
+    crossed = {aid: (x, y) for aid, x, y, _ in tz.hold(pool, 0, 1000, 0.05, 0)}
+    assert crossed[1] == pytest.approx((23.1, 0.45 + LANDING_BACKOFF))
+    assert crossed[2] == pytest.approx((9.55 - LANDING_BACKOFF, 5.5))
+
+
+def test_two_walkers_crossing_one_seam_the_opposite_ways_on_each_others_landing_change_places(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    pool = _pool(agent_factory, (1, 9.7, 5.2), (2, 22.8, 0.3))
+    pool.theta[0] = 0.1
+    crossed = {aid: (x, y, theta) for aid, x, y, theta in tz.hold(pool, 0, 1000, 0.05, 0)}
+    assert crossed[1] == pytest.approx((22.8, 0.3, HALF_PI + 0.1))
+    assert crossed[2] == pytest.approx((9.7, 5.2, -HALF_PI))
+    assert not tz._held
+
+
+def test_walkers_queued_behind_the_two_do_not_stop_them_changing_places(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    pool = _pool(agent_factory, (1, 9.6, 5.2), (2, 22.8, 0.4), (3, 9.1, 5.2), (4, 22.8, 0.9))
+    assert sorted(aid for aid, *_ in tz.hold(pool, 0, 1000, 0.05, 0)) == [1, 2]
+
+
+def test_a_crossing_never_lands_on_a_walker_that_stays(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    pool = _pool(agent_factory, (1, 9.7, 5.2), (2, 22.55, 0.3), (3, 9.7, 5.7), (4, 22.3, 1.0))
+    for aid, x, y, _ in tz.hold(pool, 0, 1000, 0.05, 0):
+        pool.pos[pool.idx(aid)] = (x, y)
+    assert tz._held == {3}
+    gaps = [math.hypot(*(pool.pos[i] - pool.pos[j])) for i in range(4) for j in range(i)]
+    assert min(gaps) >= 0.5 - 1e-9
+
+
+def test_a_larger_walker_changes_places_only_where_it_fits(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    pool = _pool(agent_factory, (1, 9.7, 5.2), (2, 22.8, 0.3), (3, 22.8, 0.85))
+    pool.agent_radius[0] = 0.4
+    assert tz.hold(pool, 0, 1000, 0.05, 0) == []
+    assert tz._held == {1, 2}
+    pool.pos[2] = (22.8, 1.2)
+    assert sorted(aid for aid, *_ in tz.hold(pool, 1, 1000, 0.05, 0)) == [1, 2]
+
+
+def test_a_walker_is_not_sent_back_from_the_half_it_landed_on_before_it_has_left_it_or_is_routed_back(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    pool = _pool(agent_factory, (1, 9.6, 5.2), (2, 9.6, 5.8))
+    [(_, x, y, _), (_, x2, y2, _)] = tz.hold(pool, 0, 1000, 0.05, 0)
+    pool.pos[0], pool.pos[1] = (x, y - 0.3), (x2, y2 - 0.3)
+    assert tz.hold(pool, 1, 1000, 0.05, 0) == []
+    assert not tz._held and tuple(pool.pos[0]) == pytest.approx((x, y - 0.3))
+    tz.transfers[2] = Transfer(goal=(GOAL_A.x, GOAL_A.y), zone="up_b", destination="up")
+    assert [aid for aid, *_ in tz.hold(pool, 2, 1000, 0.05, 0)] == [2]
+    pool.pos[0], pool.pos[1] = (22.8, 4.0), (2.0, 2.0)
+    assert tz.hold(pool, 3, 1000, 0.05, 0) == []
+    pool.pos[0] = (22.8, 0.3)
+    assert [aid for aid, *_ in tz.hold(pool, 4, 1000, 0.05, 0)] == [1]
+
+
+def test_a_walker_on_the_landing_that_crosses_nowhere_still_holds_the_crossing(agent_factory: Callable[..., BaseAgent]) -> None:
+    tz = _zones([_up(), _up_b()])
+    pool = _pool(agent_factory, (1, 9.7, 5.2), (2, 22.8, 0.5))
+    pool.policy_idx[1] = -1
+    assert tz.hold(pool, 0, 1000, 0.05, 0) == []
+
 
 
 def test_a_half_with_a_delay_carries_the_crossing_pedestrian_along_the_flight_then_lands_it(agent_factory: Callable[..., BaseAgent]) -> None:
@@ -479,16 +804,6 @@ def test_a_flight_landing_is_not_flown_back_by_a_drift_past_the_partner_seam(age
     assert tz.hold(pool, 11, 1000, 0.05, 0) == [] and tz.flying == frozenset()
     tz.clear_transfers()
     assert [aid for aid, *_ in tz.hold(pool, 12, 1000, 0.05, 0)] == [1] and tz.flying == {1}
-
-
-def test_two_pedestrians_held_facing_each_other_across_a_stair_swap(agent_factory: Callable[..., BaseAgent]) -> None:
-    tz = _zones([_up(), _up_b()])
-    # each stands past its own seam, on the other's landing (0.1 m short of the partner's hold line)
-    pool = _pool(agent_factory, (1, 9.6, 5.2), (2, 22.8, 0.4))
-    assert tz.hold(pool, 0, 1000, 0.05, 0) == []
-    assert tz._held == {1, 2}
-    moves = {aid: (x, y) for aid, x, y, _ in tz.hold(pool, 1, 1000, 0.05, 0)}
-    assert moves == {1: pytest.approx((22.8, 0.45 + LANDING_BACKOFF)), 2: pytest.approx((9.55 - LANDING_BACKOFF, 5.2))}
 
 
 def test_a_pedestrian_held_on_a_seam_for_the_wait_timeout_lands_anyway(agent_factory: Callable[..., BaseAgent]) -> None:

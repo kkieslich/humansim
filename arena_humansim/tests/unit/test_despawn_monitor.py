@@ -11,6 +11,7 @@ from arena_humansim.core.agents.base import BaseAgent
 from arena_humansim.core.agents.types import ParamDist
 from arena_humansim.core.behavior.nodes import HoldNode
 from arena_humansim.core.despawn_monitor import DespawnMonitor
+from arena_humansim.utils.geometry import point_in_polygon
 from arena_humansim.utils.types import (
     AgentLifetime,
     BehaviorTreeMovement,
@@ -192,7 +193,7 @@ def test_point_in_polygon_square(px: float, py: float, expected: bool) -> None:
         Pose2D(x=1.0, y=1.0),
         Pose2D(x=-1.0, y=1.0),
     ]
-    assert DespawnMonitor._point_in_polygon(px, py, square) is expected
+    assert point_in_polygon(px, py, square) is expected
 
 
 def _door_strip() -> SinkConfig:
@@ -309,8 +310,8 @@ def test_point_in_polygon_concave_shape() -> None:
         Pose2D(x=2.0, y=2.0),
         Pose2D(x=0.0, y=2.0),
     ]
-    assert DespawnMonitor._point_in_polygon(1.0, 1.0, concave) is True
-    assert DespawnMonitor._point_in_polygon(3.0, 1.0, concave) is True
-    assert DespawnMonitor._point_in_polygon(3.0, 3.0, concave) is True
-    assert DespawnMonitor._point_in_polygon(1.0, 3.0, concave) is False
-    assert DespawnMonitor._point_in_polygon(5.0, 5.0, concave) is False
+    assert point_in_polygon(1.0, 1.0, concave) is True
+    assert point_in_polygon(3.0, 1.0, concave) is True
+    assert point_in_polygon(3.0, 3.0, concave) is True
+    assert point_in_polygon(1.0, 3.0, concave) is False
+    assert point_in_polygon(5.0, 5.0, concave) is False

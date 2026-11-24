@@ -36,6 +36,7 @@ def _nested_params(name: str = "adult") -> dict:
         "max_deceleration": 2.5,
         "min_turning_radius": 0.3,
         "pivot_angular_velocity": 2.0,
+        "stair_effort": 2.2,
         "perception": {"vision_range": 7.5, "vision_fov": 200.0},
         "local_planner_params": {
             "relaxation_time": 0.7,
@@ -149,6 +150,7 @@ def test_get_spawn_params_nested(tmp_path: Path) -> None:
     assert params.local_planner_params["anisotropy"] == pytest.approx(0.6)
     assert params.perception_stack == ("default",)
     assert params.local_planner == "sfm"
+    assert params.stair_effort == pytest.approx(2.2)
 
 
 def test_get_spawn_params_flat_legacy_fallback(tmp_path: Path) -> None:
@@ -162,6 +164,7 @@ def test_get_spawn_params_flat_legacy_fallback(tmp_path: Path) -> None:
     assert params.local_planner_params["repulsion_strength"] == pytest.approx(2.5)
     assert params.local_planner_params["repulsion_range"] == pytest.approx(0.35)
     assert params.local_planner_params["anisotropy"] == pytest.approx(0.55)
+    assert params.stair_effort == 1.0
 
 
 def test_get_spawn_params_missing_returns_none(tmp_path: Path) -> None:

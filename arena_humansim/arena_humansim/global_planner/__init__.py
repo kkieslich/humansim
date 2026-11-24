@@ -244,6 +244,20 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
                     out.add(aid)
         return out
 
+    def paths(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[list[Pose2D] | None]:
+        """The planned path of each (start, goal) leg between snapped terminals, None where none reaches the goal."""
+        if not legs:
+            return []
+        if not self._has_map():
+            return [[start, goal] for start, goal in legs]
+        ends = self.snap_terminals([pose for leg in legs for pose in leg])
+        plans = self._plan([(k, ends[2 * k], ends[2 * k + 1]) for k in range(len(legs))])
+        return [plans.get(k) for k in range(len(legs))]
+
+    def path_cost(self, path: Sequence[Pose2D]) -> float:
+        """Walking cost of a planned path [m]: its length, weighted by congestion where the planner weighs it."""
+        return float(sum(math.hypot(b.x - a.x, b.y - a.y) for a, b in zip(path, path[1:], strict=False)))
+
     def _sees(self, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
         """Whether each straight leg is walkable as a whole path."""
         if self._wall_grid is None or self._wall_grid[0] is not self._wall_segments:
@@ -296,11 +310,6 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def components(self, poses: Sequence[Pose2D]) -> list[frozenset[int]]:
         """Free-space components each pose can walk into, empty where the planner cannot tell."""
         return [frozenset() for _ in poses]
-
-    def route_costs(self, starts: Sequence[Pose2D], goal: Pose2D) -> np.ndarray | None:
-        """Walking cost [m, congestion-weighted where the planner weighs it] from each start to goal, inf where out of
-        reach; None where the planner cannot price routes."""
-        return None
 
     def publish_markers(self, pub: MarkerPublisher) -> None:
         pass

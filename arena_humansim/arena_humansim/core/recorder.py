@@ -173,7 +173,7 @@ class BagRecorder:
         if self._closed:
             return
         if isinstance(msg, Clock):
-            t = self._node.get_clock().now().nanoseconds
+            t = msg.clock.sec * 1_000_000_000 + msg.clock.nanosec
         else:
             t = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
             if isinstance(msg, AgentFrameMsg | AgentMetaMsg):

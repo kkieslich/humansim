@@ -1,7 +1,8 @@
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 
 from arena_humansim.core.agents import BaseAgent
+from arena_humansim.utils.geometry import point_in_polygon
 from arena_humansim.utils.loggable import Loggable
 from arena_humansim.utils.types import (
     AgentLifetime,
@@ -9,7 +10,6 @@ from arena_humansim.utils.types import (
     BehaviorTreeMovement,
     CommandType,
     DespawnRequest,
-    Pose2D,
     ShapeType,
     SinkConfig,
     WaypointMovement,
@@ -128,17 +128,5 @@ class DespawnMonitor(Loggable):
 
     def _contains(self, sink: SinkConfig, x: float, y: float) -> bool:
         if sink.shape.type == ShapeType.POLYGON and sink.shape.vertices:
-            return self._point_in_polygon(x - sink.pose.x, y - sink.pose.y, sink.shape.vertices)
+            return point_in_polygon(x - sink.pose.x, y - sink.pose.y, sink.shape.vertices)
         return math.hypot(x - sink.pose.x, y - sink.pose.y) < sink.absorption_radius
-
-    @staticmethod
-    def _point_in_polygon(px: float, py: float, vertices: Sequence[Pose2D]) -> bool:
-        n = len(vertices)
-        inside = False
-        j = n - 1
-        for i in range(n):
-            vi, vj = vertices[i], vertices[j]
-            if ((vi.y > py) != (vj.y > py)) and (px < (vj.x - vi.x) * (py - vi.y) / (vj.y - vi.y) + vi.x):
-                inside = not inside
-            j = i
-        return inside

@@ -63,9 +63,6 @@ class AgentConfig:
     services: list[ServiceSpec] = attrs.Factory(list)
     spawn_tick: int = 0  # deferred spawn; 0 = spawn on first tick
     robot_awareness: Any = None
-    robot_repulsion_gain: Any = None
-    robot_fov_gain: Any = None
-    robot_reaction_gain: Any = None
     robot_aware: bool | None = None
 
 
@@ -104,9 +101,6 @@ class AgentTemplateModel:
     agent_type: str = "adult"
     sink_affinity: list[SinkAffinityModel] = attrs.Factory(list)
     robot_awareness: Any = None
-    robot_repulsion_gain: Any = None
-    robot_fov_gain: Any = None
-    robot_reaction_gain: Any = None
     robot_aware: bool | None = None
 
 

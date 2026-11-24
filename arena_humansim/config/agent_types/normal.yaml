@@ -2,7 +2,4 @@
 name: normal
 extends: adult
 perception:
-  robot_awareness: 1.0
-  robot_repulsion_gain: 1.0
-  robot_fov_gain: 1.0
-  robot_reaction_gain: 1.0
+  robot_awareness: normal

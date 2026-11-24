@@ -39,11 +39,12 @@ Both paths must produce **bitwise-identical** CSRs for the same state. The contr
 
 ## Robot Awareness Gating
 
-When robots (`KIND_ROBOT`) are present in the simulation pool, human-to-robot perception edges are modulated by the observer's `robot_awareness` and `robot_fov_gain`:
-- `robot_awareness == 0.0` completely strips robots from the observer's neighbor list, including inside `proximity_sense`. Human-to-human perception edges remain 100% active.
-- `robot_awareness < 1.0` scales both `vision_range` and `proximity_sense` when detecting robots.
-- `robot_fov_gain` modulates the effective horizontal FOV for robot detection (`eff_fov = vision_fov * robot_fov_gain`), enabling narrow tunnel vision (< 1.0) or hyper-vigilant scanning (> 1.0). Angles >= 360 deg are omnidirectional.
-- Both dense and KD-tree paths implement bitwise-equivalent perception gating.
+Robots (`KIND_ROBOT`) are gated per observer by three pool values:
+- `robot_blind` removes robots from the neighbour list, including inside `proximity_sense`. Human-to-human edges stay 100% active.
+- `robot_range_offset` moves the detection range for robots. The effective range is `clip(vision_range + offset, 0, vision_range)`, so robots are never seen past the observer's own range. The near field is `min(proximity_sense, robot range)`.
+- `robot_fov_offset` moves the field of view for robots: `clip(vision_fov + offset, 0, 360)`. A positive offset widens the cone for robots only.
+
+The dense and KD-tree paths implement the same gating. `tests/unit/test_perception_robot_awareness.py` checks each rule, and the all-human crowd is unchanged by the blind flag.
 
 ## Adding a perception module
 

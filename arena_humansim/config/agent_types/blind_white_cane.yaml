@@ -41,3 +41,5 @@ pose:
   hold: {r: {radius: 0.0125, angle: -60}}  # grip on the cane: radius (m), angle in the palm (deg): along the index finger, toward the little-finger heel
   walk: {base: walk_whitecane}
   run: {same_as: walk}
+
+device: {kind: cane, bone: cane}

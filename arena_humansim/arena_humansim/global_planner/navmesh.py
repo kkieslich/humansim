@@ -28,6 +28,8 @@ WEIDMANN_RHO_MAX = 5.4
 CONGESTION_RADIUS = 1.5
 #: The most a step through a jam costs, as a multiple of its length
 CONGESTION_CAP = 20.0
+#: `path_cost` weighs a path by the congestion at points this far apart along it [m]
+PATH_COST_STEP = 0.5
 #: The smallest body radius a lane assumes
 MIN_BODY_RADIUS = 0.15
 #: A walker pushed off its route's floor gets back along the route its body fits within this distance [m], checked every
@@ -152,6 +154,10 @@ class NavMeshPlanner(GlobalPlanner):
         self._blocked_edges = np.zeros(0, np.int64)
         self._meshed: set[tuple[float, ...]] = set()
         self._snapped: dict[tuple[float, float], tuple[float, float] | None] = {}
+        #: set while `paths` plans legs for the stair ride timing: their request ids are leg numbers, not agents
+        self._pricing = False
+        #: the walkers' positions at the last congestion update, a KD-tree
+        self._crowd = None
         #: per agent of the last `compute`: its wall trailing and passage settings, and half its body length
         self._manners: dict[int, tuple[object, object, float]] = {}
         self._ways: dict[int, Way] = {}
@@ -579,7 +585,12 @@ class NavMeshPlanner(GlobalPlanner):
             return None
         from scipy.spatial import cKDTree
 
-        counts = cKDTree(positions).query_ball_point(self._mesh.e_mid, CONGESTION_RADIUS, return_length=True)
+        self._crowd = cKDTree(positions)
+        return self._weidmann(self._crowd.query_ball_point(self._mesh.e_mid, CONGESTION_RADIUS, return_length=True))
+
+    @staticmethod
+    def _weidmann(counts: np.ndarray) -> np.ndarray:
+        """The slowdown at points with `counts` walkers within `CONGESTION_RADIUS` (Weidmann, capped at `CONGESTION_CAP`)."""
         rho = np.asarray(counts, dtype=np.float64) / (math.pi * CONGESTION_RADIUS**2)
         slow = np.ones(len(rho))
         busy = rho > 0.0
@@ -587,6 +598,20 @@ class NavMeshPlanner(GlobalPlanner):
         share = np.where(inv > 0.0, 1.0 - np.exp(-WEIDMANN_GAMMA * np.maximum(inv, 0.0)), 0.0)
         slow[busy] = np.minimum(1.0 / np.maximum(share, 1.0 / CONGESTION_CAP), CONGESTION_CAP)
         return slow
+
+    def path_cost(self, path: Sequence[Pose2D]) -> float:
+        """The path's length weighted by the mean congestion slowdown at points every `PATH_COST_STEP` along it, from the
+        crowd the last congestion update saw (`congestion_interval`); its plain length while congestion is off."""
+        length = super().path_cost(path)
+        if self._slowdown is None or self._crowd is None or len(path) < 2 or length <= 0.0:
+            return length
+        pts = np.array([(p.x, p.y) for p in path], dtype=np.float64)
+        along = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+        at = np.arange(PATH_COST_STEP / 2.0, along[-1], PATH_COST_STEP)
+        if not len(at):
+            at = np.array([along[-1] / 2.0])
+        samples = np.column_stack([np.interp(at, along, pts[:, 0]), np.interp(at, along, pts[:, 1])])
+        return float(length * np.mean(self._weidmann(self._crowd.query_ball_point(samples, CONGESTION_RADIUS, return_length=True))))
 
     def _set_slowdown(self, slowdown: np.ndarray | None) -> None:
         self._slowdown = slowdown
@@ -671,14 +696,6 @@ class NavMeshPlanner(GlobalPlanner):
             return super().components(poses)
         return self._router.components(self._inside(np.array([(p.x, p.y) for p in poses], dtype=np.float64)))
 
-    def route_costs(self, starts: Sequence[Pose2D], goal: Pose2D) -> np.ndarray | None:
-        if self._router is None:
-            return None
-        if not starts:
-            return np.zeros(0)
-        pts = self._inside(np.array([(p.x, p.y) for p in starts], dtype=np.float64))
-        return self._router.costs(pts, self._inside(np.array([goal.x, goal.y], dtype=np.float64)))
-
     def _inside(self, p: np.ndarray) -> np.ndarray:
         """p moved onto the meshed frame when it lies beyond it."""
         assert self._mesh is not None
@@ -695,9 +712,25 @@ class NavMeshPlanner(GlobalPlanner):
             polyline = np.vstack([polyline[: -1 if seen else len(polyline)], goal])
         return polyline
 
+    def paths(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[list[Pose2D] | None]:
+        """As `GlobalPlanner.paths`, planned at the inflation radius and without any agent's state: the legs are numbered
+        from 0, so their ids would read and overwrite the radius, route memory and escape of the agents with those ids."""
+        self._pricing = True
+        try:
+            return super().paths(legs)
+        finally:
+            self._pricing = False
+
     def _plan(self, requests: list[PlanRequest]) -> dict[int, list[Pose2D] | None]:
         assert self._router is not None
         plans: dict[int, list[Pose2D] | None] = {agent_id: None for agent_id, _, _ in requests}
+        if self._pricing:
+            by_target: dict[tuple[float, float], list[tuple[int, Pose2D, Pose2D]]] = {}
+            for request in requests:
+                by_target.setdefault((request[2].x, request[2].y), []).append(request)
+            for group in by_target.values():
+                plans.update(self._plan_group(self._router, group))
+            return plans
         by_goal: dict[tuple[float, float, float], list[tuple[int, Pose2D, Pose2D]]] = {}
         for agent_id, agent_pos, target in requests:
             clearance = self.clearance_for(self._radius_of(agent_id))
@@ -789,7 +822,7 @@ class NavMeshPlanner(GlobalPlanner):
         for (agent_id, agent_pos, target, _), polyline in zip(entries, polylines, strict=True):
             if polyline is None:
                 continue
-            if agent_id in self._manners:
+            if agent_id in self._manners and not self._pricing:
                 polyline = self._shape(agent_id, router, self._from_here(router, agent_id, agent_pos, polyline))
             waypoints = [Pose2D(x=float(x), y=float(y)) for x, y in polyline]
             same = polyline[0, 0] == agent_pos.x and polyline[0, 1] == agent_pos.y
@@ -798,6 +831,6 @@ class NavMeshPlanner(GlobalPlanner):
             waypoints.insert(0, Pose2D(x=agent_pos.x, y=agent_pos.y))
             waypoints[-1] = Pose2D(x=snapped.x, y=snapped.y, theta=target.theta)
             plans[agent_id] = waypoints
-            if self._manners:
+            if self._manners and not self._pricing:
                 self._keep_way(agent_id, waypoints, 0 if same else 1)
         return plans

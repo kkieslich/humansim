@@ -28,11 +28,15 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def configure(self, *, inflation_radius, resolution, comfort_radius) -> None: ...
     def _nearest_reachable(self, start, target) -> Pose2D | None: ...
     def components(self, poses) -> list[frozenset[int]]: ...
+    def paths(self, legs) -> list[list[Pose2D] | None]: ...
+    def path_cost(self, path) -> float: ...
     def passage_commands(self) -> dict[int, PassageCommand]: ...
 ```
 
 A subclass implements only `_has_map` and `_plan`. The base class owns everything else: the per-agent path cache, the replan rule, and stepping along a cached path.
 
+- `paths` plans (start, goal) legs between snapped terminals through `_plan`, None where none reaches the goal, straight lines without a map. The stair ride choice times walking and riding along them.
+- `path_cost` is optional, default the path's length. `navmesh` weighs it by the congestion along it while `congestion_interval` is on, and the stair route choice (`zone_route_choice`) times walks by it.
 - `_has_map` gates the whole planner. While false every `NAVIGATE` agent gets its raw target as its subgoal, no `_plan` call.
 - `_plan` takes `(agent_id, start pose, target pose)` requests and returns final, already-smoothed waypoints per agent, first waypoint the agent's own position, last the snapped terminal, or `None` if the target is unreachable.
 - `compute` is concrete: skips non-`NAVIGATE` commands, replans when the target moved past `_replan_distance` from the cached goal, advances a fresh cache entry with `advance_along_path`, and on `None` asks `_nearest_reachable` for a substitute target. A route to the substitute is cached under the original target, so it is not replanned every tick. Without a substitute it pops the cache entry and falls back to `snap_terminal(target)`.
@@ -69,6 +73,18 @@ An agent whose target is unreachable walks to the reachable point closest to it 
 Paths keep `comfort_radius` clearance from walls where the passage allows it, and relax towards `inflation_radius` in narrower passages. A `comfort_radius` at or below `inflation_radius` disables the preference and paths hug the hard clearance everywhere.
 
 Agents and targets beyond the meshed area are joined to it by a straight leg, or routed directly when the straight line is clear.
+
+### Crowd flow
+
+The navmesh shapes every route it plans for the crowd, whether or not its walker follows a [pedestrian lane](../../../README.md#pedestrian-lanes):
+
+- Width: an agent routes with its own radius plus `clearance_margin` from the walls (rounded up to 0.05 m, one router per clearance), and with the inflation radius where no route keeps that.
+- Side: a route's inner corners move `lane_offset` to `lane_side` where the walkers' bodies keep 0.05 m from the walls (the whole offset, half, or none), so opposite directions keep to opposite sides of a passage. `sfm` (and `hsfm`) add a sideways share `side_bias` of the push from an oncoming walker towards the same side.
+- Congestion: every `congestion_interval` seconds each mesh edge is weighted by how much slower walkers move at the density within 1.5 m of it (Weidmann 1993, capped at 20x), so routes avoid jams.
+- Stalls: an agent that moved less than 0.3 m in `stall_time` seconds plans anew (`GlobalPlanner._stalled`), on the congestion weights where they are on.
+- Narrow gaps: an agent the crowd pushed into a gap narrower than the inflation radius, with a route to its target before, walks back out along a body-radius route to the first point within 3 m that keeps the inflation radius (`_escape`).
+
+The windows count `compute` calls of `dt x bt_tick_interval` sim seconds (`set_timing`). A walker on a pedestrian lane track walks its track's legs (at most 3 m, `DIRECT_RANGE`) straight where the line between is clear, so the route shaping above leaves its track as the lane built it; the side bias, stall replanning and escape apply to it as to anyone. `paths` (the stair ride timing) plans its legs at the inflation radius without any agent's state.
 
 ## Walls, lanes and narrow passages
 

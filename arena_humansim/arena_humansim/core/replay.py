@@ -100,6 +100,7 @@ class ReplayManager(Loggable):
             },
             locomotion=SampledLocomotion(**loc),
             interaction_class=p.get("interaction_class", ""),
+            stair_effort=p.get("stair_effort", 1.0),
             perception_stack=tuple(p["perception_stack"]),
             local_planner=p["local_planner"],
             global_planner=p["global_planner"],

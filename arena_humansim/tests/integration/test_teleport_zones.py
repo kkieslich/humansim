@@ -705,3 +705,149 @@ def test_manual_wheelchair_never_boards_a_stair_stair_and_hard_reset_clears_stai
     assert mgr._reset_callback(ResetSimulation.Request(soft=False), ResetSimulation.Response()).success
     assert not mgr._zones.transfers
     assert mgr._zones.zones == {}
+
+
+SEAM_X = 13.0
+LANE = (9.5, 16.5, 4.4, ROOM)
+
+
+def _floor_walls(way_round: bool) -> list[WallConfig]:
+    """One floor of 26 by 6 m split by a wall along x = 13, open only in a walled lane along its top wall and, with a way round, over 1.4 m at the bottom."""
+    x0, x1, y0, _ = LANE
+    segments = [
+        ((0.0, 0.0), (26.0, 0.0)),
+        ((26.0, 0.0), (26.0, ROOM)),
+        ((26.0, ROOM), (0.0, ROOM)),
+        ((0.0, ROOM), (0.0, 0.0)),
+        ((SEAM_X, 1.4 if way_round else 0.0), (SEAM_X, y0)),
+        ((x0, y0), (x1, y0)),
+    ]
+    return [WallConfig(name=f"floor{i}", start=Pose2D(x=ax, y=ay), end=Pose2D(x=bx, y=by)) for i, ((ax, ay), (bx, by)) in enumerate(segments)]
+
+
+def _floor_half(name: str, destination: str, kind: str, belt: float, top: bool) -> TeleportZone:
+    """A half of a stair on one floor as Arena sends it: the footprint up to the seam, the hold pose just past it."""
+    x0, x1, y0, y1 = LANE
+    y = (y0 + y1) / 2.0
+    z = TeleportZone()
+    z.name = name
+    z.destinations = [destination] if destination else []
+    if top:
+        z.entry = Pose2DMsg(x=x1, y=y, theta=math.pi)
+        z.wait = Pose2DMsg(x=x1 + 0.8, y=y, theta=math.pi)
+        z.hold = Pose2DMsg(x=SEAM_X - 0.05, y=y, theta=math.pi)
+        corners = ((SEAM_X, y0), (x1, y0), (x1, y1), (SEAM_X, y1))
+    else:
+        z.entry = Pose2DMsg(x=x0, y=y, theta=0.0)
+        z.wait = Pose2DMsg(x=x0 - 0.8, y=y, theta=0.0)
+        z.hold = Pose2DMsg(x=SEAM_X + 0.05, y=y, theta=0.0)
+        corners = ((x0, y0), (SEAM_X, y0), (SEAM_X, y1), (x0, y1))
+    z.footprint = [Point32(x=x, y=y, z=0.0) for x, y in corners]
+    z.open = True
+    z.delay = 0.0
+    z.kind = kind
+    z.belt = belt
+    return z
+
+
+def _floor_manager(manager_factory: Callable[..., AgentManager], name: str, planner: str, zones: list[TeleportZone], agents: list[AgentConfig] | None = None, way_round: bool = False) -> AgentManager:
+    scenario = attrs.evolve(_scenario(name, planner), walls=_floor_walls(way_round))
+    if agents is not None:
+        scenario = attrs.evolve(scenario, flow=None, agents=agents)
+    mgr = manager_factory(scenario, node_name=f"test_{name}", extra_params=PLANNERS[planner])
+    assert _set_zones(mgr, zones).success
+    return mgr
+
+
+def _cross(mgr: AgentManager, aid: int, limit: int = 1500) -> tuple[float, dict[str, list[tuple[float, float]]]]:
+    """Tick until the pedestrian is gone, return its longest step and its velocities on each stair half."""
+    pool = mgr._pool
+    longest, on = 0.0, {name: [] for name in mgr._zones.zones}
+    last = None
+    for _ in range(limit):
+        if aid not in mgr._agents:
+            return longest, on
+        i = pool.idx(aid)
+        x, y = float(pool.pos[i, 0]), float(pool.pos[i, 1])
+        if last is not None:
+            longest = max(longest, math.hypot(x - last[0], y - last[1]))
+        last = (x, y)
+        for name, zone in mgr._zones.zones.items():
+            if zone.contains(x, y):
+                on[name].append((float(pool.vel[i, 0]), float(pool.vel[i, 1])))
+        mgr.tick()
+    raise AssertionError("pedestrian never reached the sink")
+
+
+@pytest.mark.parametrize("planner", sorted(PLANNERS))
+def test_pedestrian_walks_a_stair_on_its_own_floor_stair_capped_without_a_teleport_and_reaches_the_sink(manager_factory: Callable[..., AgentManager], planner: str) -> None:
+    zones = [_floor_half("fl_b", "fl_t", "stairs", 0.0, top=False), _floor_half("fl_t", "fl_b", "stairs", 0.0, top=True)]
+    mgr = _floor_manager(manager_factory, f"floor_walk_{planner}", planner, zones)
+    assert mgr._zones.gates == [((SEAM_X, LANE[2]), (SEAM_X, LANE[3]))]
+    aid = _rider(mgr)
+    _tick_until(mgr, lambda: aid in mgr._zones.transfers, 40)
+    assert mgr._zones.transfers[aid].zone == "fl_b"
+    longest, on = _cross(mgr, aid)
+    assert longest < 0.2
+    assert len(on["fl_b"]) > 10 and len(on["fl_t"]) > 10
+    assert max(math.hypot(*vel) for half in on.values() for vel in half[1:]) <= STAIR_SPEED + 1e-9
+
+
+def test_escalator_on_one_floor_carries_its_rider_over_both_halves_without_a_teleport(manager_factory: Callable[..., AgentManager]) -> None:
+    zones = [_floor_half("fl_b", "fl_t", "escalator", 0.6, top=False), _floor_half("fl_t", "", "escalator", -0.6, top=True)]
+    mgr = _floor_manager(manager_factory, "floor_escalator", "navmesh", zones)
+    aid = _rider(mgr)
+    longest, on = _cross(mgr, aid)
+    assert longest < 0.2
+    assert len(on["fl_b"]) > 10 and len(on["fl_t"]) > 10
+    assert all(vel == pytest.approx((0.6, 0.0)) for half in on.values() for vel in half[2:])
+
+
+@pytest.mark.parametrize("way_round", [False, True])
+def test_manual_wheelchair_never_stands_on_a_stair_on_its_own_floor_and_takes_the_way_round(manager_factory: Callable[..., AgentManager], way_round: bool) -> None:
+    goal = [Pose2D(x=SINK.x, y=SINK.y)]
+    agents = [
+        AgentConfig(agent_id=1, agent_type="wheelchair_manual", spawn_pose=Pose2D(x=1.0, y=3.0), goal_sequence=goal, desired_velocity=0.9),
+        AgentConfig(agent_id=2, spawn_pose=Pose2D(x=1.0, y=5.2), goal_sequence=goal, desired_velocity=1.2),
+    ]
+    zones = [_floor_half("fl_b", "fl_t", "escalator", 0.6, top=False), _floor_half("fl_t", "", "escalator", -0.6, top=True)]
+    mgr = _floor_manager(manager_factory, f"floor_wheelchair_{way_round}", "navmesh", zones, agents, way_round)
+    pool = mgr._pool
+    rode = False
+    for _ in range(900):
+        mgr.tick()
+        assert 1 not in mgr._zones.transfers
+        x, y = (float(v) for v in pool.pos[pool.idx(1)])
+        assert not any(zone.contains(x, y) for zone in mgr._zones.zones.values())
+        rode = rode or (2 in mgr._zones.transfers and mgr._zones.transfers[2].zone == "fl_b")
+    assert rode or way_round
+    assert (float(pool.pos[pool.idx(1), 0]) > SEAM_X) == way_round
+
+
+def _two_way(riders: int) -> ScenarioConfig:
+    """Riders released in each room with their sink in the other one."""
+    scenario = _scenario("stairs_two_way", "navmesh", riders)
+    [source], [sink] = scenario.flow.sources, scenario.flow.sinks
+    back = attrs.evolve(source, pose=Pose2D(x=ROOM_B_X + 5.0, y=3.0), agent_template=attrs.evolve(source.agent_template, sink_affinity=[SinkAffinityModel(sink_idx=1, weight=1.0)]))
+    flow = attrs.evolve(scenario.flow, sources=[source, back], sinks=[sink, attrs.evolve(sink, pose=Pose2D(x=1.0, y=1.0))])
+    return attrs.evolve(scenario, walls=scenario.walls + STAIRS_WALLS, flow=flow)
+
+
+def test_two_way_traffic_over_one_stair_gets_everyone_across_once(manager_factory: Callable[..., AgentManager]) -> None:
+    riders = 8
+    mgr = manager_factory(_two_way(riders), node_name="test_stairs_two_way")
+    assert _set_zones(mgr, [_stair_half("st_a", "st_b", "stairs", 0.0, b_side=False), _stair_half("st_b", "st_a", "stairs", 0.0, b_side=True)]).success
+    pool = mgr._pool
+    last: dict[int, float] = {}
+    crossings: dict[int, int] = {}
+
+    def everyone_arrived() -> bool:
+        for i in range(pool.n):
+            aid, x = int(pool.agent_ids[i]), float(pool.pos[i, 0])
+            if abs(x - last.setdefault(aid, x)) > 5.0:
+                crossings[aid] = crossings.get(aid, 0) + 1
+            last[aid] = x
+        return len(last) == 2 * riders and not mgr._agents
+
+    _tick_until(mgr, everyone_arrived, 4000)
+    assert crossings == dict.fromkeys(last, 1)

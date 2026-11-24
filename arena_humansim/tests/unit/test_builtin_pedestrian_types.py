@@ -80,3 +80,18 @@ def test_climbs_rejects_an_unknown_stair_kind() -> None:
     assert converter.structure({"name": "x", "climbs": ["stairs"]}, AgentType).climbs == ("stairs",)
     with pytest.raises(ValueError, match="ladder"):
         converter.structure({"name": "x", "climbs": ["ladder"]}, AgentType)
+
+
+def test_stair_effort_is_drawn_per_walker_from_its_type_within_its_clip(types: dict[str, AgentType]) -> None:
+    efforts = [sample_agent_type(types["adult"], np.random.default_rng(seed)).stair_effort for seed in range(40)]
+    assert all(1.0 <= e <= 3.0 for e in efforts) and len(set(efforts)) > 10
+    assert sample_agent_type(types["adult"], np.random.default_rng(7)).stair_effort == efforts[7]
+
+
+def test_a_stair_effort_mapping_is_clipped_to_1_and_3_unless_it_sets_its_own_clips() -> None:
+    wide = converter.structure({"name": "x", "stair_effort": {"mean": 1.6, "std": 5.0}}, AgentType)
+    efforts = [sample_agent_type(wide, np.random.default_rng(seed)).stair_effort for seed in range(40)]
+    assert min(efforts) == 1.0 and max(efforts) == 3.0
+    own = converter.structure({"name": "x", "stair_effort": {"mean": 4.0, "clip_low": 3.5, "clip_high": 5.0}}, AgentType)
+    assert sample_agent_type(own, np.random.default_rng(0)).stair_effort == 4.0
+    assert sample_agent_type(converter.structure({"name": "x", "stair_effort": 2.0}, AgentType), np.random.default_rng(0)).stair_effort == 2.0

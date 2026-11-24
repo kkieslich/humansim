@@ -179,3 +179,28 @@ def test_gestures_published_only_on_change(manager_factory: Callable[..., AgentM
     settle(executor)
     assert len(gestures) == 5
     executor.remove_node(mgr)
+
+
+def test_a_repeated_clock_republishes_the_last_frame(manager_factory: Callable[..., AgentManager]) -> None:
+    """A gate holding the clock repeats it to recover a frame it missed: the engine answers with its last frame, and a clock that advances without owing a tick stays silent."""
+    mgr = _manager(manager_factory, "repeat_clock")
+    frames = subscribe(mgr, AgentFrameMsg, "agent_states", STREAM)
+    executor = SingleThreadedExecutor()
+    executor.add_node(mgr)
+    settle(executor)
+
+    _clock_tick(mgr)
+    stamp = _clock_tick(mgr)
+    spin_until(executor, lambda: len(frames) == 2)
+    ticks = mgr._tick_count
+
+    mgr._subsystem_timer_callback(Clock(clock=stamp))
+    spin_until(executor, lambda: len(frames) == 3)
+    assert frames[-1].header.stamp == stamp
+    assert mgr._tick_count == ticks
+
+    ns = stamp.sec * 1_000_000_000 + stamp.nanosec + DT_NS // 2
+    mgr._subsystem_timer_callback(Clock(clock=Time(sec=ns // 1_000_000_000, nanosec=ns % 1_000_000_000)))
+    settle(executor)
+    assert len(frames) == 3
+    assert mgr._tick_count == ticks

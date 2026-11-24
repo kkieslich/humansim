@@ -3,9 +3,9 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from arena_rclpy_mixins.Time import TimeNode
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import Point
-from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     from arena_humansim.perception import Perception
     from arena_humansim.utils.types import Pose2D, Shape, SinkConfig, SourceConfig
 
-_FRAME = "map"
 _MISSING = object()
 
 _STATIC_NS_BUCKETS: dict[str, str] = {
@@ -44,7 +43,6 @@ def rgba(r: float, g: float, b: float, a: float = 1.0) -> ColorRGBA:
 
 def mk(ns: str, mid: int, mtype: int, stamp: Time | None) -> Marker:
     m = Marker()
-    m.header.frame_id = _FRAME
     if stamp is not None:
         m.header.stamp = stamp
     m.ns = ns
@@ -158,8 +156,9 @@ class MarkerView:
 
 
 class MarkerPublisher:
-    def __init__(self, node: Node):
+    def __init__(self, node: TimeNode, frame_id: str):
         self._node = node
+        self._frame_id = frame_id
         self._pub = node.create_publisher(MarkerArray, "viz", 100)
         static_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._pubs_static = {bucket: node.create_publisher(MarkerArray, f"viz_static/{bucket}", static_qos) for bucket in _STATIC_BUCKETS}
@@ -183,7 +182,7 @@ class MarkerPublisher:
         return False
 
     def _stamp(self) -> Time:
-        return self._node.get_clock().now().to_msg()
+        return self._node.sim_time.to_msg()
 
     def view(self, ns: str, mtype: int, count: int = 0, dirty: bool = True) -> MarkerView:
         self._touched_ns.add(ns)
@@ -229,7 +228,7 @@ class MarkerPublisher:
             del self._scene[(ns, mid)]
             self._dirty.discard((ns, mid))
             m = Marker()
-            m.header.frame_id = _FRAME
+            m.header.frame_id = self._frame_id
             m.header.stamp = stamp
             m.ns = ns
             m.id = mid
@@ -248,6 +247,7 @@ class MarkerPublisher:
                 changed_buckets.add(bucket)
                 continue
             m = self._scene[key]
+            m.header.frame_id = self._frame_id
             m.header.stamp = stamp
             dyn_adds.append(m)
 
@@ -262,6 +262,7 @@ class MarkerPublisher:
             adds: list[Marker] = []
             for (ns, _mid), m in self._scene.items():
                 if _STATIC_NS_BUCKETS.get(ns) == bucket:
+                    m.header.frame_id = self._frame_id
                     m.header.stamp = stamp
                     adds.append(m)
             ma = MarkerArray()

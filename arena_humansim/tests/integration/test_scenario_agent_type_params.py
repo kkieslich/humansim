@@ -102,7 +102,7 @@ def _flow_with_awareness(tmp_path: Path) -> Path:
                 "max_concurrent": 2,
                 "max_total": 2,
                 "pose": {"x": -5.0, "y": 0.0},
-                "agent_template": {"agent_type": "stroller", "robot_awareness": 0.25, "robot_repulsion_gain": 0.5, "robot_fov_gain": 1.5, "robot_reaction_gain": 0.75},
+                "agent_template": {"agent_type": "stroller", "robot_awareness": "blind"},
             }
         ],
         "sinks": [],
@@ -120,10 +120,8 @@ def test_flow_spawns_take_the_template_robot_awareness(manager_factory: Callable
     assert len(mgr._agents) == 2
     for aid, agent in mgr._agents.items():
         idx = pool.idx(aid)
-        row = (pool.robot_awareness[idx], pool.robot_repulsion_gain[idx], pool.robot_fov_gain[idx], pool.robot_reaction_gain[idx])
-        assert row == pytest.approx((0.25, 0.5, 1.5, 0.75))
-        perception = agent.params.perception
-        assert (perception.robot_awareness, perception.robot_repulsion_gain, perception.robot_fov_gain, perception.robot_reaction_gain) == pytest.approx((0.25, 0.5, 1.5, 0.75))
+        assert bool(pool.robot_blind[idx]) is True
+        assert agent.params.perception.robot_blind is True
 
 
 def test_removing_a_flow_agent_drops_its_awareness_override(manager_factory: Callable[..., AgentManager], tmp_path: Path) -> None:

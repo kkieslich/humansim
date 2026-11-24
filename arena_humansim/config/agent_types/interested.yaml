@@ -2,7 +2,4 @@
 name: interested
 extends: adult
 perception:
-  robot_awareness: 1.0
-  robot_repulsion_gain: 0.6
-  robot_fov_gain: 1.0
-  robot_reaction_gain: 1.0
+  robot_awareness: interested

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-
 from arena_humansim.core.agents.types import (
     SampledParams,
     SampledPerception,
@@ -104,10 +103,15 @@ def test_record_spawn_emits_expected_keys(tmp_path: Path) -> None:
         "vision_fov": pytest.approx(180.0),
         "proximity_sense": pytest.approx(1.0),
         "vision_occlusion": True,
-        "robot_awareness": pytest.approx(1.0),
+        "vision_range_sd": pytest.approx(0.0),
+        "vision_fov_sd": pytest.approx(0.0),
+        "repulsion_rel_sd": pytest.approx(0.0),
+        "reaction_rel_sd": pytest.approx(0.0),
+        "robot_range_offset": pytest.approx(0.0),
+        "robot_fov_offset": pytest.approx(0.0),
         "robot_repulsion_gain": pytest.approx(1.0),
-        "robot_fov_gain": pytest.approx(1.0),
         "robot_reaction_gain": pytest.approx(1.0),
+        "robot_blind": False,
     }
     assert params["local_planner_params"]["relaxation_time"] == pytest.approx(0.5)
     assert params["local_planner_params"]["repulsion_strength"] == pytest.approx(2.1)

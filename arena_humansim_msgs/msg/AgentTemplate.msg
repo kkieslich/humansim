@@ -10,3 +10,4 @@ arena_humansim_msgs/SinkAffinity[] sink_affinity
 uint8 kind 0
 string policy
 string policy_params
+string robot_awareness  # preset name, or JSON spec; empty = type default

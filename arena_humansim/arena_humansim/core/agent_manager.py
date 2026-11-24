@@ -4,7 +4,7 @@ import array
 import math
 import time
 from collections import deque
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,7 @@ from arena_humansim_msgs.srv import (
     UpdateRobot,
 )
 from arena_rclpy_mixins.params import Param, declare
+from arena_rclpy_mixins.Time import TimeNode
 from geometry_msgs.msg import Point32, Vector3
 from geometry_msgs.msg import Pose2D as Pose2DMsg
 from py_trees.common import Status
@@ -63,7 +64,6 @@ from py_trees.trees import BehaviourTree
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.clock import Clock as RclClock
 from rclpy.clock import ClockType
-from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
@@ -83,7 +83,16 @@ from arena_humansim.core.agents import (
     spawn_params,
 )
 from arena_humansim.core.agents.loader import resolve_agent_type_name
-from arena_humansim.core.agents.types import ATTENTION_KEYWORDS, AWARENESS_PRESETS, STAIRS_KINDS, ParamDist
+from arena_humansim.core.agents.types import (
+    ATTENTION_KEYWORDS,
+    STAIRS_KINDS,
+    AwarenessSpec,
+    ParamDist,
+    as_awareness_spec,
+    awareness_from_text,
+    sample_awareness,
+    with_robot_awareness,
+)
 from arena_humansim.core.animation_kinds import AnimationType, locomotion_states
 from arena_humansim.core.behavior.compiler import BehaviorTreeFactory
 from arena_humansim.core.carry import Carrier
@@ -101,13 +110,15 @@ from arena_humansim.core.spawn_scheduler import SpawnScheduler
 from arena_humansim.core.teleport_zones import HOLD_CLEARANCE, TeleportZones, Zone
 from arena_humansim.core.viz import MarkerPublisher, publish_infrastructure, publish_module_markers
 from arena_humansim.core.world_knowledge import FormationSpec, WorldKnowledge, WorldObject
-from arena_humansim.global_planner import LANE_OFFSET_M, LANE_SIDES, GlobalPlanner, PassageCommand
+from arena_humansim.global_planner import LANE_SIDES, GlobalPlanner, PassageCommand
 from arena_humansim.local_planner import LocalPlanner
 from arena_humansim.occlusion import Occluder
 from arena_humansim.params import AGENT_MANAGER_PARAMS, GESTURE_ENABLED, MODE_MASTER, MODE_SUBSYSTEM
 from arena_humansim.perception import Perception
 from arena_humansim.utils import RNG
 from arena_humansim.utils.event_bus import EventBus
+from arena_humansim.utils.geometry import box_wall_segments
+from arena_humansim.utils.lanes import lane_affected, resolve_clearance, resolve_lane, segments_array, sigma_meters, with_goal_corners
 from arena_humansim.utils.loggable import Loggable
 from arena_humansim.utils.scenario import EventScript, InteractionScript, ScenarioConfig
 from arena_humansim.utils.types import (
@@ -120,6 +131,9 @@ from arena_humansim.utils.types import (
     HighLevelCommand,
     InteractionOutcome,
     InteractionState,
+    Lane,
+    LaneConfig,
+    LaneSide,
     Pose2D,
     SeekSpec,
     Segments,
@@ -136,6 +150,10 @@ from arena_humansim.utils.types import (
 )
 
 
+def _positive_or_none(value: float) -> float | None:
+    return value if value > 0.0 else None
+
+
 @attrs.define
 class ObstacleData:
     name: str
@@ -146,103 +164,12 @@ class ObstacleData:
     wall_segments: tuple[tuple[tuple[float, float], tuple[float, float]], ...]
 
 
-AwarenessInput = bool | float | int | str | dict[str, object] | list[object] | None
-
-
-def _resolve_awareness_tuple(
-    aware_raw: AwarenessInput,
-    gain_raw: AwarenessInput = None,
-    fov_gain_raw: AwarenessInput = None,
-    react_gain_raw: AwarenessInput = None,
-    robot_aware: bool | None = None,
-) -> tuple[float | None, float | None, float | None, float | None]:
-    for name, val in [
-        ("robot_awareness", aware_raw),
-        ("robot_repulsion_gain", gain_raw),
-        ("robot_fov_gain", fov_gain_raw),
-        ("robot_reaction_gain", react_gain_raw),
-    ]:
-        if isinstance(val, (dict, list)):
-            raise TypeError(f"Scripted agents require a scalar, bool, or preset name for {name}, got {type(val).__name__}")
-
-    baseline_tuple: tuple[float, float, float, float] | None = None
+def _resolve_awareness(robot_awareness: object, robot_aware: bool | None) -> AwarenessSpec | None:
+    if robot_awareness is not None:
+        return as_awareness_spec(robot_awareness)
     if robot_aware is not None:
-        baseline_tuple = AWARENESS_PRESETS["normal"] if robot_aware else AWARENESS_PRESETS["blind"]
-
-    awareness: float | None = baseline_tuple[0] if baseline_tuple is not None else None
-    repulsion_gain: float | None = baseline_tuple[1] if baseline_tuple is not None else None
-    fov_gain: float | None = baseline_tuple[2] if baseline_tuple is not None else None
-    react_gain: float | None = baseline_tuple[3] if baseline_tuple is not None else None
-
-    if aware_raw is not None:
-        if isinstance(aware_raw, bool):
-            preset = AWARENESS_PRESETS["normal"] if aware_raw else AWARENESS_PRESETS["blind"]
-            awareness = preset[0]
-            if gain_raw is None and baseline_tuple is None:
-                repulsion_gain = preset[1]
-            if fov_gain_raw is None and baseline_tuple is None:
-                fov_gain = preset[2]
-            if react_gain_raw is None and baseline_tuple is None:
-                react_gain = preset[3]
-        elif isinstance(aware_raw, (int, float)):
-            awareness = float(np.clip(float(aware_raw), 0.0, 1.0))
-        elif isinstance(aware_raw, str):
-            key = aware_raw.strip().lower()
-            if key in AWARENESS_PRESETS:
-                p_aw, p_gn, p_fov, p_react = AWARENESS_PRESETS[key]
-                awareness = p_aw
-                if gain_raw is None and baseline_tuple is None:
-                    repulsion_gain = p_gn
-                if fov_gain_raw is None and baseline_tuple is None:
-                    fov_gain = p_fov
-                if react_gain_raw is None and baseline_tuple is None:
-                    react_gain = p_react
-            else:
-                try:
-                    awareness = float(np.clip(float(key), 0.0, 1.0))
-                except ValueError:
-                    raise ValueError(f"Unknown awareness preset {aware_raw!r}; valid presets: {', '.join(sorted(AWARENESS_PRESETS))}") from None
-
-    if gain_raw is not None:
-        if isinstance(gain_raw, (int, float)):
-            repulsion_gain = max(0.0, float(gain_raw))
-        elif isinstance(gain_raw, str):
-            key = gain_raw.strip().lower()
-            if key in AWARENESS_PRESETS:
-                repulsion_gain = AWARENESS_PRESETS[key][1]
-            else:
-                try:
-                    repulsion_gain = max(0.0, float(key))
-                except ValueError:
-                    raise ValueError(f"Unknown repulsion preset {gain_raw!r}; valid presets: {', '.join(sorted(AWARENESS_PRESETS))}") from None
-
-    if fov_gain_raw is not None:
-        if isinstance(fov_gain_raw, (int, float)):
-            fov_gain = max(0.0, float(fov_gain_raw))
-        elif isinstance(fov_gain_raw, str):
-            key = fov_gain_raw.strip().lower()
-            if key in AWARENESS_PRESETS:
-                fov_gain = AWARENESS_PRESETS[key][2]
-            else:
-                try:
-                    fov_gain = max(0.0, float(key))
-                except ValueError:
-                    raise ValueError(f"Unknown fov preset {fov_gain_raw!r}; valid presets: {', '.join(sorted(AWARENESS_PRESETS))}") from None
-
-    if react_gain_raw is not None:
-        if isinstance(react_gain_raw, (int, float)):
-            react_gain = max(0.05, float(react_gain_raw))
-        elif isinstance(react_gain_raw, str):
-            key = react_gain_raw.strip().lower()
-            if key in AWARENESS_PRESETS:
-                react_gain = AWARENESS_PRESETS[key][3]
-            else:
-                try:
-                    react_gain = max(0.05, float(key))
-                except ValueError:
-                    raise ValueError(f"Unknown reaction preset {react_gain_raw!r}; valid presets: {', '.join(sorted(AWARENESS_PRESETS))}") from None
-
-    return awareness, repulsion_gain, fov_gain, react_gain
+        return as_awareness_spec(robot_aware)
+    return None
 
 
 _TUNABLE_PARAMS = frozenset(
@@ -427,7 +354,7 @@ def _gesture_msg(intent: GestureIntent) -> GestureMsg:
     return g
 
 
-class AgentManager(Node):
+class AgentManager(TimeNode):
     def __init__(self, **node_kwargs: Any) -> None:
         super().__init__("arena_humansim", **node_kwargs)
         self._logger = self.get_logger()
@@ -442,6 +369,7 @@ class AgentManager(Node):
         self._dt = self._float_param("dt")
         self._bt_tick_interval = self._int_param("bt_tick_interval")
         self._mode = str(self.get_parameter("mode").value)
+        self._frame_id = str(self.get_parameter("frame_id").value)
         log_dir = str(self.get_parameter("log_dir").value)
         replay_mode = str(self.get_parameter("replay_mode").value)
         self._load_tunables()
@@ -589,20 +517,23 @@ class AgentManager(Node):
         self._external_velocity_ticks = max(1, int(round(_EXTERNAL_VELOCITY_WINDOW_S / self._dt)))
         self._walls: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {}
         self._obstacles: dict[str, ObstacleData] = {}
+        self._lane_sources: dict[str, SourceConfig] = {}
         self._zones = TeleportZones()
         self._zones.route_choice = self._zone_route_choice
         self._prone: set[int] = set()
         self._parked_from: dict[int, tuple[float, float, float]] = {}
         self._rising: dict[int, tuple[float, float, float, int]] = {}
-        self._marker_pub = MarkerPublisher(self) if self._publish_markers > 0 else None
+        self._marker_pub = MarkerPublisher(self, self._frame_id) if self._publish_markers > 0 else None
         self._tick_count: int = 0
         self._sim_time_ns: int = 0
         self._subsystem_epoch_ns: int = 0
+        self._last_clock_ns: int = -1
+        self._last_frame: AgentFrameMsg | None = None
         # start_on_request: no tick until start_clock, which gives the epoch of the next first tick
         self._clock_held = False
         self._start_epoch_ns: int | None = None
         self._pending_scenario_spawns: deque[tuple[int, AgentStateMsg]] = deque()
-        self._scenario_awareness_overrides: dict[int, tuple[float | None, float | None, float | None, float | None]] = {}
+        self._scenario_awareness_overrides: dict[int, AwarenessSpec] = {}
         self._pending_stimuli: deque[tuple[int, int, str, float]] = deque()
         self._stimulus_levels: dict[str, float] = {}
         self._meta_dirty = True
@@ -954,7 +885,7 @@ class AgentManager(Node):
             if self._marker_pub is not None:
                 self._marker_pub.forget_all()
         if level > 0 and self._marker_pub is None:
-            self._marker_pub = MarkerPublisher(self)
+            self._marker_pub = MarkerPublisher(self, self._frame_id)
 
     def _set_rtf(self, rtf: float) -> None:
         if rtf == self._rtf:
@@ -1066,7 +997,7 @@ class AgentManager(Node):
         agents = [self._agents[aid] for aid in self._pool_agent_ids if aid in self._agents]
         self._pool.attach_late(planner, agents)
         self._wall_aware = (*self._wall_aware, planner)
-        segments = self._all_wall_segments()
+        segments = self._walls_of(planner, self._all_wall_segments())
         if segments:
             planner.set_walls(segments)
         self._set_side(planner)
@@ -1205,15 +1136,9 @@ class AgentManager(Node):
         for a in scenario.agents:
             if int(a.agent_id) == 0:
                 a.agent_id = self._allocate_robot_id() if int(a.kind) == int(AgentKind.ROBOT) else self._allocate_agent_id()
-            if any(v is not None for v in (a.robot_aware, a.robot_awareness, a.robot_repulsion_gain, a.robot_fov_gain, a.robot_reaction_gain)):
-                aw, gn, fov_g, react_g = _resolve_awareness_tuple(
-                    a.robot_awareness,
-                    a.robot_repulsion_gain,
-                    a.robot_fov_gain,
-                    a.robot_reaction_gain,
-                    robot_aware=a.robot_aware,
-                )
-                self._scenario_awareness_overrides[int(a.agent_id)] = (aw, gn, fov_g, react_g)
+            spec = _resolve_awareness(a.robot_awareness, a.robot_aware)
+            if spec is not None:
+                self._scenario_awareness_overrides[int(a.agent_id)] = spec
             if int(a.kind) == int(AgentKind.ROBOT) and a.services:
                 self._robot_service_advertiser.register(int(a.agent_id), a.services)
             msg = AgentStateMsg()
@@ -1333,9 +1258,6 @@ class AgentManager(Node):
                     agent_type=tmpl.agent_type,
                     sink_affinity=[SinkAffinity(sink_name=f"sink_{sa.sink_idx}", weight=float(sa.weight)) for sa in tmpl.sink_affinity],
                     robot_awareness=tmpl.robot_awareness,
-                    robot_repulsion_gain=tmpl.robot_repulsion_gain,
-                    robot_fov_gain=tmpl.robot_fov_gain,
-                    robot_reaction_gain=tmpl.robot_reaction_gain,
                     robot_aware=tmpl.robot_aware,
                 ),
             )
@@ -1459,37 +1381,24 @@ class AgentManager(Node):
         agent_msg.desired_velocity = spawn_req.desired_velocity
         agent_msg.radius = spawn_req.agent_radius
         agent_msg.agent_type = spawn_req.agent_type
-        if any(v is not None for v in (spawn_req.robot_awareness, spawn_req.robot_repulsion_gain, spawn_req.robot_fov_gain, spawn_req.robot_reaction_gain)):
-            self._scenario_awareness_overrides[aid] = (
-                spawn_req.robot_awareness,
-                spawn_req.robot_repulsion_gain,
-                spawn_req.robot_fov_gain,
-                spawn_req.robot_reaction_gain,
-            )
-        return self._build_base_agent(aid, agent_msg, list(spawn_req.waypoints))
+        spec = _resolve_awareness(spawn_req.robot_awareness, None)
+        if spec is not None:
+            self._scenario_awareness_overrides[aid] = spec
+        agent = self._build_base_agent(aid, agent_msg, list(spawn_req.waypoints))
+        agent.movement = spawn_req.waypoint_movement()
+        return agent
 
     def _apply_awareness_overrides(self, aid: int, idx: int, agent: BaseAgent) -> None:
         if aid not in self._scenario_awareness_overrides:
             return
-        aw, gn, fov_g, react_g = self._scenario_awareness_overrides[aid]
-        perc_evolve: dict[str, Any] = {}
-        if aw is not None:
-            self._pool.robot_awareness[idx] = aw
-            perc_evolve["robot_awareness"] = aw
-        if gn is not None:
-            self._pool.robot_repulsion_gain[idx] = gn
-            perc_evolve["robot_repulsion_gain"] = gn
-        if fov_g is not None:
-            self._pool.robot_fov_gain[idx] = fov_g
-            perc_evolve["robot_fov_gain"] = fov_g
-        if react_g is not None:
-            self._pool.robot_reaction_gain[idx] = react_g
-            perc_evolve["robot_reaction_gain"] = react_g
-        if perc_evolve:
-            agent.params = attrs.evolve(
-                agent.params,
-                perception=attrs.evolve(agent.params.perception, **perc_evolve),
-            )
+        draw = sample_awareness(self._scenario_awareness_overrides[aid], self._rng.get_agent_substream(aid, "awareness"))
+        perception = with_robot_awareness(agent.params.perception, draw)
+        agent.params = attrs.evolve(agent.params, perception=perception)
+        self._pool.robot_range_offset[idx] = perception.robot_range_offset
+        self._pool.robot_fov_offset[idx] = perception.robot_fov_offset
+        self._pool.robot_repulsion_gain[idx] = perception.robot_repulsion_gain
+        self._pool.robot_reaction_gain[idx] = perception.robot_reaction_gain
+        self._pool.robot_blind[idx] = perception.robot_blind
 
     def _lookup_agent_name(self, name: str, kind: int | None = None) -> int | None:
         """Exact name, else the unique agent whose name ends in ``/name``, optionally restricted to one AgentState kind."""
@@ -1750,6 +1659,7 @@ class AgentManager(Node):
             for planner, _group in _group_by(subgoal_agents, key=lambda a: a.global_planner):
                 self._cached_intermediate_goals.update(planner.get_cached_goals())
                 passage_commands.update(planner.passage_commands())
+            self._cached_intermediate_goals.update(self._zones.through)
             self._locomotion.set_passage(pool, passage_commands)
 
             for aid in self._high_level_cmds:
@@ -1923,6 +1833,7 @@ class AgentManager(Node):
         self._update_animation_states()
         frame = self._build_agent_frame()
         self._agent_states_pub.publish(frame)
+        self._last_frame = frame
         if self._meta_dirty:
             self._publish_agent_meta(frame.header)
         if self._gestures_dirty or is_bt_tick:
@@ -2368,7 +2279,11 @@ class AgentManager(Node):
         covered = (now_ns - self._subsystem_epoch_ns) // dt_ns + 1
         owed = covered - self._tick_count
         if owed <= 0:
+            if now_ns <= self._last_clock_ns and self._last_frame is not None:
+                self._agent_states_pub.publish(self._last_frame)
+            self._last_clock_ns = max(self._last_clock_ns, now_ns)
             return
+        self._last_clock_ns = now_ns
         t0 = time.perf_counter()
         for _ in range(owed):
             self._sim_time_ns = self._tick_count * dt_ns
@@ -2642,7 +2557,7 @@ class AgentManager(Node):
             ns = self._subsystem_epoch_ns + self._sim_time_ns
         else:
             ns = self._sim_time_ns
-        header = Header(frame_id="map")
+        header = Header(frame_id=self._frame_id)
         header.stamp.sec = int(ns // int(1e9))
         header.stamp.nanosec = int(ns % int(1e9))
         return header
@@ -2693,15 +2608,19 @@ class AgentManager(Node):
             tuple(agent.params.name if agent is not None else "" for agent in agents),
             tuple(lifetime.source_name if lifetime is not None else "" for lifetime in lifetimes),
             tuple(lifetime.source_seq if lifetime is not None else 0 for lifetime in lifetimes),
-            tuple(self._pool.robot_awareness[rows]),
-            tuple(self._pool.robot_repulsion_gain[rows]),
-            tuple(self._pool.robot_fov_gain[rows]),
-            tuple(self._pool.robot_reaction_gain[rows]),
+            (
+                tuple(self._pool.robot_range_offset[rows].tolist()),
+                tuple(self._pool.robot_fov_offset[rows].tolist()),
+                tuple(self._pool.robot_repulsion_gain[rows].tolist()),
+                tuple(self._pool.robot_reaction_gain[rows].tolist()),
+                tuple(self._pool.robot_blind[rows].tolist()),
+            ),
         )
         if content == self._meta_published:
             return
         self._meta_published = content
-        policies, _, agent_names, handedness, agent_types, source_names, source_seqs, robot_awareness, robot_repulsion_gain, robot_fov_gain, robot_reaction_gain = content
+        policies, _, agent_names, handedness, agent_types, source_names, source_seqs, awareness = content
+        range_offsets, fov_offsets, repulsion_gains, reaction_gains, blind = awareness
         msg = AgentMetaMsg(header=header)
         msg.policies = list(policies)
         msg.agent_id = array.array("i", ids)
@@ -2710,10 +2629,11 @@ class AgentManager(Node):
         msg.agent_type = list(agent_types)
         msg.source_name = list(source_names)
         msg.source_seq = array.array("i", source_seqs)
-        msg.robot_awareness = array.array("f", robot_awareness)
-        msg.robot_repulsion_gain = array.array("f", robot_repulsion_gain)
-        msg.robot_fov_gain = array.array("f", robot_fov_gain)
-        msg.robot_reaction_gain = array.array("f", robot_reaction_gain)
+        msg.robot_range_offset = array.array("f", range_offsets)
+        msg.robot_fov_offset = array.array("f", fov_offsets)
+        msg.robot_repulsion_gain = array.array("f", repulsion_gains)
+        msg.robot_reaction_gain = array.array("f", reaction_gains)
+        msg.robot_blind = list(blind)
         self._agent_meta_pub.publish(msg)
 
     def _publish_agent_gestures(self, header: Header) -> None:
@@ -3099,6 +3019,7 @@ class AgentManager(Node):
         self._interaction_scripts_by_tick.clear()
         self._walls.clear()
         self._obstacles.clear()
+        self._lane_sources.clear()
         self._zones.clear_transfers()
         self._zones.set_zones([], [])
         for subsystem in self._wall_aware:
@@ -3227,7 +3148,35 @@ class AgentManager(Node):
                 agent_radius=src_msg.agent.agent_radius,
                 agent_type=src_msg.agent.agent_type,
                 sink_affinity=[SinkAffinity(sink_name=sa.sink_name, weight=sa.weight) for sa in src_msg.agent.sink_affinity],
+                robot_awareness=awareness_from_text(src_msg.agent.robot_awareness),
             ),
+            lane_config=AgentManager._lane_config_from_msg(src_msg),
+        )
+
+    @staticmethod
+    def _lane_config_from_msg(src_msg: SourceConfigMsg) -> LaneConfig | None:
+        lane = src_msg.lane
+        if not lane.segments:
+            return None
+        if not lane.side:
+            raise ValueError(f"source {src_msg.name!r}: a lane needs a side (right, left or center)")
+        try:
+            side = LaneSide(lane.side)
+        except ValueError:
+            raise ValueError(f"source {src_msg.name!r}: unknown lane side {lane.side!r}") from None
+        defaults = LaneConfig(centerlines=[], side=side)
+        return LaneConfig(
+            centerlines=[[Pose2D(x=point.x, y=point.y, theta=0.0) for point in segment.centerline] for segment in lane.segments],
+            side=side,
+            two_way=lane.two_way,
+            offset=lane.offset if lane.has_offset else None,
+            sigma_q=lane.sigma_q or defaults.sigma_q,
+            chord_tolerance=lane.chord_tolerance or defaults.chord_tolerance,
+            track_spacing=_positive_or_none(lane.track_spacing),
+            arrival_radius=_positive_or_none(lane.arrival_radius),
+            merge_length=_positive_or_none(lane.merge_length),
+            spawn_length=_positive_or_none(lane.spawn_length),
+            sweep_length=_positive_or_none(lane.sweep_length),
         )
 
     @staticmethod
@@ -3241,9 +3190,11 @@ class AgentManager(Node):
         )
 
     def _set_flow_callback(self, request: SetFlow.Request, response: SetFlow.Response) -> SetFlow.Response:
+        sinks = {sink.name: sink for sink in (self._sink_msg_to_config(sink_msg) for sink_msg in request.flow.sinks)}
         try:
             sources = [self._source_msg_to_config(src_msg) for src_msg in request.flow.sources]
             for src in sources:
+                self._attach_lane(src, sinks)
                 self._spawn_scheduler.validate(src)
         except ValueError as e:
             response.success = False
@@ -3253,14 +3204,15 @@ class AgentManager(Node):
 
         self._spawn_scheduler.clear_sources()
         self._despawn_monitor.clear_sinks()
+        self._lane_sources.clear()
 
         for src in sources:
             self._spawn_scheduler.add_source(src)
+            if src.lane_config is not None:
+                self._lane_sources[src.name] = src
+        self._narrow_goal_corners()
 
-        sinks = {}
-        for sink_msg in request.flow.sinks:
-            sink = self._sink_msg_to_config(sink_msg)
-            sinks[sink.name] = sink
+        for sink in sinks.values():
             self._despawn_monitor.add_sink(sink)
 
         self._spawn_scheduler.set_sinks(sinks)
@@ -3296,12 +3248,21 @@ class AgentManager(Node):
     def _add_source_callback(self, request: AddSource.Request, response: AddSource.Response) -> AddSource.Response:
         try:
             src = self._source_msg_to_config(request.source)
+            self._attach_lane(src, self._despawn_monitor.sinks)
             self._spawn_scheduler.add_source(src)
         except ValueError as e:
             response.success = False
             response.message = str(e)
             self._logger.error(response.message)
             return response
+        if src.lane_config is not None:
+            self._lane_sources[src.name] = src
+        self._narrow_goal_corners()
+        if src.lane is not None:
+            response.track_spacing = src.lane.settings.track_spacing
+            response.arrival_radius = src.lane.settings.arrival_radius
+            response.spawn_length = src.lane.settings.spawn_length
+            response.sigma_m = sigma_meters(src.lane)
         response.success = True
         response.message = f"Added source {src.name}"
         response.name = src.name
@@ -3311,10 +3272,13 @@ class AgentManager(Node):
     def _remove_source_callback(self, request: RemoveSource.Request, response: RemoveSource.Response) -> RemoveSource.Response:
         if not request.name:
             self._spawn_scheduler.clear_sources()
+            self._lane_sources.clear()
             response.message = "Removed all sources"
         else:
             self._spawn_scheduler.remove_source(request.name)
+            self._lane_sources.pop(request.name, None)
             response.message = f"Removed source {request.name}"
+        self._narrow_goal_corners()
         response.success = True
         self._logger.debug(response.message)
         return response
@@ -3323,6 +3287,7 @@ class AgentManager(Node):
         sink = self._sink_msg_to_config(request.sink)
         self._despawn_monitor.add_sink(sink)
         self._spawn_scheduler.set_sinks(self._despawn_monitor.sinks)
+        self._rebuild_lanes(sink=sink.name)
         response.success = True
         response.message = f"Added sink {sink.name}"
         response.name = sink.name
@@ -3333,14 +3298,53 @@ class AgentManager(Node):
         if not request.name:
             self._despawn_monitor.clear_sinks()
             self._spawn_scheduler.set_sinks({})
+            self._rebuild_lanes()
             response.message = "Removed all sinks"
         else:
             self._despawn_monitor.remove_sink(request.name)
             self._spawn_scheduler.set_sinks(self._despawn_monitor.sinks)
+            self._rebuild_lanes(sink=request.name)
             response.message = f"Removed sink {request.name}"
         response.success = True
         self._logger.debug(response.message)
         return response
+
+    def _attach_lane(self, src: SourceConfig, sinks: Mapping[str, SinkConfig]) -> None:
+        if src.lane_config is not None:
+            src.lane = self._build_source_lane(src, self._all_wall_segments(), sinks)
+
+    def _build_source_lane(self, src: SourceConfig, walls: Segments, sinks: Mapping[str, SinkConfig]) -> Lane:
+        clearance = resolve_clearance(self._float_param("global_planner.inflation_radius"), self._float_param("global_planner.resolution"))
+        return resolve_lane(src, walls, sinks, clearance)
+
+    def _rebuild_lanes(self, changed: Segments | None = None, sink: str | None = None) -> None:
+        """Rebuild the lanes the changed segments can affect or that end in the sink (all when both are None) and suspend the sources whose lane no longer builds."""
+        walls = self._all_wall_segments()
+        sinks = self._despawn_monitor.sinks
+        moved = None if changed is None else segments_array(changed)
+        for src in self._lane_sources.values():
+            if sink is not None and src.agent.sink_affinity[0].sink_name != sink:
+                continue
+            if src.lane is not None and moved is not None and not lane_affected(src.lane, moved):
+                continue
+            try:
+                lane = self._build_source_lane(src, walls, sinks)
+            except ValueError as e:
+                if src.lane is not None:
+                    self._logger.warning(f"source {src.name!r} suspended: {e}")
+                src.lane = None
+                continue
+            if src.lane is None:
+                self._logger.info(f"source {src.name!r} resumed")
+            src.lane = lane
+        self._narrow_goal_corners()
+
+    def _narrow_goal_corners(self) -> None:
+        """Limit each built lane's goal corners to the corners where another built lane is inside the turn."""
+        built = {name: src.lane for name, src in self._lane_sources.items() if src.lane is not None}
+        for name, lane in built.items():
+            others = [other for other_name, other in built.items() if other_name != name]
+            self._lane_sources[name].lane = with_goal_corners(lane, others)
 
     def _all_wall_segments(self) -> Segments:
         """Collect wall segments from both explicit walls and obstacle bounding boxes."""
@@ -3349,16 +3353,19 @@ class AgentManager(Node):
             segments.extend(obs.wall_segments)
         return segments
 
+    def _walls_of(self, subsystem: WallAware, segments: Segments) -> Segments:
+        """The walls a subsystem takes, for a global planner with the seams of the stairs joined in place."""
+        return [*segments, *self._zones.gates] if isinstance(subsystem, GlobalPlanner) else segments
+
     def _refresh_planners(self):
         """Push current wall segments to local planner, global planner, and collision."""
         segments = self._all_wall_segments()
         for subsystem in self._wall_aware:
-            subsystem.set_walls(segments)
+            subsystem.set_walls(self._walls_of(subsystem, segments))
 
     def _publish_world_geometry(self) -> None:
         msg = WorldGeometryMsg()
-        msg.header.frame_id = "map"
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header = self._header()
 
         for name, ((sx, sy), (ex, ey)) in self._walls.items():
             msg.wall_names.append(name)  # pyright: ignore[reportAttributeAccessIssue]
@@ -3396,8 +3403,13 @@ class AgentManager(Node):
         self._world_geometry_pub.publish(msg)
 
     def _add_walls_callback(self, request: AddWalls.Request, response: AddWalls.Response) -> AddWalls.Response:
+        changed: Segments = []
         for name, start, end in zip(request.names, request.starts, request.ends, strict=True):
+            if name in self._walls:
+                changed.append(self._walls[name])
             self._walls[name] = ((start.x, start.y), (end.x, end.y))
+            changed.append(self._walls[name])
+        self._rebuild_lanes(changed)
         self._refresh_planners()
         self._publish_world_geometry()
         response.success = True
@@ -3406,13 +3418,14 @@ class AgentManager(Node):
         return response
 
     def _remove_walls_callback(self, request: RemoveWalls.Request, response: RemoveWalls.Response) -> RemoveWalls.Response:
+        changed: Segments | None = None
         if not request.names:
             self._walls.clear()
             response.message = "Removed all walls"
         else:
-            for name in request.names:
-                self._walls.pop(name, None)
+            changed = [wall for name in request.names if (wall := self._walls.pop(name, None)) is not None]
             response.message = f"Removed {len(request.names)} wall(s), remaining {len(self._walls)}"
+        self._rebuild_lanes(changed)
         self._refresh_planners()
         self._publish_world_geometry()
         response.success = True
@@ -3453,7 +3466,10 @@ class AgentManager(Node):
             return response
         if not walls and any(z.kind for z in zones):
             self._logger.warning("teleport zones set before any wall: stair half holds are not checked against the walls")
+        gates = self._zones.gates
         self._zones.set_zones(zones, [z.open for z in request.zones])
+        if self._zones.gates != gates:
+            self._refresh_planners()
         response.success = True
         response.message = f"Set {len(zones)} teleport zone(s)"
         self._logger.debug(response.message)
@@ -3488,41 +3504,14 @@ class AgentManager(Node):
         self._logger.debug(response.message)
         return response
 
-    @staticmethod
-    def _decompose_obstacle_to_walls(
-        pose: Pose2D,
-        x_min: float,
-        x_max: float,
-        y_min: float,
-        y_max: float,
-    ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
-        """Convert a rotated 2D bounding box into 4 wall segments."""
-        cos_t, sin_t = math.cos(pose.theta), math.sin(pose.theta)
-        corners_local = [
-            (x_min, y_min),
-            (x_min, y_max),
-            (x_max, y_max),
-            (x_max, y_min),
-        ]
-        corners_world = []
-        for lx, ly in corners_local:
-            wx = pose.x + cos_t * lx - sin_t * ly
-            wy = pose.y + sin_t * lx + cos_t * ly
-            corners_world.append((wx, wy))
-
-        segments = []
-        for i in range(4):
-            j = (i + 1) % 4
-            segments.append((corners_world[i], corners_world[j]))
-        return segments
-
     def _add_obstacles_callback(self, request: AddObstacles.Request, response: AddObstacles.Response) -> AddObstacles.Response:
         added = 0
+        changed: Segments = []
         for obs_msg in request.obstacles:
             if obs_msg.name in self._obstacles:
                 continue  # noop if already exists
             pose = Pose2D(x=obs_msg.pose.x, y=obs_msg.pose.y, theta=obs_msg.pose.theta)
-            wall_segments = self._decompose_obstacle_to_walls(
+            wall_segments = box_wall_segments(
                 pose,
                 obs_msg.bb_x_min,
                 obs_msg.bb_x_max,
@@ -3545,6 +3534,8 @@ class AgentManager(Node):
                 wall_segments=tuple(wall_segments),
             )
             added += 1
+            changed.extend(wall_segments)
+        self._rebuild_lanes(changed)
         if added:
             self._refresh_planners()
             self._publish_world_geometry()
@@ -3554,13 +3545,14 @@ class AgentManager(Node):
         return response
 
     def _remove_obstacles_callback(self, request: RemoveObstacles.Request, response: RemoveObstacles.Response) -> RemoveObstacles.Response:
+        changed: Segments | None = None
         if not request.names:
             self._obstacles.clear()
             response.message = "Removed all obstacles"
         else:
-            for name in request.names:
-                self._obstacles.pop(name, None)
+            changed = [segment for name in request.names if (obs := self._obstacles.pop(name, None)) is not None for segment in obs.wall_segments]
             response.message = f"Removed {len(request.names)} obstacle(s), remaining {len(self._obstacles)}"
+        self._rebuild_lanes(changed)
         self._refresh_planners()
         self._publish_world_geometry()
         response.success = True

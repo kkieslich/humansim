@@ -102,7 +102,7 @@ class DefaultPerception(Perception):
                 blocked = ~_clear_unordered(self._occluder, positions, r_los, c_los, n)
                 mask[r_los[blocked], c_los[blocked]] = False
 
-        # Gate robot perception by observer's robot_awareness
+        # Robots are gated by each observer's blind flag, range offset and cone offset.
         is_robot = pool.kind[:n] == KIND_ROBOT
         if np.any(is_robot):
             robot_cols = np.flatnonzero(is_robot)
@@ -110,20 +110,18 @@ class DefaultPerception(Perception):
             if len(human_rows) > 0 and len(robot_cols) > 0:
                 h_idx = human_rows[:, None]
                 r_idx = robot_cols[None, :]
-                awareness = pool.robot_awareness[human_rows, None]
-                blind_mask = awareness <= 0.0
+                blind_mask = pool.robot_blind[human_rows, None]
                 mask[h_idx, r_idx] &= ~blind_mask
 
-                fov_gain = pool.robot_fov_gain[human_rows, None]
-                partial = ((awareness > 0.0) & (awareness < 1.0)) | (fov_gain != 1.0)
+                partial = (pool.robot_range_offset[human_rows, None] != 0.0) | (pool.robot_fov_offset[human_rows, None] != 0.0)
                 partial = np.broadcast_to(partial, (len(human_rows), len(robot_cols)))
                 if np.any(partial):
                     p_rows, p_cols = np.nonzero(partial)
                     orig_r = human_rows[p_rows]
                     orig_c = robot_cols[p_cols]
                     pair_dists = dists[orig_r, orig_c]
-                    eff_range = pool.vision_range[orig_r] * pool.robot_awareness[orig_r]
-                    eff_prox = pool.proximity_sense[orig_r] * pool.robot_awareness[orig_r]
+                    eff_range = _robot_range(pool.vision_range[orig_r], pool.robot_range_offset[orig_r])
+                    eff_prox = np.minimum(pool.proximity_sense[orig_r], eff_range)
                     beyond = pair_dists > np.maximum(eff_range, eff_prox)
                     mask[orig_r[beyond], orig_c[beyond]] = False
 
@@ -131,9 +129,9 @@ class DefaultPerception(Perception):
                     if np.any(surviving):
                         sr_r = orig_r[surviving]
                         sr_c = orig_c[surviving]
-                        eff_fov = pool.vision_fov[sr_r] * pool.robot_fov_gain[sr_r]
+                        eff_fov = _robot_fov(pool.vision_fov[sr_r], pool.robot_fov_offset[sr_r])
                         needs_fov_check = eff_fov < 360.0
-                        cos_half = np.cos(np.radians(np.clip(eff_fov, 0.0, 360.0) * 0.5))
+                        cos_half = np.cos(np.radians(eff_fov * 0.5))
                         heading = pool.theta[sr_r]
                         dot = diff[sr_r, sr_c, 0] * np.cos(heading) + diff[sr_r, sr_c, 1] * np.sin(heading)
                         outside_fov = needs_fov_check & (dot < pair_dists[surviving] * cos_half)
@@ -201,23 +199,20 @@ class DefaultPerception(Perception):
                 blocked = ~_clear_unordered(self._occluder, positions, row[los_idx], col[los_idx], n)
                 keep[los_idx[blocked]] = False
 
-        # Gate robot perception by observer's robot_awareness
+        # Robots are gated by each observer's blind flag, range offset and cone offset.
         robot_nbr = (pool.kind[col] == KIND_ROBOT) & (pool.kind[row] != KIND_ROBOT)
         if np.any(robot_nbr):
-            awareness = pool.robot_awareness[row[robot_nbr]]
             robot_nbr_idx = np.flatnonzero(robot_nbr)
-            blind_idx = robot_nbr_idx[awareness <= 0.0]
-            keep[blind_idx] = False
+            keep[robot_nbr_idx[pool.robot_blind[row[robot_nbr]]]] = False
 
-            fov_gain = pool.robot_fov_gain[row[robot_nbr]]
-            partial_sub = ((awareness > 0.0) & (awareness < 1.0)) | (fov_gain != 1.0)
+            partial_sub = (pool.robot_range_offset[row[robot_nbr]] != 0.0) | (pool.robot_fov_offset[row[robot_nbr]] != 0.0)
             if np.any(partial_sub):
                 partial_idx = robot_nbr_idx[partial_sub]
                 p_row = row[partial_idx]
                 p_col = col[partial_idx]
                 p_dist = dist[partial_idx]
-                eff_range = pool.vision_range[p_row] * pool.robot_awareness[p_row]
-                eff_prox = pool.proximity_sense[p_row] * pool.robot_awareness[p_row]
+                eff_range = _robot_range(pool.vision_range[p_row], pool.robot_range_offset[p_row])
+                eff_prox = np.minimum(pool.proximity_sense[p_row], eff_range)
                 beyond = p_dist > np.maximum(eff_range, eff_prox)
                 keep[partial_idx[beyond]] = False
 
@@ -226,9 +221,9 @@ class DefaultPerception(Perception):
                     s_idx = partial_idx[surviving]
                     s_row = p_row[surviving]
                     s_col = p_col[surviving]
-                    eff_fov = pool.vision_fov[s_row] * pool.robot_fov_gain[s_row]
+                    eff_fov = _robot_fov(pool.vision_fov[s_row], pool.robot_fov_offset[s_row])
                     needs_fov_check = eff_fov < 360.0
-                    cos_half = np.cos(np.radians(np.clip(eff_fov, 0.0, 360.0) * 0.5))
+                    cos_half = np.cos(np.radians(eff_fov * 0.5))
                     heading = pool.theta[s_row]
                     dx = positions[s_col, 0] - positions[s_row, 0]
                     dy = positions[s_col, 1] - positions[s_row, 1]
@@ -273,8 +268,10 @@ class DefaultPerception(Perception):
             return belief
 
         heading = observer.pose.theta
-        robot_awareness: float = agent.params.perception.robot_awareness
-        robot_fov_gain: float = agent.params.perception.robot_fov_gain
+        perception = agent.params.perception
+        robot_range = min(vision_range, max(0.0, vision_range + perception.robot_range_offset))
+        robot_prox = min(proximity_sense, robot_range)
+        robot_fov = min(360.0, max(0.0, vision_fov + perception.robot_fov_offset))
 
         query_radius = max(vision_range, proximity_sense)
         neighbor_indices = self._shared_tree.query_ball_point([ox, oy], query_radius)
@@ -285,11 +282,11 @@ class DefaultPerception(Perception):
             if nid == agent_id:
                 continue
             nbr_is_robot = all_agents[nid].kind == KIND_ROBOT
-            if nbr_is_robot and robot_awareness <= 0.0:
+            if nbr_is_robot and perception.robot_blind:
                 continue
-            eff_range = vision_range * robot_awareness if nbr_is_robot else vision_range
-            eff_prox = proximity_sense * robot_awareness if nbr_is_robot else proximity_sense
-            eff_fov = vision_fov * robot_fov_gain if nbr_is_robot else vision_fov
+            eff_range = robot_range if nbr_is_robot else vision_range
+            eff_prox = robot_prox if nbr_is_robot else proximity_sense
+            eff_fov = robot_fov if nbr_is_robot else vision_fov
 
             nx, ny = self._shared_positions[idx]
             d = float(np.hypot(nx - ox, ny - oy))
@@ -317,9 +314,17 @@ class DefaultPerception(Perception):
         return belief
 
 
+def _robot_range(vision_range: np.ndarray, range_offset: np.ndarray) -> np.ndarray:
+    return np.clip(vision_range + range_offset, 0.0, vision_range)
+
+
+def _robot_fov(vision_fov: np.ndarray, fov_offset: np.ndarray) -> np.ndarray:
+    return np.clip(vision_fov + fov_offset, 0.0, 360.0)
+
+
 def _pair_fov(pool: AgentPool, rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
     robot_target = (pool.kind[cols] == KIND_ROBOT) & (pool.kind[rows] != KIND_ROBOT)
-    return pool.vision_fov[rows] * np.where(robot_target, pool.robot_fov_gain[rows], 1.0)
+    return np.where(robot_target, _robot_fov(pool.vision_fov[rows], pool.robot_fov_offset[rows]), pool.vision_fov[rows])
 
 
 def _wrap_angle(angle: float) -> float:
