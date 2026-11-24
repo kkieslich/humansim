@@ -410,13 +410,7 @@ class TeleportZones:
         if walking and held is None and (not paced or now < self._next_choice.get(aid, -math.inf)):
             return None
         choose = self.route_choice and paced
-        rides = [
-            (name, dest)
-            for name, zone in sorted(self.zones.items())
-            if name not in blocked and (name in self._joined or (choose and zone.belt >= 0.0))
-            for dest in zone.destinations
-            if dest in self.zones and (name in self._joined or dest not in blocked)
-        ]
+        rides = [(name, dest) for name, zone in sorted(self.zones.items()) if name not in blocked and (name in self._joined or (choose and zone.belt >= 0.0)) for dest in zone.destinations if dest in self.zones and (name in self._joined or dest not in blocked)]
         if paced:
             self._next_choice[aid] = now + CHOICE_INTERVAL + (aid % CHOICE_STAGGER) * CHOICE_INTERVAL / CHOICE_STAGGER
         if not rides:
