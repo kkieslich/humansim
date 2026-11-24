@@ -40,7 +40,7 @@ __all__ = [
 
 import json
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import overload
 
@@ -524,8 +524,8 @@ class LocomotionDist:
     recovery_reverse_m: ParamDist = attrs.field(factory=_zero_dist, converter=_as_paramdist)
 
 
-def _block(cls: type, name: str):  # noqa: ANN202
-    def convert(val: object) -> object:
+def _block[T: attrs.AttrsInstance](cls: type[T], name: str) -> Callable[[object], T]:
+    def convert(val: object) -> T:
         if val is None:
             return cls()
         if isinstance(val, cls):

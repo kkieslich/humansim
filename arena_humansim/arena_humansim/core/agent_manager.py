@@ -989,8 +989,9 @@ class AgentManager(TimeNode):
 
     def _set_side(self, planner: object) -> None:
         """The lane side for a local planner that sidesteps oncoming walkers (`set_side`)."""
-        if hasattr(planner, "set_side"):
-            planner.set_side(str(self.get_parameter("global_planner.lane_side").value))
+        set_side = getattr(planner, "set_side", None)
+        if callable(set_side):
+            set_side(str(self.get_parameter("global_planner.lane_side").value))
 
     def _attach_late(self, planner: LocalPlanner | GlobalPlanner) -> None:
         """Wire a planner created after __init__ into the pool and the walls."""

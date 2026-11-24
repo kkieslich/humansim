@@ -3,10 +3,12 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Sequence
+from typing import Any, TypedDict
 
 import attrs
 import numpy as np
 
+from arena_humansim.core.agents.types import Passage, WallTrailing
 from arena_humansim.utils.mesh import TOL, Mesh
 from arena_humansim.utils.router import VERIFY_EPS, Router
 from arena_humansim.utils.types import Pose2D, Segments
@@ -55,6 +57,14 @@ QUEUE_LOOK, QUEUE_STEP = 6.0, 0.25
 QUEUE_MARGIN = 0.1
 #: Two walkers in each other's way are level where neither is this much further ahead of the other [m]
 QUEUE_LEVEL = 0.1
+
+
+class _Fit(TypedDict):
+    """How a walker's body fits a shaped route (`wall_following`'s `body`, `axial` and `ends`)."""
+
+    body: float
+    axial: float
+    ends: float
 
 
 @attrs.frozen
@@ -159,7 +169,7 @@ class NavMeshPlanner(GlobalPlanner):
         #: the walkers' positions at the last congestion update, a KD-tree
         self._crowd = None
         #: per agent of the last `compute`: its wall trailing and passage settings, and half its body length
-        self._manners: dict[int, tuple[object, object, float]] = {}
+        self._manners: dict[int, tuple[WallTrailing, Passage, float]] = {}
         self._ways: dict[int, Way] = {}
         self._shapes: dict[int, tuple[int, Shaped]] = {}
         self._claims: dict[int, tuple[float, float, int]] = {}
@@ -183,6 +193,7 @@ class NavMeshPlanner(GlobalPlanner):
         lane_side: str | None = None,
         lane_offset: float | None = None,
         congestion_interval: float | None = None,
+        **_: Any,  # noqa: ANN401 - as GlobalPlanner.configure
     ) -> None:
         if congestion_interval is not None and congestion_interval != self._congestion_interval:
             self._congestion_interval = congestion_interval
@@ -301,10 +312,13 @@ class NavMeshPlanner(GlobalPlanner):
         self._manners = {}
         for agent in agents:
             params = getattr(agent, "params", None)
-            trailing, passage = getattr(params, "wall_trailing", None), getattr(params, "passage", None)
+            if params is None:
+                continue
+            trailing: WallTrailing | None = getattr(params, "wall_trailing", None)
+            passage: Passage | None = getattr(params, "passage", None)
             if (trailing is not None and trailing.active) or (passage is not None and passage.active):
                 length = float(getattr(getattr(params, "locomotion", None), "footprint_length", 0.0) or 0.0)
-                self._manners[agent.state.agent_id] = (trailing, passage, max(length / 2.0, float(params.agent_radius)))
+                self._manners[agent.state.agent_id] = (trailing if trailing is not None else WallTrailing(), passage if passage is not None else Passage(), max(length / 2.0, float(params.agent_radius)))
         goals = super().compute(agents, high_level_commands)
         self._commands = {}
         if self._manners or self._ways:
@@ -313,7 +327,7 @@ class NavMeshPlanner(GlobalPlanner):
 
     def _takes_straight_legs(self, agent_id: int) -> bool:
         manner = self._manners.get(agent_id)
-        return manner is None or manner[1] is None or not manner[1].active
+        return manner is None or not manner[1].active
 
     def passage_commands(self) -> dict[int, PassageCommand]:
         """What the last `compute` asks of the locomotion of walkers that keep a lane or take turns in narrow passages."""
@@ -338,12 +352,12 @@ class NavMeshPlanner(GlobalPlanner):
         radius = self._radius_of(agent_id)
         body = max(radius, MIN_BODY_RADIUS) + LANE_WALL_GAP
         prefer = {"right": -1.0, "left": 1.0}.get(self._lane_side, 0.0)
-        if trailing is not None and trailing.active:
+        if trailing.active:
             shaped = follow_walls(polyline, self._cast, router.clearance, body=body, offset=trailing.offset, reach=trailing.reach, prefer=prefer, either=True, ramp=TRAIL_RAMP, bridge=trailing.reach)
             narrow = 0.0
         else:
             lanes = passage.lanes and prefer != 0.0
-            fit = dict(body=body, axial=max(half - radius, 0.0), ends=radius)
+            fit: _Fit = {"body": body, "axial": max(half - radius, 0.0), "ends": radius}
             lane = passage.lane_width / 2.0 if lanes else 0.0
             shaped = follow_walls(polyline, self._cast, router.clearance, offset=lane, reach=passage.corridor_width, prefer=prefer, either=False, corridor=passage.corridor_width, span=passage.two_way_width, early=False, along=LANE_ALONG, bridge=passage.corridor_width, **fit)
             narrow = passage.two_way_width if passage.takes_turns else 0.0
@@ -379,7 +393,7 @@ class NavMeshPlanner(GlobalPlanner):
         self._ways.pop(agent_id, None)
         manner = self._manners.get(agent_id)
         hit = self._shapes.pop(agent_id, None)
-        if manner is None or hit is None or manner[1] is None or not manner[1].active:
+        if manner is None or hit is None or not manner[1].active:
             return
         passage, shaped = manner[1], hit[1]
         if hit[0] + extra != len(waypoints):
@@ -515,7 +529,7 @@ class NavMeshPlanner(GlobalPlanner):
         that stands across). Two in each other's way, as where two routes join: the one that has the other further ahead
         gives way (the higher id where they are level) and keeps giving way until they are apart, so they go one after
         the other instead of side by side."""
-        ids = [aid for aid, manner in self._manners.items() if manner[1] is not None and manner[1].active and aid in present]
+        ids = [aid for aid, manner in self._manners.items() if manner[1].active and aid in present]
         if len(ids) < 2:
             return {}
         pos = np.array([(present[aid].state.pose.x, present[aid].state.pose.y) for aid in ids], dtype=np.float64)
@@ -583,7 +597,7 @@ class NavMeshPlanner(GlobalPlanner):
         assert self._mesh is not None
         if not len(positions):
             return None
-        from scipy.spatial import cKDTree
+        from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]  # scipy exports it from a compiled module the checker cannot see
 
         self._crowd = cKDTree(positions)
         return self._weidmann(self._crowd.query_ball_point(self._mesh.e_mid, CONGESTION_RADIUS, return_length=True))

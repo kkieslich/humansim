@@ -312,7 +312,7 @@ class TeleportZones:
                 continue
             if cmd is not None and cmd.type == CommandType.NAVIGATE and agent.state.kind != KIND_ROBOT:
                 groups.setdefault(agent.global_planner, []).append((agent, cmd))
-        paced = self.route_choice and now is not None
+        paced_at = now if self.route_choice else None
         blocked: dict[tuple[str, ...], set[str]] = {}
         for planner, group in groups.items():
             graph = self._graph(planner)
@@ -344,7 +344,7 @@ class TeleportZones:
                 if transfer is not None and transfer.ride and not self._aboard(transfer, *near) and (transfer.zone in blocked[climbs] or (comps[k] and not comps[k] & graph.sides[transfer.zone]) or (transfer.zone not in self._joined and transfer.destination in blocked[climbs])):
                     del self.transfers[aid]
                     transfer = None
-                again = paced and transfer is not None and transfer.ride and transfer.phase == Phase.WALK and not self._aboard(transfer, *near) and now >= self._next_choice.get(aid, -math.inf)
+                again = paced_at is not None and transfer is not None and transfer.ride and transfer.phase == Phase.WALK and not self._aboard(transfer, *near) and paced_at >= self._next_choice.get(aid, -math.inf)
                 if transfer is None or again or (transfer.phase == Phase.WALK and not transfer.ride and not self._aboard(transfer, *near)):
                     start, end = comps[k], comps[len(group) + k]
                     keep = None if transfer is None else (transfer.zone, transfer.destination)
@@ -359,7 +359,7 @@ class TeleportZones:
                     walkable = bool({graph.area.get(c, c) for c in start} & {graph.area.get(c, c) for c in end})
                     if (edge is None and walkable) or (edge is not None and edge[0] in self._joined):
                         held = (transfer.zone, transfer.destination) if again and transfer is not None else None
-                        timed = self._ride(planner, agent, cmd.target_pose, goal, blocked[climbs] | set(self._banned[aid][1] if aid in self._banned else ()), now if paced else None, held)
+                        timed = self._ride(planner, agent, cmd.target_pose, goal, blocked[climbs] | set(self._banned[aid][1] if aid in self._banned else ()), paced_at, held)
                         if timed is not None:
                             edge, ride = timed, True
                     if edge is None:
