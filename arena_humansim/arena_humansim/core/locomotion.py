@@ -205,9 +205,9 @@ class LocomotionExtension(PoolAware):
         self.overlay_sway[rows] = 0.0
 
     def set_passage(self, pool: AgentPool, commands: Mapping[int, PassageCommand]) -> None:
-        """Take the planner's lane and hold commands for the rows with a locomotion profile, until the next call: a row in a
-        lane steers its heading at its goal (`pool.steer_to_goal`), a held row slows down to stop at its hold point and
-        makes no stall recovery there, a row told to roll back does so until it is behind the point."""
+        """Take the planner's lane and hold commands until the next call: a row with a locomotion profile in a lane steers
+        its heading at its goal (`pool.steer_to_goal`); any held row slows down to stop at its hold point (one with a
+        locomotion profile makes no stall recovery there), a row told to roll back does so until it is behind the point."""
         n = pool.n
         if not commands and not self._commanded:
             return
@@ -217,9 +217,9 @@ class LocomotionExtension(PoolAware):
         pool.steer_to_goal[:n] = False
         for aid, command in commands.items():
             idx = pool._id_to_idx.get(aid)
-            if idx is None or not self.active[idx]:
+            if idx is None or (not self.active[idx] and command.hold is None):
                 continue
-            pool.steer_to_goal[idx] = command.lane
+            pool.steer_to_goal[idx] = command.lane and bool(self.active[idx])
             if command.hold is not None:
                 self.hold[idx] = True
                 self.hold_at[idx] = command.hold
@@ -239,12 +239,18 @@ class LocomotionExtension(PoolAware):
         pool.vel[held] = vel * np.where(along > cap, cap / np.maximum(along, 1e-9), 1.0)[:, None]
         rolling = self.back[held] & (left < 0.0)
         if rolling.any():
-            theta = pool.theta[held[rolling]]
-            pool.vel[held[rolling]] = -np.minimum(REVERSE_SPEED, -left[rolling] / dt)[:, None] * np.column_stack([np.cos(theta), np.sin(theta)])
+            rows = held[rolling]
+            theta = pool.theta[rows]
+            # a row that moves along its heading reverses; any other walks back against the route
+            along = (self.active[rows] & (self.kinematics[rows] == 1))[:, None]
+            way = np.where(along, np.column_stack([np.cos(theta), np.sin(theta)]), at[rolling, 2:4])
+            pool.vel[rows] = -np.minimum(REVERSE_SPEED, -left[rolling] / dt)[:, None] * way
 
     def constrain(self, pool: AgentPool, dt: float, provides_heading: np.ndarray) -> None:
         rows = self._rows()
         if rows.size == 0:
+            if self._commanded:
+                self._hold(pool, np.flatnonzero(self.hold[: pool.n]), dt)
             return
         self._recover(pool, rows, dt)
         mode = self.mode[rows]
@@ -275,7 +281,7 @@ class LocomotionExtension(PoolAware):
         if reverse.any():
             pool.vel[rows[reverse]] = -REVERSE_SPEED * f[reverse]
         if self._commanded:
-            self._hold(pool, rows, dt)
+            self._hold(pool, np.flatnonzero(self.hold[: pool.n]), dt)
 
     def _recover(self, pool: AgentPool, rows: np.ndarray, dt: float) -> None:
         rec = rows[self.stall_after[rows] > 0.0]
