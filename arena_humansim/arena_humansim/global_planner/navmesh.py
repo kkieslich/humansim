@@ -4,13 +4,16 @@ import math
 import time
 from collections.abc import Sequence
 
+import attrs
 import numpy as np
 
 from arena_humansim.utils.mesh import TOL, Mesh
 from arena_humansim.utils.router import VERIFY_EPS, Router
 from arena_humansim.utils.types import Pose2D, Segments
+from arena_humansim.utils.wall_grid import WallGrid, cast_rays
 
-from . import LANE_SIDES, GlobalPlanner, PlanRequest
+from . import LANE_SIDES, GlobalPlanner, PassageCommand, PlanRequest
+from .wall_following import PASSING_GAP, STEP, Shaped, approach, follow_walls, leave, sample, thin
 
 SNAP_CACHE = 4096
 FRAME_INSET = 0.01
@@ -32,6 +35,89 @@ MIN_BODY_RADIUS = 0.15
 #: A walker pushed off its route's floor gets back along the route its body fits within this distance [m], checked every
 #: `ESCAPE_STEP` [m]
 ESCAPE_M, ESCAPE_STEP = 3.0, 0.1
+#: A walker trailing a wall nears and leaves it by this much sideways per metre along its route (45 degrees)
+TRAIL_RAMP = 1.0
+#: A walker with a lane steers at the point furthest ahead on its route, up to `LOOK_AHEAD` [m], that it can head for
+#: without leaving the route by more than `LOOK_CUT` [m], and at one at least `LOOK_MIN` [m] away from itself
+LOOK_AHEAD, LOOK_STEP, LOOK_CUT, LOOK_MIN = 1.5, 0.25, 0.1, 0.5
+#: A lane lies between walls that both run along the route within this much sideways per metre (20 degrees)
+LANE_ALONG = 0.36
+#: A walker with a lane or turns to take is in line with the corridor over this length before it enters and after it
+#: leaves [m], so that the two directions' ways in and out run side by side; within it it claims a narrow stretch
+LINE_UP = 4.5
+#: A walker that takes turns is past its hold line, and goes on, once it is this far beyond it [m]
+HOLD_SLACK = 0.5
+#: The narrow stretch a route starts in is measured back from the start this far at most [m]
+BACK_REACH = 30.0
+#: A walker that queues looks this far ahead along its route for another in its way [m], at points this far apart
+QUEUE_LOOK, QUEUE_STEP = 6.0, 0.25
+#: Another is in a queueing walker's way where its body comes within this of the walker's body as it passes [m]
+QUEUE_MARGIN = 0.1
+#: Two walkers in each other's way are level where neither is this much further ahead of the other [m]
+QUEUE_LEVEL = 0.1
+
+
+@attrs.frozen
+class Narrow:
+    """A stretch of a route narrower than its walker's two-way width: its start and end along the route [m], where the
+    walker holds before it (`line`, along the route), and points every `STEP` along it with the route's direction at
+    each."""
+
+    start: float
+    end: float
+    line: float
+    points: np.ndarray
+    tangents: np.ndarray
+
+
+@attrs.define
+class Way:
+    """What a walker with a lane or turns to take needs of its route: the cached waypoint list it belongs to, its points,
+    their distance along it, where it keeps a lane, and its narrow stretches in order."""
+
+    waypoints: list[Pose2D]
+    points: np.ndarray
+    at: np.ndarray
+    lane: np.ndarray
+    narrows: list[Narrow]
+
+    def point(self, s: float) -> tuple[float, float]:
+        """The route's point `s` metres along it, on its first leg's line before the start."""
+        if s < 0.0:
+            u = self.direction(0.0)
+            return float(self.points[0, 0] + s * u[0]), float(self.points[0, 1] + s * u[1])
+        return float(np.interp(s, self.at, self.points[:, 0])), float(np.interp(s, self.at, self.points[:, 1]))
+
+    def look(self, s: float, x: float, y: float) -> tuple[float, float]:
+        """The point to steer at from `s` metres along the route, standing at (x, y): the furthest one up to `LOOK_AHEAD`
+        on whose straight line from the route's point at `s` stays within `LOOK_CUT` of the route (so corners are not
+        cut), but one at least `LOOK_MIN` away where the route goes on that far."""
+        end = float(self.at[-1])
+        sx, sy = self.point(s)
+        best = None
+        for k in range(1, int(round(LOOK_AHEAD / LOOK_STEP)) + 1):
+            e = min(s + k * LOOK_STEP, end)
+            ex, ey = self.point(e)
+            inner = self.points[(self.at > s) & (self.at < e)]
+            if len(inner):
+                chord = math.hypot(ex - sx, ey - sy)
+                off = np.abs((inner[:, 0] - sx) * (ey - sy) - (inner[:, 1] - sy) * (ex - sx)) / max(chord, 1e-9)
+                if float(off.max()) > LOOK_CUT and best is not None and math.hypot(best[0] - x, best[1] - y) >= LOOK_MIN:
+                    break
+            best = (ex, ey)
+            if e >= end:
+                break
+        assert best is not None
+        return best
+
+    def direction(self, s: float) -> tuple[float, float]:
+        """The route's unit direction `s` metres along it."""
+        i = int(np.clip(np.searchsorted(self.at, s, side="right") - 1, 0, len(self.points) - 2))
+        while i < len(self.points) - 2 and self.at[i + 1] - self.at[i] <= 1e-9:
+            i += 1
+        leg = self.points[i + 1] - self.points[i]
+        length = max(float(np.hypot(leg[0], leg[1])), 1e-9)
+        return float(leg[0] / length), float(leg[1] / length)
 
 
 def _keys(segs: np.ndarray) -> set[tuple[float, ...]]:
@@ -72,6 +158,14 @@ class NavMeshPlanner(GlobalPlanner):
         self._pricing = False
         #: the walkers' positions at the last congestion update, a KD-tree
         self._crowd = None
+        #: per agent of the last `compute`: its wall trailing and passage settings, and half its body length
+        self._manners: dict[int, tuple[object, object, float]] = {}
+        self._ways: dict[int, Way] = {}
+        self._shapes: dict[int, tuple[int, Shaped]] = {}
+        self._claims: dict[int, tuple[float, float, int]] = {}
+        self._commands: dict[int, PassageCommand] = {}
+        self._gives_way: set[tuple[int, int]] = set()
+        self._ray_grid: tuple[list, WallGrid] | None = None
 
     @staticmethod
     def _side(lane_side: str) -> str:
@@ -204,7 +298,284 @@ class NavMeshPlanner(GlobalPlanner):
             if self._congestion_tick >= max(1, round(self._congestion_interval / self._dt)):
                 self._congestion_tick = 0
                 self._set_slowdown(self._slowdown_at(np.array([(a.state.pose.x, a.state.pose.y) for a in agents], dtype=np.float64).reshape(-1, 2)))
-        return super().compute(agents, high_level_commands)
+        self._manners = {}
+        for agent in agents:
+            params = getattr(agent, "params", None)
+            trailing, passage = getattr(params, "wall_trailing", None), getattr(params, "passage", None)
+            if (trailing is not None and trailing.active) or (passage is not None and passage.active):
+                length = float(getattr(getattr(params, "locomotion", None), "footprint_length", 0.0) or 0.0)
+                self._manners[agent.state.agent_id] = (trailing, passage, max(length / 2.0, float(params.agent_radius)))
+        goals = super().compute(agents, high_level_commands)
+        self._commands = {}
+        if self._manners or self._ways:
+            self._drive(agents, goals)
+        return goals
+
+    def _takes_straight_legs(self, agent_id: int) -> bool:
+        manner = self._manners.get(agent_id)
+        return manner is None or manner[1] is None or not manner[1].active
+
+    def passage_commands(self) -> dict[int, PassageCommand]:
+        """What the last `compute` asks of the locomotion of walkers that keep a lane or take turns in narrow passages."""
+        return self._commands
+
+    def _cast(self, origins: np.ndarray, directions: np.ndarray, far: float) -> np.ndarray:
+        """The distance to the first wall along each ray, `far` where there is none within it."""
+        if self._ray_grid is None or self._ray_grid[0] is not self._wall_segments:
+            self._ray_grid = (self._wall_segments, WallGrid(self._wall_segments))
+        return cast_rays(self._ray_grid[1], origins, directions, far)
+
+    def _shape(self, agent_id: int, router: Router, polyline: np.ndarray) -> np.ndarray:
+        """The route of an agent that trails walls (`wall_trailing`) or keeps a lane in corridors (`passage`): laid
+        `offset` from the wall it follows, on the lane side where it has the choice. A lane is entered and left in line
+        with it (`approach`, `leave`), and a stretch narrower than the agent's `two_way_width` gets an approach beside
+        its mouth where the agent waits. Any other agent's route as it is."""
+        self._shapes.pop(agent_id, None)
+        manner = self._manners.get(agent_id)
+        if manner is None or len(polyline) < 2 or router.r < self._inflation_radius - 1e-9:
+            return polyline
+        trailing, passage, half = manner
+        radius = self._radius_of(agent_id)
+        body = max(radius, MIN_BODY_RADIUS) + LANE_WALL_GAP
+        prefer = {"right": -1.0, "left": 1.0}.get(self._lane_side, 0.0)
+        if trailing is not None and trailing.active:
+            shaped = follow_walls(polyline, self._cast, router.clearance, body=body, offset=trailing.offset, reach=trailing.reach, prefer=prefer, either=True, ramp=TRAIL_RAMP, bridge=trailing.reach)
+            narrow = 0.0
+        else:
+            lanes = passage.lanes and prefer != 0.0
+            fit = dict(body=body, axial=max(half - radius, 0.0), ends=radius)
+            lane = passage.lane_width / 2.0 if lanes else 0.0
+            shaped = follow_walls(polyline, self._cast, router.clearance, offset=lane, reach=passage.corridor_width, prefer=prefer, either=False, corridor=passage.corridor_width, span=passage.two_way_width, early=False, along=LANE_ALONG, bridge=passage.corridor_width, **fit)
+            narrow = passage.two_way_width if passage.takes_turns else 0.0
+            if lanes:
+                shaped = leave(shaped, shaped.follows, router.clearance, length=LINE_UP, **fit)
+                wide = shaped.follows.copy()
+                edges = np.flatnonzero(np.diff(np.concatenate([[False], wide, [False]]).astype(np.int8)))
+                for a, b in zip(edges[::2].tolist(), edges[1::2].tolist(), strict=True):
+                    if (shaped.width[a : min(a + 2, b)] < narrow).any():
+                        wide[a:b] = False
+                shaped = approach(shaped, wide, router.clearance, length=LINE_UP, prefer=prefer, **fit)
+            if passage.takes_turns:
+                beside = lane + radius + PASSING_GAP if lanes else 0.0
+                shaped = approach(shaped, shaped.width < narrow, router.clearance, length=LINE_UP, lateral=beside, prefer=prefer, waits=True, **fit)
+        shaped = thin(shaped, narrow)
+        self._shapes[agent_id] = (len(shaped.points), shaped)
+        return shaped.points
+
+    def _from_here(self, router: Router, agent_id: int, agent_pos: Pose2D, polyline: np.ndarray) -> np.ndarray:
+        """`polyline` starting where the agent stands instead of where the router moved its start off a wall: a walker in
+        a lane stands closer to the wall than its route's clearance, and its new route must not begin with a step
+        sideways. Kept as it is where the straight leg from the agent to the route's second point is not clear."""
+        here = np.array([agent_pos.x, agent_pos.y], dtype=np.float64)
+        if len(polyline) < 2 or (polyline[0] == here).all():
+            return polyline
+        body = max(self._radius_of(agent_id), MIN_BODY_RADIUS)
+        direct = np.vstack([here, polyline[1:]])
+        return direct if router._clear_many([direct[:2]])[0] >= body - VERIFY_EPS else polyline
+
+    def _keep_way(self, agent_id: int, waypoints: list[Pose2D], extra: int) -> None:
+        """Note the lane stretches and narrow stretches of a route just planned for an agent that takes passages by rule;
+        `extra` is how many waypoints the plan put before the shaped route's own."""
+        self._ways.pop(agent_id, None)
+        manner = self._manners.get(agent_id)
+        hit = self._shapes.pop(agent_id, None)
+        if manner is None or hit is None or manner[1] is None or not manner[1].active:
+            return
+        passage, shaped = manner[1], hit[1]
+        if hit[0] + extra != len(waypoints):
+            return
+        points = np.array([(w.x, w.y) for w in waypoints], dtype=np.float64)
+        lane = np.concatenate([np.zeros(extra, dtype=bool), shaped.follows])
+        width = np.concatenate([np.full(extra, np.inf), shaped.width])
+        waits = np.concatenate([np.zeros(extra, dtype=bool), shaped.waits])
+        at = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(points, axis=0).T))])
+        narrows: list[Narrow] = []
+        if passage.takes_turns:
+            tight = width < passage.two_way_width
+            edges = np.flatnonzero(np.diff(np.concatenate([[False], tight, [False]]).astype(np.int8)))
+            done = 0
+            for a, b in zip(edges[::2].tolist(), edges[1::2].tolist(), strict=True):
+                start = float(at[a]) if a else -self._narrow_behind(points, passage.two_way_width)
+                line = start - passage.hold_back
+                stand = np.flatnonzero(waits[done:a])
+                if len(stand):
+                    line = min(line, float(at[done + stand[-1]]))
+                done = b
+                if b - a < 2:
+                    pts, tangents = points[a : a + 1], np.array([[1.0, 0.0]])
+                    if a + 1 < len(points):
+                        leg = points[a + 1] - points[a]
+                        tangents = (leg / max(float(np.hypot(*leg)), 1e-9))[None]
+                else:
+                    pts, tangents = sample(points[a:b])
+                narrows.append(Narrow(start, float(at[b - 1]), line, pts, tangents))
+        self._ways[agent_id] = Way(waypoints, points, at, lane, narrows)
+
+    def _narrow_behind(self, points: np.ndarray, narrow: float) -> float:
+        """How far the stretch narrower than `narrow` that a route starts in reaches back behind the route's start,
+        along its first leg (`BACK_REACH` at most): where a walker that has to roll back out of it finds its mouth."""
+        leg = points[1] - points[0]
+        length = float(np.hypot(leg[0], leg[1]))
+        if length <= 1e-9:
+            return 0.0
+        u = leg / length
+        left = np.array([-u[1], u[0]])
+        xs = np.arange(STEP, BACK_REACH + 1e-9, STEP)
+        spots = points[0] - xs[:, None] * u
+        width = self._cast(spots, np.repeat(left[None], len(xs), 0), narrow) + self._cast(spots, np.repeat(-left[None], len(xs), 0), narrow)
+        blocked = self._cast(points[:1], -u[None], BACK_REACH)[0]
+        wide = np.flatnonzero((width >= narrow) | (xs >= blocked))
+        return float(xs[wide[0]] - STEP) if len(wide) else BACK_REACH
+
+    def _drive(self, agents: list, goals: dict[int, Pose2D]) -> None:
+        """Steer the walkers that keep lanes or take turns (`passage`) along their routes, and say which of them wait.
+
+        Each steers at a point up to `LOOK_AHEAD` on along its route (`Way.look`). Where its route keeps a lane, its heading follows that point (`PassageCommand.lane`). Before a
+        stretch narrower than its `two_way_width` it claims the stretch once within `LINE_UP` of it,
+        and holds `hold_back` before it (beside the mouth where its approach leads there) while a walker of this kind is in the stretch the other way, or one waiting at the other
+        end claimed it before any of those waiting at its own end. Two that met inside: the one that came less far rolls
+        back behind its hold line. Behind another of its kind it queues (`_queue`)."""
+        present = {a.state.agent_id: a for a in agents}
+        seen: dict[int, tuple[Way, float, Narrow | None, str, float]] = {}
+        for aid in list(self._ways):
+            way, manner, entry = self._ways[aid], self._manners.get(aid), self._path_cache.get(aid)
+            if aid not in present or manner is None or entry is None or entry[1] is not way.waypoints:
+                del self._ways[aid]
+                continue
+            passage, half = manner[1], manner[2]
+            idx = min(entry[3], len(way.points) - 2)
+            pose = present[aid].state.pose
+            leg = way.points[idx + 1] - way.points[idx]
+            length = float(np.hypot(leg[0], leg[1]))
+            along = 0.0 if length <= 1e-9 else min(max(((pose.x - way.points[idx, 0]) * leg[0] + (pose.y - way.points[idx, 1]) * leg[1]) / length, 0.0), length)
+            s = float(way.at[idx]) + along
+            if aid in goals:
+                x, y = way.look(s, pose.x, pose.y)
+                goals[aid] = Pose2D(x=x, y=y, theta=goals[aid].theta)
+            narrow = next((n for n in way.narrows if n.end + half > s), None) if passage.takes_turns else None
+            phase, line = "far", 0.0
+            if narrow is not None:
+                line = narrow.line
+                phase = "inside" if s > line + HOLD_SLACK else "near" if s >= narrow.start - LINE_UP else "far"
+            if phase == "far":
+                self._claims.pop(aid, None)
+            else:
+                assert narrow is not None
+                ex, ey = way.point(narrow.start)
+                claim = self._claims.get(aid)
+                if claim is None or math.hypot(claim[0] - ex, claim[1] - ey) > 1.0:
+                    self._claims[aid] = (ex, ey, self._tick)
+            seen[aid] = (way, s, narrow, phase, line)
+            self._commands[aid] = PassageCommand(lane=bool(way.lane[idx] and way.lane[idx + 1]))
+        self._claims = {aid: claim for aid, claim in self._claims.items() if aid in seen}
+
+        busy = [aid for aid, (_, _, _, phase, _) in seen.items() if phase != "far"]
+        against: dict[int, list[int]] = {aid: [] for aid in busy}
+        beside: dict[int, list[int]] = {aid: [aid] for aid in busy}
+        for i, a in enumerate(busy):
+            for b in busy[i + 1 :]:
+                reach = max(self._manners[a][1].two_way_width, self._manners[b][1].two_way_width)
+                met = self._meet(seen[a][2], seen[b][2], reach)
+                for one, other in ((a, b), (b, a)):
+                    if met < 0:
+                        against[one].append(other)
+                    elif met > 0:
+                        beside[one].append(other)
+        back = set()
+        for aid in busy:
+            _, s, _, phase, line = seen[aid]
+            if phase != "inside":
+                continue
+            for other in against[aid]:
+                if seen[other][3] == "inside" and (s - line, -aid) < (seen[other][1] - seen[other][4], -other):
+                    back.add(aid)
+        limits: dict[int, float] = {}
+        for aid in busy:
+            _, _, _, phase, line = seen[aid]
+            hold = aid in back
+            if phase == "near":
+                ours = min((self._claims[o][2], o) for o in beside[aid] if seen[o][3] == "near")
+                hold = any((seen[o][3] == "inside" and o not in back) or (seen[o][3] == "near" and (self._claims[o][2], o) < ours) for o in against[aid])
+            if hold:
+                limits[aid] = line
+        for aid, arc in self._queue(present, seen).items():
+            limits[aid] = min(limits.get(aid, math.inf), arc)
+        for aid, arc in limits.items():
+            way = seen[aid][0]
+            x, y = way.point(arc)
+            ux, uy = way.direction(max(arc - 1e-6, 0.0))
+            self._commands[aid] = PassageCommand(lane=self._commands[aid].lane, hold=(x, y, ux, uy), back=aid in back)
+
+    def _queue(self, present: dict, seen: dict[int, tuple[Way, float, Narrow | None, str, float]]) -> dict[int, float]:
+        """How far along its route each walker with a `queue_space` may go behind another of this kind in its way.
+
+        One is in a walker's way where its body lies on the walker's route within `QUEUE_LOOK` ahead and it faces along
+        that route rather than against it (one coming the other way is steered round, or met by turns in a narrow
+        stretch). The walker stays behind it by its `queue_space` (measured from the middle of each body, less for a body
+        that stands across). Two in each other's way, as where two routes join: the one that has the other further ahead
+        gives way (the higher id where they are level) and keeps giving way until they are apart, so they go one after
+        the other instead of side by side."""
+        ids = [aid for aid, manner in self._manners.items() if manner[1] is not None and manner[1].active and aid in present]
+        if len(ids) < 2:
+            return {}
+        pos = np.array([(present[aid].state.pose.x, present[aid].state.pose.y) for aid in ids], dtype=np.float64)
+        theta = np.array([present[aid].state.pose.theta for aid in ids], dtype=np.float64)
+        radius = np.array([self._radius_of(aid) for aid in ids], dtype=np.float64)
+        half = np.array([self._manners[aid][2] for aid in ids], dtype=np.float64)
+        row = {aid: i for i, aid in enumerate(ids)}
+        steps = np.arange(0.0, QUEUE_LOOK + 1e-9, QUEUE_STEP)
+        ahead: dict[tuple[int, int], tuple[float, float]] = {}
+        for aid, (way, s, _, _, _) in seen.items():
+            space = self._manners[aid][1].queue_space
+            if space <= 0.0 or aid not in row:
+                continue
+            i = row[aid]
+            at = np.minimum(s + steps, float(way.at[-1]))
+            line = np.column_stack([np.interp(at, way.at, way.points[:, 0]), np.interp(at, way.at, way.points[:, 1])])
+            near = np.hypot(pos[:, 0] - pos[i, 0], pos[:, 1] - pos[i, 1]) <= QUEUE_LOOK + 2.0
+            near[i] = False
+            if not near.any():
+                continue
+            others = np.flatnonzero(near)
+            d = np.hypot(line[:, None, 0] - pos[None, others, 0], line[:, None, 1] - pos[None, others, 1])
+            k = np.argmin(d, axis=0)
+            across = d[k, np.arange(len(others))]
+            tangent = np.array([way.direction(float(a)) for a in at[k]])
+            angle = theta[others] - np.arctan2(tangent[:, 1], tangent[:, 0])
+            turned = np.abs(np.sin(angle))
+            wide = radius[others] + (half[others] - radius[others]) * turned
+            long = half[others] - (half[others] - radius[others]) * turned
+            front = (((pos[others] - pos[i]) * np.array(way.direction(s))).sum(axis=1) > 0.0) & (np.cos(angle) > 0.0)
+            for j in np.flatnonzero(front & (across <= radius[i] + wide + QUEUE_MARGIN)):
+                ahead[(aid, ids[others[j]])] = (float(at[k[j]] - s), max(space - half[i], half[i]) + float(long[j]))
+        limits: dict[int, float] = {}
+        gives_way: set[tuple[int, int]] = set()
+        for (aid, other), (gap, room) in ahead.items():
+            back = ahead.get((other, aid))
+            if back is not None:
+                if (other, aid) in self._gives_way:
+                    continue
+                if (aid, other) not in self._gives_way and (back[0] > gap + QUEUE_LEVEL or (abs(back[0] - gap) <= QUEUE_LEVEL and other > aid)):
+                    continue
+                gives_way.add((aid, other))
+            limits[aid] = min(limits.get(aid, math.inf), seen[aid][1] + gap - room)
+        self._gives_way = gives_way
+        return limits
+
+    def _meet(self, a: Narrow | None, b: Narrow | None, reach: float) -> int:
+        """How two routes' narrow stretches meet: -1 where they are one passage taken in opposite directions, 1 in the
+        same direction, 0 where they are not one passage. One passage: they come within `reach` of each other with no
+        wall between."""
+        if a is None or b is None:
+            return 0
+        d = np.hypot(a.points[:, None, 0] - b.points[None, :, 0], a.points[:, None, 1] - b.points[None, :, 1])
+        i, j = np.unravel_index(int(np.argmin(d)), d.shape)
+        gap = float(d[i, j])
+        if gap > reach:
+            return 0
+        if gap > 1e-6 and self._cast(a.points[i][None], ((b.points[j] - a.points[i]) / gap)[None], gap)[0] < gap - 1e-6:
+            return 0
+        return -1 if float(a.tangents[i] @ b.tangents[j]) < 0.0 else 1
 
     def _slowdown_at(self, positions: np.ndarray) -> np.ndarray | None:
         """How much slower than at free flow walkers move through each mesh edge, from the density of `positions` within
@@ -451,10 +822,15 @@ class NavMeshPlanner(GlobalPlanner):
         for (agent_id, agent_pos, target, _), polyline in zip(entries, polylines, strict=True):
             if polyline is None:
                 continue
+            if agent_id in self._manners and not self._pricing:
+                polyline = self._shape(agent_id, router, self._from_here(router, agent_id, agent_pos, polyline))
             waypoints = [Pose2D(x=float(x), y=float(y)) for x, y in polyline]
-            if polyline[0, 0] == agent_pos.x and polyline[0, 1] == agent_pos.y:
+            same = polyline[0, 0] == agent_pos.x and polyline[0, 1] == agent_pos.y
+            if same:
                 waypoints.pop(0)
             waypoints.insert(0, Pose2D(x=agent_pos.x, y=agent_pos.y))
             waypoints[-1] = Pose2D(x=snapped.x, y=snapped.y, theta=target.theta)
             plans[agent_id] = waypoints
+            if self._manners and not self._pricing:
+                self._keep_way(agent_id, waypoints, 0 if same else 1)
         return plans

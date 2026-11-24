@@ -15,6 +15,18 @@ local_planner_params:
   lateral_gain: 0.0
   heading_source: total
 
+# Corridors and narrow passages: the `passage` block (global_planner/navmesh.py and wall_following.py,
+# core/locomotion.py) is NOT set here. With the values below the twin crowd got worse at a 15 % wheelchair share
+# (more wheelchair users standing 60 s and longer), so the type keeps the behaviour it had. To try it:
+#   passage: {lane_width: 0.915, corridor_width: 3.6, two_way_width: 1.8, hold_back: 1.5, queue_space: 1.22}
+#   lane_width 0.915 m: clear width of an accessible route, 36 in (2010 ADA Standards 403.5.1).
+#   corridor_width 3.6 m: a lane is kept between walls closer than this. No source, our choice.
+#   two_way_width 1.8 m: "A clear width of 1800mm will allow two wheelchair users to pass each other" (Singapore BCA
+#     Code on Accessibility in the Built Environment 2019, Fig. 15, and 4.2.1.2). ADA: 60 in, 1525 mm (2010 ADA
+#     403.5.3). ISO 21542 and DIN 18040-1 (1.8 m) seen in secondary sources only: not verified.
+#   hold_back 1.5 m: no source, our choice (the size of a turning space, 2010 ADA 304.3.1, by analogy).
+#   queue_space 1.22 m: 48 in, clear floor space 30 x 48 in (2010 ADA 305.3).
+
 locomotion:
   kinematics: along_heading
   cadence: {base: 0.6, per_speed: 0.4, min: 0.6, max: 1.4}

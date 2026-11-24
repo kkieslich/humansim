@@ -30,6 +30,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def components(self, poses) -> list[frozenset[int]]: ...
     def paths(self, legs) -> list[list[Pose2D] | None]: ...
     def path_cost(self, path) -> float: ...
+    def passage_commands(self) -> dict[int, PassageCommand]: ...
 ```
 
 A subclass implements only `_has_map` and `_plan`. The base class owns everything else: the per-agent path cache, the replan rule, and stepping along a cached path.
@@ -46,6 +47,7 @@ A subclass implements only `_has_map` and `_plan`. The base class owns everythin
 - `components` is optional, default an empty set per pose. It returns the free-space components a pose can walk into, two poses being mutually reachable when their sets meet, and the teleport zone routing reads it. `navmesh` snaps each pose off the walls and returns the edge graph components of its triangle, `astar` and `dijkstra` the flood fill label of the nearest free cell at `resolution` 0.1 or finer. Labels follow every `set_walls`.
 - `get_cached_goals` is how the rest of the pipeline (local planner, markers) reads the planner state without re-triggering work.
 - `get_cached_paths` is optional, only used for visualization.
+- `passage_commands` is optional, default empty. It returns what the last `compute` asks of an agent's locomotion: steer along the route, stop at a hold point, roll back behind it. Only `navmesh` fills it, see [Walls, lanes and narrow passages](#walls-lanes-and-narrow-passages).
 - `WallAware.set_walls(segments)` invalidates any grid / graph caches through `_forget_paths`.
 - `forget_agents` drops every agent's cached path and goal. The node calls it at a remove-all and at a plain `reset`, which number the next crowd from 1 again, so no new agent starts on the path and goal cached for the old agent with its id.
 - `configure` is optional, default is a no-op. The node calls it with all three params at startup and at every `reset`.
@@ -83,6 +85,17 @@ The navmesh shapes every route it plans for the crowd, whether or not its walker
 - Narrow gaps: an agent the crowd pushed into a gap narrower than the inflation radius, with a route to its target before, walks back out along a body-radius route to the first point within 3 m that keeps the inflation radius (`_escape`).
 
 The windows count `compute` calls of `dt x bt_tick_interval` sim seconds (`set_timing`). A walker on a pedestrian lane track walks its track's legs (at most 3 m, `DIRECT_RANGE`) straight where the line between is clear, so the route shaping above leaves its track as the lane built it; the side bias, stall replanning and escape apply to it as to anyone. `paths` (the stair ride timing) plans its legs at the inflation radius without any agent's state.
+
+## Walls, lanes and narrow passages
+
+`navmesh` lays the routes of two kinds of agents along walls, by the type's `wall_trailing` and `passage` blocks ([config/agent_types/README.md](../../config/agent_types/README.md)). Agents without the blocks get the routes and subgoals they got before, and `passage_commands` stays empty.
+
+- `wall_following.py` holds the geometry, free of planner state. `follow_walls` samples a route every 0.5 m, casts a ray to each side, and moves the route to an `offset` from a wall that runs along it; `approach` and `leave` put a straight way in and out of a stretch; `thin` drops the points that change nothing. Every moved point and leg keeps the body's clearance, a long body at both end discs, and what does not fit moves less.
+- A trailing agent (`wall_trailing`) follows either side, the lane side where both have a wall, a wall only where it runs along for longer than the way to it and back, and starts towards it before its stretch begins.
+- A lane agent (`passage`) follows the lane side only, and only between two walls that run along the route less than `corridor_width` apart. Its route is in line with the corridor for `LINE_UP` (4.5 m) before and after, so the two directions' ways in and out run side by side. Its subgoal is a point up to 1.5 m ahead on the route that it can head for without cutting a corner (`Way.look`), and it gets no straight last leg.
+- Before a stretch narrower than `two_way_width` the route lines up beside the mouth, and `_drive` decides each `compute` who holds there (`PassageCommand.hold`), who rolls back (`back`), who is in a lane (`lane`) and who queues behind whom (`_queue`). `GlobalPlanner.passage_commands()` hands the commands to the node, which passes them to the locomotion extension (`LocomotionExtension.set_passage`): a held agent slows to a stop at its hold point and makes no stall recovery there.
+
+`LINE_UP`, the ramps, the lookahead and the gaps in `navmesh.py` and `wall_following.py` are modelling constants without a source.
 
 ## Shared helpers
 

@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
+import attrs
 import numpy as np
 
 from arena_humansim.core.agents import BaseAgent
@@ -80,6 +81,16 @@ def simplify_path(
     return [waypoints[i] for i in range(n) if not removed[i]]
 
 
+@attrs.frozen
+class PassageCommand:
+    """What a planner asks of a walker's locomotion until its next `compute`: steer along the route (`lane`), stop at
+    `hold` (a point and the route's unit direction there: x, y, ux, uy) and, with `back`, roll back behind it first."""
+
+    lane: bool = False
+    hold: tuple[float, float, float, float] | None = None
+    back: bool = False
+
+
 class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def __init__(self, replan_distance: float = 1.0) -> None:
         self._replan_distance = replan_distance
@@ -127,6 +138,8 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         blind = self._blind(unchanged, agent_positions) | self._stalled(unchanged, agent_positions)
         unchanged -= blind
         straight = [aid for aid, target in navigate.items() if has_map and aid not in unchanged and (pos := agent_positions.get(aid)) is not None and (math.hypot(target.x - pos.x, target.y - pos.y) <= DIRECT_RANGE or (aid in deviations and self._path_cache[aid][3] >= len(self._path_cache[aid][1]) - 2))]
+        if straight:
+            straight = [aid for aid in straight if self._takes_straight_legs(aid)]
         direct = set(straight)
         moved = [aid for aid, d in deviations.items() if d <= self._replan_distance and aid not in unchanged and aid not in direct and aid not in blind]
         legs = straight + moved
@@ -187,6 +200,10 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
 
         self._cached_results = goals
         return goals
+
+    def _takes_straight_legs(self, agent_id: int) -> bool:
+        """Whether the agent may walk the last stretch to its target on a straight line instead of a planned route."""
+        return True
 
     def _blind(self, kept: set[int], positions: dict[int, Pose2D]) -> set[int]:
         """The agents among `kept` (on their path, within the replan distance) that a wall hides their next waypoint
@@ -252,6 +269,11 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
 
     def get_cached_paths(self) -> dict[int, list[Pose2D]]:
         return {aid: wps for aid, (_, wps, _, _) in self._path_cache.items()}
+
+    def passage_commands(self) -> dict[int, PassageCommand]:
+        """Per agent what the last `compute` asks of its locomotion (lane steering, holding before a narrow passage);
+        empty for a planner without such rules."""
+        return {}
 
     def _forget_paths(self) -> None:
         self._path_cache.clear()

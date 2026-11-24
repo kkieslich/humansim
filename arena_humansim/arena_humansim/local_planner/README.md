@@ -7,7 +7,7 @@ Velocity commands for the next tick, given each agent's global subgoal and neigh
 | Name | Class | Notes |
 |---|---|---|
 | `sfm` | `SFMPlanner` | Social Force Model. `supports_pool=True` - vectorized NumPy path. Gain scales per interaction-class pair and capsule footprints, see below. Default. |
-| `hsfm` | `HSFMPlanner` | Headed Social Force Model (Farina/Pallottino/Bicchi 2017). Subclasses `sfm`; decomposes total force in the body frame, attenuates lateral force, and drives heading via PD toward the goal-attraction direction (or the total force within 90 degrees of the goal bearing, `heading_source`). `supports_pool=True`, `provides_heading=True`. |
+| `hsfm` | `HSFMPlanner` | Headed Social Force Model (Farina/Pallottino/Bicchi 2017). Subclasses `sfm`; decomposes total force in the body frame, attenuates lateral force, and drives heading via PD toward the goal-attraction direction (or the total force within 90 degrees of the goal bearing, `heading_source`). A row flagged `pool.steer_to_goal` (an agent in a lane, see the global planners' README) heads straight for its goal instead. `supports_pool=True`, `provides_heading=True`. |
 | `orca` | `ORCAPlanner` | Reciprocal velocity obstacles (RVO2 agent and wall constraints). Numba kernel, `supports_pool=True`. |
 | `helbing` | `HelbingPlanner` | Helbing/Farkas/Vicsek 2000 social force with body compression and sliding friction on contact, after Menge's AgtHelbing. Numba kernel on the `ForcePlanner` base (`force.py`), `supports_pool=True`. |
 | `johansson` | `JohanssonPlanner` | Johansson/Helbing/Shukla 2007 elliptical repulsion from the neighbor's stride offset, after Menge's AgtJohansson. `ForcePlanner`. |

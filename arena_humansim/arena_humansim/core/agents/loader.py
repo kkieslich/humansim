@@ -22,6 +22,8 @@ _DICT_MERGE_FIELDS = {
     "local_planner_params",
     "locomotion",
     "pose",
+    "wall_trailing",
+    "passage",
 }
 
 _DEEP_MERGE_FIELDS = {"locomotion", "pose"}

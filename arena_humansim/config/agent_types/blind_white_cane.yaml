@@ -16,6 +16,19 @@ perception:
   vision_occlusion: true
 max_acceleration: {mean: 0.8, std: 0.1, clip_low: 0.4, clip_high: 1.2}
 
+# Wall trailing: where a wall runs along the route, the walker walks `offset` from it and crosses open floor only
+# between walls (global_planner/wall_following.py). Off: offset 0, or no block, gives the routes the type had before.
+#   offset 0.42 m: half the measured mean arc of the long cane, 83.2 cm (Wall Emerson, Kim, Naghshineh & Myers 2019,
+#     J. Vis. Impair. Blind. 113(3):235-247, Tables 4-5, 101 participants), so the tip meets the wall at the end of each
+#     arc, as in shorelining. Derived, not measured: no source we could open gives the body-to-wall distance of cane
+#     trailing (Hill & Ponder 1976, Jacobson, LaGrow & Weessies: not verified). Hand trailing is closer, about 15 cm.
+#   reach 4.5 m: how far from the route a wall may lie and still be trailed. No source. Our derivation: walking without
+#     a guide line veers 0.82 m per 9.14 m (Kallie, Schrater & Legge 2007, J. Exp. Psychol. Hum. Percept. Perform.
+#     33(1):183-200), which stays within half the cane's arc for about 4.7 m.
+wall_trailing:
+  offset: 0.42
+  reach: 4.5
+
 locomotion:
   cadence: {base: 0.4, per_speed: 0.2502, min: 0.4, max: 2.2}
   phase_warp: {split: 0.5966}
