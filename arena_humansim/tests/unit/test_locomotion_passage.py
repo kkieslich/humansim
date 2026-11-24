@@ -123,11 +123,35 @@ def test_a_lane_command_flags_the_row_until_the_next_call(agent_factory: Callabl
     assert pool.steer_to_goal[:2].tolist() == [False, False]
 
 
-def test_rows_without_a_locomotion_profile_take_no_commands(agent_factory: Callable[..., BaseAgent]) -> None:
-    pool, ext = _pool(agent_factory(agent_id=1))
-    ext.set_passage(pool, {1: PassageCommand(lane=True, hold=(0.0, 0.0, 1.0, 0.0)), 99: PassageCommand(lane=True)})
-    assert not pool.steer_to_goal[0]
-    assert not ext.hold[0]
+def test_rows_without_a_locomotion_profile_take_holds_but_no_lanes(agent_factory: Callable[..., BaseAgent]) -> None:
+    pool, ext = _pool(agent_factory(agent_id=1), agent_factory(agent_id=2, x=3.0))
+    ext.set_passage(pool, {1: PassageCommand(lane=True, hold=(0.0, 0.0, 1.0, 0.0)), 2: PassageCommand(lane=True), 99: PassageCommand(lane=True)})
+    assert not pool.steer_to_goal[0] and not pool.steer_to_goal[1]
+    assert ext.hold[0] and not ext.hold[1]
+
+
+def test_a_walker_without_a_locomotion_profile_stops_at_its_hold_point(agent_factory: Callable[..., BaseAgent]) -> None:
+    pool, ext = _pool(agent_factory(agent_id=1, x=-2.0))
+    ext.set_passage(pool, {1: PassageCommand(hold=(0.0, 0.0, 1.0, 0.0))})
+    speeds = _drive(pool, ext, 200)
+    assert pool.pos[0, 0] <= 1e-9
+    assert pool.pos[0, 0] > -0.05
+    assert speeds[-1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_walker_without_a_locomotion_profile_walks_back_against_its_route(agent_factory: Callable[..., BaseAgent]) -> None:
+    """It walks back along the route's direction, not its heading: a walker's heading follows its velocity, so backing
+    along the heading would turn it round and send it forward again."""
+    pool, ext = _pool(agent_factory(agent_id=1, x=1.0))
+    pool.theta[0] = math.pi  # faces back the way it came
+    ext.set_passage(pool, {1: PassageCommand(hold=(0.0, 0.0, 1.0, 0.0), back=True)})
+    for _ in range(100):
+        pool.vel[:1] = (0.9, 0.0)
+        ext.constrain(pool, DT, np.ones(1, dtype=np.bool_))
+        assert pool.vel[0, 0] <= 0.0
+        pool.pos[:1] += pool.vel[:1] * DT
+        pool.theta[0] = math.pi
+    assert pool.pos[0, 0] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_hold_rows_follow_swap_remove(agent_factory: Callable[..., BaseAgent]) -> None:
