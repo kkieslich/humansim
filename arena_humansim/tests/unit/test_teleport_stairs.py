@@ -742,12 +742,51 @@ def test_a_type_that_does_not_climb_the_half_is_not_carried_over_its_seam(agent_
 def test_a_running_belt_does_not_carry_a_type_that_does_not_climb_it(agent_factory: Callable[..., BaseAgent], planner: DijkstraPlanner) -> None:
     tz = _zones([_up("escalator", 0.6), _up_b("escalator", -0.6, ())])
     chair, walker = _walker(agent_factory, planner, 1, 7.0, 5.2, climbs=()), _walker(agent_factory, planner, 2, 8.0, 5.2)
-    tz.steer([chair, walker], _go([chair, walker], GOAL_A))
+    tz.steer([chair, walker], {**_go([chair], GOAL_A), **_go([walker], GOAL_B)})  # the walker's route takes the belt
     pool = _pool(agent_factory, (1, 7.0, 5.2), (2, 8.0, 5.2))
     pool.vel[0] = (-0.8, 0.0)
     tz.carry(pool)
     assert pool.vel[0] == pytest.approx((-0.8, 0.0)) and 1 not in tz.riders
     assert pool.vel[1] == pytest.approx((0.6, 0.0)) and 2 in tz.riders
+
+
+def test_a_walker_on_a_half_its_route_does_not_take_walks_over_it(agent_factory: Callable[..., BaseAgent], planner: DijkstraPlanner) -> None:
+    # beside its landing or on a wall-trailing line round a mouth: no belt carries it and it is not carried over the seam,
+    # or it rides back, takes the first half again and goes round for good
+    tz = _zones([_up("escalator", 0.5), _up_b("escalator", -0.5, ())])
+    walker = _walker(agent_factory, planner, 1, 9.6, 5.2)
+    tz.steer([walker], _go([walker], GOAL_A))
+    assert 1 not in tz.transfers
+    pool = _pool(agent_factory, (1, 9.6, 5.2))
+    pool.vel[0] = (0.0, -0.9)
+    pool.desired_vel[0] = 1.2
+    tz.carry(pool)
+    assert pool.vel[0] == pytest.approx((0.0, -0.9)) and pool.desired_vel[0] == 1.2 and not tz.riders
+    assert tz.hold(pool, 0, 1000, 0.05, 0) == [] and tz.flying == frozenset()
+
+
+def test_a_walker_whose_route_takes_the_half_is_carried_and_crosses(agent_factory: Callable[..., BaseAgent], planner: DijkstraPlanner) -> None:
+    tz = _zones([_up("escalator", 0.5), _up_b("escalator", -0.5, ())])
+    walker = _walker(agent_factory, planner, 1, 9.6, 5.2)
+    tz.steer([walker], _go([walker], GOAL_B))
+    assert tz.transfers[1].zone == "up"
+    pool = _pool(agent_factory, (1, 9.6, 5.2))
+    tz.carry(pool)
+    assert pool.vel[0] == pytest.approx((0.5, 0.0)) and tz.riders == {1}
+    assert [aid for aid, *_ in tz.hold(pool, 0, 1000, 0.05, 0)] == [1]
+
+
+def test_a_walker_that_landed_is_carried_off_its_landing_by_the_belt_while_walking_on(agent_factory: Callable[..., BaseAgent], planner: DijkstraPlanner) -> None:
+    tz = _zones([_up("escalator", 0.5), _up_b("escalator", -0.4, ())])
+    walker = _walker(agent_factory, planner, 1, 9.6, 5.2)
+    tz.steer([walker], _go([walker], GOAL_B))
+    pool = _pool(agent_factory, (1, 9.6, 5.2))
+    _land(tz, pool, range(0, 1))
+    walker.state.pose = Pose2D(x=float(pool.pos[0, 0]), y=float(pool.pos[0, 1]))
+    tz.steer([walker], _go([walker], GOAL_B))
+    assert 1 not in tz.transfers
+    tz.carry(pool)
+    assert pool.vel[0] == pytest.approx((0.0, 0.4)) and tz.riders == {1}
 
 
 def test_unreachable_names_stair_halves_whose_hold_is_on_a_wall_or_outside_the_footprint() -> None:
