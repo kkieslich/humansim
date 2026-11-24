@@ -9,12 +9,13 @@ import attrs
 import numpy as np
 
 from arena_humansim.core.agents.types import Passage, WallTrailing
-from arena_humansim.utils.mesh import TOL, Mesh
+from arena_humansim.utils.mesh import TOL, Mesh, _pt_seg
 from arena_humansim.utils.router import VERIFY_EPS, Router
-from arena_humansim.utils.types import Pose2D, Segments
+from arena_humansim.utils.types import CommandType, HighLevelCommand, Pose2D, Segments
 from arena_humansim.utils.wall_grid import WallGrid, cast_rays
 
-from . import LANE_SIDES, GlobalPlanner, PassageCommand, PlanRequest
+from . import BLOCK_NEAR, LANE_SIDES, GlobalPlanner, PassageCommand, PlanRequest, Robots
+from ._grid import next_waypoint
 from .wall_following import PASSING_GAP, STEP, Shaped, approach, follow_walls, leave, sample, thin
 
 SNAP_CACHE = 4096
@@ -57,6 +58,14 @@ QUEUE_LOOK, QUEUE_STEP = 6.0, 0.25
 QUEUE_MARGIN = 0.1
 #: Two walkers in each other's way are level where neither is this much further ahead of the other [m]
 QUEUE_LEVEL = 0.1
+#: A walker blocked by a robot standing still goes round it this far from the robot's body [m], on points of a circle
+#: round the robot at most `ROUND_STEP` [rad] apart, its route checked against the robot every `ROUND_SAMPLE` [m]
+ROUND_GAP, ROUND_STEP, ROUND_SAMPLE = 0.2, math.pi / 6.0, 0.1
+#: A route runs into a robot where it comes within the two bodies plus this of the robot's middle [m]
+ROUND_HIT = 0.05
+#: Robot-aware routers kept (keyed by clearance, walker radius and the robots standing still they keep off), and how much
+#: a step across a mesh edge that passes through a robot's body (plus the walker's) costs on them, per metre
+ROUND_ROUTERS, ROUND_PENALTY = 8, 1000.0
 
 
 class _Fit(TypedDict):
@@ -176,6 +185,11 @@ class NavMeshPlanner(GlobalPlanner):
         self._commands: dict[int, PassageCommand] = {}
         self._gives_way: set[tuple[int, int]] = set()
         self._ray_grid: tuple[list, WallGrid] | None = None
+        #: per blocked walker: the route `_reroute` last saw or made for it with the robots it goes round, and the side it
+        #: goes round each robot by (+1 counter-clockwise, -1 clockwise); routers that also keep off robots standing still
+        self._rounded: dict[int, tuple[list[Pose2D], tuple]] = {}
+        self._round_side: dict[tuple[int, int], float] = {}
+        self._robot_routers: dict[tuple, tuple[Router, np.ndarray]] = {}
 
     @staticmethod
     def _side(lane_side: str) -> str:
@@ -205,6 +219,7 @@ class NavMeshPlanner(GlobalPlanner):
             self._margin, self._lane_side, self._lane_offset = margin, side, offset
             self._routers.clear()
             self._body_routers.clear()
+            self._robot_routers.clear()
             self._routed.clear()
             self._forget_paths()
         if (inflation_radius, comfort_radius) == (self._inflation_radius, self._comfort_radius):
@@ -227,6 +242,7 @@ class NavMeshPlanner(GlobalPlanner):
         self._router = None
         self._routers = {}
         self._body_routers = {}
+        self._robot_routers = {}
         self._routed = {}
         self._blocked_edges = np.zeros(0, np.int64)
         self._slowdown = None
@@ -253,6 +269,7 @@ class NavMeshPlanner(GlobalPlanner):
         self._router.set_blocked(edges)
         for router in (*self._routers.values(), *self._body_routers.values()):
             router.set_blocked(edges)
+        self._robot_routers.clear()
         self._blocked_edges = edges
         self._logger.info(f"Walls blocked on the mesh: {len(edges)} edge(s), {(time.perf_counter() - began) * 1e3:.0f} ms")
         return True
@@ -320,12 +337,16 @@ class NavMeshPlanner(GlobalPlanner):
                 length = float(getattr(getattr(params, "locomotion", None), "footprint_length", 0.0) or 0.0)
                 self._manners[agent.state.agent_id] = (trailing if trailing is not None else WallTrailing(), passage if passage is not None else Passage(), max(length / 2.0, float(params.agent_radius)))
         goals = super().compute(agents, high_level_commands)
+        if self._blockers or self._rounded:
+            self._reroute(agents, goals, high_level_commands)
         self._commands = {}
         if self._manners or self._ways:
             self._drive(agents, goals)
         return goals
 
     def _takes_straight_legs(self, agent_id: int) -> bool:
+        if self._blockers.get(agent_id):
+            return False
         manner = self._manners.get(agent_id)
         return manner is None or not manner[1].active
 
@@ -632,6 +653,8 @@ class NavMeshPlanner(GlobalPlanner):
         for router in (self._router, *self._routers.values()):
             if router is not None:
                 router.set_congestion(slowdown)
+        for router, penalty in self._robot_routers.values():
+            router.set_congestion(penalty if slowdown is None else slowdown * penalty)
 
     def _lanes(self, router: Router, polyline: np.ndarray) -> np.ndarray:
         """`polyline` with its inner corners moved `lane_offset` to the lane side, so walkers in opposite directions keep
@@ -664,6 +687,192 @@ class NavMeshPlanner(GlobalPlanner):
             return out
         out[1:-1] = inner + (moved - inner) * 0.5
         return out if router._clear_many([out])[0] >= body - VERIFY_EPS else polyline
+
+    def forget_agents(self) -> None:
+        super().forget_agents()
+        self._rounded.clear()
+        self._round_side.clear()
+
+    def _reroute(self, agents: list, goals: dict[int, Pose2D], high_level_commands: dict[int, HighLevelCommand]) -> None:
+        """Routes of walkers blocked by a robot standing still (`_note_blockers`) go round it instead of into it.
+
+        Where a walker's route ahead runs into such a robot, the stretch near the robot is replaced by an arc round it,
+        `ROUND_GAP` clear of both bodies, on the side its body fits between the robot and the walls (and other robots
+        standing still), the shorter one where both do; the route goes on as before behind the robot. A walker trailing a
+        wall so steps off the wall line, passes the robot and comes back onto the line. Where neither side fits (the
+        robot closes a passage), the walker plans anew on the map with that robot on it (`_plan_round`), and waits as
+        before only where there is no way at all. A route once checked is not checked again until it or the robots
+        change. Only robots that blocked this walker count: robots that move, and robots standing still elsewhere, are
+        left to the local forces."""
+        blocked = self.blockers()
+        for aid in [a for a in self._rounded if a not in blocked]:
+            del self._rounded[aid]
+        self._round_side = {k: v for k, v in self._round_side.items() if k[0] in blocked and k[1] in blocked[k[0]]}
+        if not blocked or self._router is None:
+            return
+        still = self.still_robots()
+        standing = {(rid, round(x, 2), round(y, 2), round(r, 2)) for rid, (x, y, r) in still.items()}
+        for key in [k for k in self._robot_routers if not set(k[2]) <= standing]:
+            del self._robot_routers[key]
+        present = {a.state.agent_id: a.state.pose for a in agents}
+        for aid, robots in blocked.items():
+            entry, pos, cmd = self._path_cache.get(aid), present.get(aid), high_level_commands.get(aid)
+            if entry is None or pos is None or aid not in goals or not isinstance(cmd, HighLevelCommand) or cmd.type != CommandType.NAVIGATE:
+                continue
+            key = tuple(sorted(robots.items()))
+            seen = self._rounded.get(aid)
+            if seen is not None and seen[0] is entry[1] and seen[1] == key:
+                continue
+            goal_key, waypoints, _, idx = entry
+            hit, route = self._round(aid, pos, waypoints, idx, robots, still)
+            if hit and route is None:
+                route = self._plan_round(aid, pos, cmd.target_pose, robots)
+                if route is not None:
+                    self._logger.debug(f"agent {aid}: robot(s) {sorted(robots)} close its way, planned anew round them")
+            if route is None:
+                self._rounded[aid] = (waypoints, key)
+                continue
+            idx = self.advance_along_path(pos, route, 0)
+            self._path_cache[aid] = (goal_key, route, np.array([(w.x, w.y) for w in route], dtype=np.float64).reshape(-1, 2), idx)
+            goals[aid] = next_waypoint(route, idx)
+            self._rounded[aid] = (route, key)
+
+    def _round(self, agent_id: int, pos: Pose2D, waypoints: list[Pose2D], idx: int, robots: Robots, still: Robots) -> tuple[bool, list[Pose2D] | None]:
+        """Whether the route ahead of the walker runs into one of `robots`, and the route going round them by arcs
+        (`_round_one`); None where it runs into none, or where one of them it cannot go round."""
+        radius = self._radius_of(agent_id)
+        tail = np.array([(w.x, w.y) for w in waypoints[idx + 1 :]], dtype=np.float64).reshape(-1, 2)
+        if not len(tail):
+            return False, None
+        poly = np.vstack([[pos.x, pos.y], tail])
+        done: set[int] = set()
+        while True:
+            hit = self._hit(poly, {rid: rob for rid, rob in robots.items() if rid not in done}, radius)
+            if hit is None:
+                break
+            rid, at, pts, d, h = hit
+            done.add(rid)
+            poly = self._round_one(agent_id, rid, robots[rid], radius, poly, at, pts, d, h, still)
+            if poly is None:
+                return True, None
+        if not done:
+            return False, None
+        route = [Pose2D(x=pos.x, y=pos.y), *(Pose2D(x=float(x), y=float(y)) for x, y in poly[1:-1]), waypoints[-1]]
+        return True, route
+
+    @staticmethod
+    def _hit(poly: np.ndarray, robots: Robots, radius: float) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, int] | None:
+        """The first of `robots` that the route `poly` runs into (comes within both bodies plus `ROUND_HIT`): its id, the
+        route sampled every `ROUND_SAMPLE` (distances along it and points), each sample's distance from the robot's
+        middle, and the first sample that runs into it. None where it runs into none, or only into robots it ends next to
+        (its target lies by the robot: going round does not get it there)."""
+        if not robots or len(poly) < 2:
+            return None
+        along = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(poly, axis=0).T))])
+        at = np.unique(np.concatenate([np.arange(0.0, along[-1], ROUND_SAMPLE), along]))
+        pts = np.column_stack([np.interp(at, along, poly[:, 0]), np.interp(at, along, poly[:, 1])])
+        best = None
+        for rid, (x, y, r) in robots.items():
+            d = np.hypot(pts[:, 0] - x, pts[:, 1] - y)
+            hits = np.flatnonzero(d < r + radius + ROUND_HIT)
+            if not len(hits) or not (d[hits[0] :] >= r + radius + ROUND_GAP).any():
+                continue
+            if best is None or at[hits[0]] < at[best[2]]:
+                best = (rid, d, int(hits[0]))
+        if best is None:
+            return None
+        return best[0], at, pts, best[1], best[2]
+
+    def _round_one(self, agent_id: int, rid: int, robot: tuple[float, float, float], radius: float, poly: np.ndarray, at: np.ndarray, pts: np.ndarray, d: np.ndarray, h: int, still: Robots) -> np.ndarray | None:
+        """`poly` with its stretch near the robot (round sample `h`, see `_hit`) replaced by an arc round it, on the side
+        the walker took round this robot before where that still fits, else on the shorter side that fits. A walker
+        standing by the robot (blocked, within `BLOCK_NEAR` of its body) goes round from where it stands, at its own
+        distance from the robot (the local forces hold it there), or at both bodies plus `ROUND_GAP` where only that
+        fits; the arc of one further away starts where its route comes within `ROUND_GAP`. A side fits where the walker's
+        body keeps clear of the walls and of the other robots standing still. None where neither fits."""
+        x, y, r = robot
+        touch = r + radius
+        near = float(d[0]) <= touch + BLOCK_NEAR + ROUND_HIT
+        rings = dict.fromkeys((min(max(float(d[0]), touch + ROUND_GAP), touch + BLOCK_NEAR), touch + ROUND_GAP)) if near else {touch + ROUND_GAP: None}
+        body = max(radius, MIN_BODY_RADIUS)
+        walls = self._body_router(round(math.ceil(body / CLEARANCE_STEP - 1e-9) * CLEARANCE_STEP, 6))
+        others = [(ox, oy, orad) for oid, (ox, oy, orad) in still.items() if oid != rid]
+        along = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(poly, axis=0).T))])
+        for ring in rings:
+            after = np.flatnonzero(d[h:] >= ring)
+            if not len(after):
+                continue
+            b = h + int(after[0])
+            if near:
+                a, p_in = 0, pts[0]
+            else:
+                before = np.flatnonzero(d[:h] >= ring)
+                a = int(before[-1]) + 1 if len(before) else 0
+                p_in = pts[a]
+            p_out = pts[b]
+            head = np.vstack([poly[along < at[a] - 1e-9], p_in[None]])
+            rest = np.vstack([p_out[None], poly[along > at[b] + 1e-9]])
+            t_in = math.atan2(p_in[1] - y, p_in[0] - x)
+            t_out = math.atan2(p_out[1] - y, p_out[0] - x)
+            ccw = (t_out - t_in) % (2.0 * math.pi)
+            fits: dict[float, tuple[float, np.ndarray]] = {}
+            for side, sweep in ((1.0, ccw), (-1.0, ccw - 2.0 * math.pi)):
+                n = max(1, math.ceil(abs(sweep) / ROUND_STEP - 1e-9))
+                angles = t_in + sweep * np.arange(1, n) / n
+                arc = np.column_stack([x + ring * np.cos(angles), y + ring * np.sin(angles)])
+                middle = np.vstack([p_in[None], arc, p_out[None]])
+                if walls._clear_many([middle])[0] < body - VERIFY_EPS:
+                    continue
+                if others:
+                    legs = np.hypot(*np.diff(middle, axis=0).T)
+                    m_at = np.concatenate([[0.0], np.cumsum(legs)])
+                    s = np.arange(0.0, m_at[-1] + 1e-9, ROUND_SAMPLE)
+                    spots = np.column_stack([np.interp(s, m_at, middle[:, 0]), np.interp(s, m_at, middle[:, 1])])
+                    if any(float(np.hypot(spots[:, 0] - ox, spots[:, 1] - oy).min()) < orad + radius for ox, oy, orad in others):
+                        continue
+                fits[side] = (float(np.hypot(*np.diff(middle, axis=0).T).sum()), middle)
+            if not fits:
+                continue
+            side = self._round_side.get((agent_id, rid))
+            if side not in fits:
+                side = min(fits, key=lambda k: fits[k][0])
+            self._round_side[(agent_id, rid)] = side
+            return np.vstack([head[:-1], fits[side][1], rest[1:]])
+        return None
+
+    def _plan_round(self, agent_id: int, pos: Pose2D, target: Pose2D, robots: Robots) -> list[Pose2D] | None:
+        """A route to `target` that keeps off `robots` (`_robot_router`), at the walker's clearance or else the inflation
+        radius; None where every way runs into them."""
+        radius = self._radius_of(agent_id)
+        for clearance in dict.fromkeys((self.clearance_for(radius), self._inflation_radius)):
+            route = self._plan_group(self._robot_router(clearance, robots, radius), [(agent_id, pos, target)]).get(agent_id)
+            if route is not None and self._hit(np.array([(w.x, w.y) for w in route], dtype=np.float64), robots, radius) is None:
+                return route
+        return None
+
+    def _robot_router(self, clearance: float, robots: Robots, radius: float) -> Router:
+        """A router keeping `clearance` on which every step across a mesh edge that passes within `radius` of the body of
+        one of `robots` costs `ROUND_PENALTY` times its length (on top of the congestion weights), built on first use. A
+        route avoids those edges wherever any other way exists; a step through them stays possible, so a walker is never
+        walled in by the coarse mesh (a route that still runs into a robot is dropped by `_plan_round`)."""
+        assert self._mesh is not None
+        key = (clearance, round(radius, 2), tuple(sorted((rid, round(x, 2), round(y, 2), round(r, 2)) for rid, (x, y, r) in robots.items())))
+        hit = self._robot_routers.get(key)
+        if hit is None:
+            mesh = self._mesh
+            near = np.zeros(len(mesh.ea), dtype=bool)
+            pa, pb = mesh.P[mesh.ea], mesh.P[mesh.eb]
+            for x, y, r in robots.values():
+                near |= _pt_seg(np.array([x, y], dtype=np.float64), pa, pb)[0] <= r + radius
+            penalty = np.where(near, ROUND_PENALTY, 1.0)
+            router = Router(mesh, clearance, self._comfort_radius)
+            if len(self._blocked_edges):
+                router.set_blocked(self._blocked_edges)
+            router.set_congestion(penalty if self._slowdown is None else self._slowdown * penalty)
+            if len(self._robot_routers) >= ROUND_ROUTERS:
+                self._robot_routers.pop(next(iter(self._robot_routers)))
+            hit = self._robot_routers[key] = (router, penalty)
+        return hit[0]
 
     def _has_map(self) -> bool:
         return self._router is not None
