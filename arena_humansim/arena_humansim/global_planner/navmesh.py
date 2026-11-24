@@ -19,6 +19,8 @@ from ._grid import next_waypoint
 from .wall_following import PASSING_GAP, STEP, Shaped, approach, follow_walls, leave, sample, thin
 
 SNAP_CACHE = 4096
+#: Priced legs kept between changes of the map, blocked edges, congestion or lanes (`NavMeshPlanner.paths`)
+PRICED_LEGS = 20000
 FRAME_INSET = 0.01
 #: Planning clearances round up to this step, so agents of similar size share a router
 CLEARANCE_STEP = 0.05
@@ -204,6 +206,9 @@ class NavMeshPlanner(GlobalPlanner):
         self._snapped: dict[tuple[float, float], tuple[float, float] | None] = {}
         #: set while `paths` plans legs for the stair ride timing: their request ids are leg numbers, not agents
         self._pricing = False
+        #: priced legs (start x, y, goal x, y: path) and the planner state they were priced on (`paths`)
+        self._priced: dict[tuple[float, float, float, float], list[Pose2D] | None] = {}
+        self._priced_state: tuple | None = None
         #: the walkers' positions at the last congestion update, a KD-tree
         self._crowd = None
         #: per agent of the last `compute`: its wall trailing and passage settings, and half its body length
@@ -1158,12 +1163,23 @@ class NavMeshPlanner(GlobalPlanner):
 
     def paths(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[list[Pose2D] | None]:
         """As `GlobalPlanner.paths`, planned at the inflation radius and without any agent's state: the legs are numbered
-        from 0, so their ids would read and overwrite the radius, route memory and escape of the agents with those ids."""
-        self._pricing = True
-        try:
-            return super().paths(legs)
-        finally:
-            self._pricing = False
+        from 0, so their ids would read and overwrite the radius, route memory and escape of the agents with those ids.
+
+        A leg's path depends only on its ends, the map, the blocked edges, the congestion weights and the lane settings:
+        legs asked again while none of these changed (the route choice of many walkers from a landing to one goal, until
+        the next congestion update) are answered from `_priced` (at most `PRICED_LEGS`)."""
+        state = (self._router, self._blocked_edges, self._slowdown, self._lane_side, self._lane_offset, self._margin)
+        if self._priced_state is None or len(self._priced) >= PRICED_LEGS or any(a is not b and a != b if isinstance(a, (str, float, int)) else a is not b for a, b in zip(state, self._priced_state, strict=True)):
+            self._priced, self._priced_state = {}, state
+        keys = [(a.x, a.y, b.x, b.y) for a, b in legs]
+        todo = {key: leg for key, leg in zip(keys, legs, strict=True) if key not in self._priced}
+        if todo:
+            self._pricing = True
+            try:
+                self._priced.update(zip(todo, super().paths(list(todo.values())), strict=True))
+            finally:
+                self._pricing = False
+        return [self._priced[key] for key in keys]
 
     def _plan(self, requests: list[PlanRequest]) -> dict[int, list[Pose2D] | None]:
         assert self._router is not None
@@ -1255,7 +1271,8 @@ class NavMeshPlanner(GlobalPlanner):
         framed = self._inside(starts)
         beyond = (framed != starts).any(axis=1) | (self._inside(goal) != goal).any()
         direct = beyond & router.line_of_sight(starts, np.repeat(goal[None], len(starts), 0))
-        routes = router.plan_many(framed[~direct], self._inside(goal))
+        # priced routes (`paths`) only need their length: their funnels are not checked against the walls
+        routes = router.plan_many(framed[~direct], self._inside(goal), verify=not self._pricing)
         polylines: list[np.ndarray | None] = [None] * len(entries)
         for i, route in zip(np.nonzero(~direct)[0], routes, strict=True):
             if route is not None:

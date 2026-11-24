@@ -300,3 +300,28 @@ def test_a_jam_weighs_the_path_cost(planner: NavMeshPlanner) -> None:
     xs, ys = np.meshgrid(np.linspace(3.0, 7.0, 10), np.linspace(4.0, 6.0, 6))
     planner._set_slowdown(planner._slowdown_at(np.column_stack([xs.ravel(), ys.ravel()])))
     assert planner.path_cost(path) > 12.0
+
+
+def test_one_steer_prices_every_walker_as_alone_in_three_batches(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, monkeypatch: pytest.MonkeyPatch) -> None:
+    spots = [(5.0, 2.0 + 0.5 * k) for k in range(12)] + [(25.0, 2.0 + 0.5 * k) for k in range(12)]
+    walkers = [_walker(agent_factory, planner, aid, x, y) for aid, (x, y) in enumerate(spots, start=1)]
+    cmds = {**_go(walkers[:12], IN_B), **_go(walkers[12:], IN_A)}
+    alone = {}
+    for walker in walkers:
+        tz = _zones(_stairs())
+        aid = walker.state.agent_id
+        alone[aid] = (tz.steer([walker], {aid: cmds[aid]}, now=0.0)[aid].target_pose, tz.transfers.get(aid))
+    calls = []
+    paths = planner.paths
+    monkeypatch.setattr(planner, "paths", lambda legs: calls.append(len(legs)) or paths(legs))
+    together = _zones(_stairs())
+    out = together.steer(walkers, cmds, now=0.0)
+    for walker in walkers:
+        aid = walker.state.agent_id
+        target, transfer = alone[aid]
+        assert out[aid].target_pose == target
+        both = together.transfers.get(aid)
+        assert (transfer is None) == (both is None)
+        assert transfer is None or (transfer.zone, transfer.destination, transfer.ride) == (both.zone, both.destination, both.ride)
+    assert list(together.transfers) == [w.state.agent_id for w in walkers if w.state.agent_id in together.transfers]
+    assert len(calls) <= 3 and sum(calls) > len(walkers)

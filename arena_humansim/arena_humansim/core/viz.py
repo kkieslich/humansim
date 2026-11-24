@@ -296,10 +296,13 @@ def publish_infrastructure(
     walls: dict[str, tuple[tuple[float, float], tuple[float, float]]],
     world_objects: dict[str, WorldObject],
     obstacles: dict[str, ObstacleData] | None = None,
+    walls_rev: int | None = None,
 ) -> None:
+    """Infrastructure markers, sent again only where they changed. `walls_rev`, a count the caller bumps at every change
+    of `walls`, stands for the walls themselves: comparing thousands of walls every tick costs more than a tick's crowd."""
     obstacles = obstacles or {}
 
-    walls_sig = tuple(walls.items())
+    walls_sig = tuple(walls.items()) if walls_rev is None else (id(walls), walls_rev)
     walls_changed = not pub.infra_unchanged("walls", walls_sig)
     objects_sig = (tuple(sources.keys()), tuple(sinks.keys()), tuple(world_objects.keys()), tuple(obstacles.keys()))
     objects_changed = not pub.infra_unchanged("objects", objects_sig)
