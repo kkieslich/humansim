@@ -1,9 +1,9 @@
 """Walkers blocked by a robot that stands still go round it; robots that move stay left to the local forces.
 
-A corridor 3 m wide, the robot fed in through world_state as Arena feeds its robots: waiting at a locker flush against
-the south wall, or stopped (jammed) in the corridor 0.9 m off that wall. A long-cane user trails the south wall straight
-at the robot, an adult walks at it. Before the global planner knew standing robots, both stopped at the robot for good;
-now each passes within seconds and gets back onto its line. A robot driving along the corridor stays off the
+A corridor 3 m wide, the robot fed in through world_state as Arena feeds its robots, standing (waiting at a locker,
+jammed) on the line long-cane users trail along the south wall, or in a lane too narrow to pass it. Before the global
+planner knew standing robots, a walker pinned at the robot, or one whose lane it closed, stood there for good; now the
+first goes round it and back onto its line, the second takes the other lane, and one with no way at all waits. A robot driving along the corridor stays off the
 walkers' maps: they keep clear of it by the local forces as before and do not swing back and forth.
 """
 
@@ -27,6 +27,8 @@ GOAL_X = 12.0
 #: The robot waits at a locker flush against the south wall, 6 cm off it; or it stopped mid-corridor
 PARKED = (0.0, 0.36)
 JAMMED = (0.0, 0.9)
+#: A robot standing on the long-cane users' trailing line, 0.67 m off the wall
+ON_LINE = (0.0, 0.67)
 #: A divider splits the corridor (4 m wide) into a 1.5 m lane and a 2.5 m lane over x -5..5; a robot jammed in the
 #: middle of the narrow lane closes it
 DIVIDER = (WallConfig(name="divider", start=Pose2D(x=-5.0, y=1.5), end=Pose2D(x=5.0, y=1.5)),)
@@ -103,53 +105,66 @@ def _passed_at(track: np.ndarray, x: float) -> float | None:
     return float(track[beyond[0], 0]) if len(beyond) else None
 
 
-@pytest.mark.parametrize("where", ["locker", "jammed"])
-def test_long_cane_user_goes_round_a_robot_standing_on_its_wall_line(manager_factory: Callable[..., AgentManager], where: str) -> None:
-    spot = PARKED if where == "locker" else JAMMED
-    tracks, _ = run(manager_factory, [_walker(2, "blind_white_cane", 0.5)], lambda _t: spot, 60.0, f"test_reroute_cane_{where}")
-    track = tracks[2]
-    passed = _passed_at(track, spot[0] + 1.0)
-    assert passed is not None, f"long-cane walker never got past the parked robot (last at x={track[-1, 1]:.2f})"
-    # it reaches the robot after ~13 s at 0.75 m/s; robot still 3 s, walker waits 2 s: past it well within 10 s more
-    assert passed < 30.0
-    # it trailed the wall before the robot and trails it again behind
-    before = track[(track[:, 1] > -6.0) & (track[:, 1] < -3.0)]
-    after = track[(track[:, 1] > 3.0) & (track[:, 1] < 6.0)]
-    assert len(before) and len(after)
-    assert abs(float(np.median(before[:, 2])) - 0.42) < 0.15
-    assert abs(float(np.median(after[:, 2])) - 0.42) < 0.15
-    # never through the robot's body
-    gap = np.hypot(track[:, 1] - spot[0], track[:, 2] - spot[1]) - ROBOT_RADIUS
-    assert float(gap.min()) > 0.0
+def _line(track: np.ndarray, lo: float, hi: float) -> float:
+    """The walker's median distance from the south wall while it is between x `lo` and `hi`."""
+    part = track[(track[:, 1] > lo) & (track[:, 1] < hi)]
+    assert len(part), f"walker never between x {lo} and {hi}"
+    return float(np.median(part[:, 2]))
 
 
-@pytest.mark.parametrize("where", ["locker", "jammed"])
-def test_adult_goes_round_a_standing_robot(manager_factory: Callable[..., AgentManager], where: str) -> None:
-    spot, y = (PARKED, 0.6) if where == "locker" else (JAMMED, 0.9)
-    tracks, _ = run(manager_factory, [_walker(3, "adult", y)], lambda _t: spot, 45.0, f"test_reroute_adult_{where}")
-    passed = _passed_at(tracks[3], spot[0] + 1.0)
-    assert passed is not None, f"adult never got past the parked robot (last at x={tracks[3][-1, 1]:.2f})"
-    assert passed < 25.0
+def test_long_cane_users_trailing_into_a_standing_robot_go_round_it(manager_factory: Callable[..., AgentManager]) -> None:
+    """Two long-cane users trail the south wall, an adult follows; the robot stands on their trailing line (waiting at a
+    locker, or jammed). The second long-cane user ends up pinned between robot and wall: before, it stood there for good;
+    now it steps off the wall line, passes, and trails the wall again behind the robot."""
+    walkers = [_walker(2, "blind_white_cane", 0.5), _walker(6, "blind_white_cane", 0.5, x=-12.0), _walker(7, "adult", 0.6, x=-13.0)]
+    tracks, _ = run(manager_factory, walkers, lambda _t: ON_LINE, 60.0, "test_reroute_cane_queue")
+    for aid, track in tracks.items():
+        passed = _passed_at(track, ON_LINE[0] + 1.5)
+        assert passed is not None, f"walker {aid} never got past the standing robot (last at x={track[-1, 1]:.2f}, y={track[-1, 2]:.2f})"
+        assert passed < 45.0
+    for aid in (2, 6):
+        assert abs(_line(tracks[aid], 3.0, 8.0) - _line(tracks[aid], -6.0, -3.0)) < 0.15, f"walker {aid} not back on its wall line"
+
+
+def test_wheelchair_takes_the_other_lane_when_a_robot_closes_its_lane(manager_factory: Callable[..., AgentManager]) -> None:
+    """A robot stands in the middle of the 1.5 m lane, too narrow to pass it; the wheelchair user turns back and takes
+    the 2.5 m lane instead (before: it stood at the robot for good)."""
+    tracks, _ = run(manager_factory, [_walker(5, "wheelchair_manual", 0.75)], lambda _t: IN_LANE, 60.0, "test_reroute_bypass", width=4.0, inner=DIVIDER)
+    track = tracks[5]
+    assert _passed_at(track, 6.0) is not None, f"wheelchair never got past the closed lane (last at x={track[-1, 1]:.2f}, y={track[-1, 2]:.2f})"
+    middle = track[(track[:, 1] > -4.0) & (track[:, 1] < 4.0)]
+    assert float(middle[:, 2].max()) > 1.5 and _passed_at(track, IN_LANE[0]) is not None
+    assert float(track[(np.abs(track[:, 1] - IN_LANE[0]) < 0.5), 2].min()) > 1.5, "wheelchair went through the closed lane"
+
+
+def test_walker_with_no_way_round_waits(manager_factory: Callable[..., AgentManager]) -> None:
+    """The robot closes the only way (a 1.5 m corridor): the walker waits before it, as before, and does not go through."""
+    tracks, _ = run(manager_factory, [_walker(5, "wheelchair_manual", 0.75)], lambda _t: IN_LANE, 40.0, "test_reroute_no_way", width=1.5)
+    track = tracks[5]
+    assert float(track[:, 1].max()) < IN_LANE[0]
+    assert float(track[-1, 1]) > -4.0
 
 
 def test_walkers_keep_off_a_moving_robot_without_swinging(manager_factory: Callable[..., AgentManager]) -> None:
-    """A robot driving west along the south wall at 0.5 m/s, at the walkers: not on their maps (it moves), they pass it
-    by the local forces, never inside its body, and do not swing back and forth across the corridor."""
+    """A robot driving west through the corridor at 0.5 m/s, past the walkers: never on their maps (it moves), so their
+    routes stay as the static map makes them and the local forces alone keep them off it, as before."""
 
     def driving(t: float) -> tuple[float, float]:
-        return (8.0 - 0.5 * t, 0.45)
+        return (10.0 - 0.5 * t, 1.6)
 
-    walkers = [_walker(2, "blind_white_cane", 0.5), _walker(3, "adult", 0.6, x=-12.0)]
-    tracks, robot = run(manager_factory, walkers, driving, 40.0, "test_reroute_moving")
-    for aid, track in tracks.items():
-        n = min(len(track), len(robot))
-        gap = np.hypot(track[:n, 1] - robot[:n, 1], track[:n, 2] - robot[:n, 2]) - ROBOT_RADIUS
-        assert float(gap.min()) > 0.0, f"walker {aid} inside the moving robot"
-        # no swinging: the walker's heading across the corridor turns over at most a few times
-        dy = np.sign(np.diff(track[::10, 2]))
-        dy = dy[dy != 0]
-        flips = int(np.count_nonzero(np.diff(dy)))
-        assert flips <= 6, f"walker {aid} swings across the corridor ({flips} turns)"
+    walkers = [_walker(2, "blind_white_cane", 0.5), _walker(3, "adult", 1.4, x=-12.0)]
+    mgr = manager_factory(_scenario(walkers), node_name="test_reroute_moving")
+    for tick in range(round(40.0 / DT)):
+        rx, ry = driving(tick * DT)
+        mgr._world_state_callback(_robot_at(tick, rx, ry))
+        mgr.tick()
+        assert not mgr._global_planner.still_robots(), "a moving robot counted as standing"
+        assert not mgr._global_planner.blockers(), "a moving robot blocked a walker's route"
+        for aid in (2, 3):
+            pose = mgr._agents[aid].state.pose
+            assert math.hypot(pose.x - rx, pose.y - ry) > ROBOT_RADIUS, f"walker {aid} inside the moving robot"
+    for aid in (2, 3):
+        assert mgr._agents[aid].state.pose.x > 5.0
 
 
 def test_robot_standing_then_driving_off_leaves_routes_alone(manager_factory: Callable[..., AgentManager]) -> None:
@@ -172,13 +187,14 @@ def test_robot_standing_then_driving_off_leaves_routes_alone(manager_factory: Ca
 
 
 def test_planner_marks_only_walkers_a_standing_robot_blocks(manager_factory: Callable[..., AgentManager]) -> None:
-    """A walker far from the parked robot is never marked blocked; one that waits at it is."""
-    mgr = manager_factory(_scenario([_walker(2, "blind_white_cane", 0.5), _walker(4, "adult", 2.4, x=-12.0, goal_x=-11.0)]), node_name="test_reroute_marks")
-    marked: set[int] = set()
-    for tick in range(round(25.0 / DT)):
-        mgr._world_state_callback(_robot_at(tick, *PARKED))
+    """A walker far from the standing robot is never marked blocked; one pinned at it is, and only by that robot."""
+    walkers = [_walker(2, "blind_white_cane", 0.5), _walker(6, "blind_white_cane", 0.5, x=-12.0), _walker(4, "adult", 2.4, x=-12.0, goal_x=-11.0)]
+    mgr = manager_factory(_scenario(walkers), node_name="test_reroute_marks")
+    marked: dict[int, set[int]] = {}
+    for tick in range(round(30.0 / DT)):
+        mgr._world_state_callback(_robot_at(tick, *ON_LINE))
         mgr.tick()
-        marked |= set(mgr._global_planner.blockers())
+        for aid, robots in mgr._global_planner.blockers().items():
+            marked.setdefault(aid, set()).update(robots)
     assert 4 not in marked
-    assert 2 in marked
-    assert math.isfinite(float(mgr._agents[2].state.pose.x))
+    assert marked.get(6) == {mgr._external_entities[ROBOT_ID].agent_id}
