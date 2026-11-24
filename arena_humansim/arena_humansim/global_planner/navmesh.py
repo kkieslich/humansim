@@ -636,6 +636,8 @@ class NavMeshPlanner(GlobalPlanner):
         walkers behind keep pressing in from both ends, so neither front can give way."""
         navigating = {aid for aid, cmd in high_level_commands.items() if isinstance(cmd, HighLevelCommand) and cmd.type == CommandType.NAVIGATE}
         present = {a.state.agent_id: a for a in agents}
+        for aid in [a for a in self._turn_ways if a not in present]:
+            del self._turn_ways[aid]
         seen: dict[int, tuple[float, float, Narrow, float, str]] = {}
         for aid, agent in present.items():
             manner = self._manners.get(aid)
