@@ -213,6 +213,11 @@ class TeleportZones:
         self._flights: dict[int, _Flight] = {}
         #: the stair kinds each pedestrian's type climbs, as last steered: a type that does not climb a half is never carried over its seam
         self._climbs: dict[int, tuple[str, ...]] = {}
+        #: the pedestrians the last `steer` routed (a walking goal): their route says which halves they take, and one that
+        #: steps onto a half its route does not take (beside its landing, on a wall-trailing line round the mouth) walks
+        #: over it: no belt carries it and it is not carried over the seam. Without this, a walker that lands beside the
+        #: mouth of the half going back is carried back, takes the first half again, and rides round for good.
+        self._routed: set[int] = set()
 
     def set_zones(self, zones: Sequence[Zone], is_open: Sequence[bool]) -> None:
         """Replace every zone, keeping the transfers through zones that come back unchanged or stairs that keep their destination."""
@@ -240,6 +245,7 @@ class TeleportZones:
             self._flights.clear()
             self._climbs.clear()
             self._landed.clear()
+            self._routed.clear()
         self._join()
 
     @staticmethod
@@ -275,6 +281,7 @@ class TeleportZones:
         self._held_since.clear()
         self._flights.clear()
         self._climbs.clear()
+        self._routed.clear()
 
     def forget(self, aid: int) -> None:
         self.transfers.pop(aid, None)
@@ -301,6 +308,7 @@ class TeleportZones:
             return cmds
         out = dict(cmds)
         groups: dict[GlobalPlanner, list[tuple[BaseAgent, HighLevelCommand]]] = {}
+        self._routed = set()
         for agent in agents:
             aid = agent.state.agent_id
             if agent.state.kind != KIND_ROBOT:
@@ -312,6 +320,7 @@ class TeleportZones:
                 continue
             if cmd is not None and cmd.type == CommandType.NAVIGATE and agent.state.kind != KIND_ROBOT:
                 groups.setdefault(agent.global_planner, []).append((agent, cmd))
+                self._routed.add(aid)
         paced_at = now if self.route_choice else None
         blocked: dict[tuple[str, ...], set[str]] = {}
         for planner, group in groups.items():
@@ -476,12 +485,14 @@ class TeleportZones:
         return bool(zone.kind) and (zone.contains(x, y) or (self._joined.get(zone.name) == transfer.destination and self.zones[transfer.destination].contains(x, y)))
 
     def carry(self, pool: AgentPool) -> None:
-        """Stand the pedestrians on a running belt and carry them at belt speed, cap walkers on a still stair at stair speed and keep the ones held at a seam still."""
+        """Stand the pedestrians on a running belt and carry them at belt speed, cap walkers on a still stair at stair speed and keep the ones held at a seam still. A routed pedestrian on a half its route does not take walks over it (`_passing`)."""
         self.riders = set()
         for i, zone in self._on_stairs(pool):
             aid = int(pool.agent_ids[i])
             climbs = self._climbs.get(aid)
             if climbs is not None and zone.kind not in climbs:  # pushed onto a half it does not climb: it walks off
+                continue
+            if self._passing(aid, zone):  # on a half its route does not take: it walks over it
                 continue
             if zone.belt:
                 self.riders.add(aid)
@@ -497,6 +508,15 @@ class TeleportZones:
                 if speed > STAIR_SPEED:
                     pool.vel[i] *= STAIR_SPEED / speed
             pool.prev_vel[i] = pool.vel[i]
+
+    def _passing(self, aid: int, zone: Zone) -> bool:
+        """Whether a routed pedestrian stands on a half its route does not take (no transfer through it) and did not
+        land on: it walks over the half like floor, neither carried by its belt nor over its seam. Halves joined to their
+        partner in place (no seam teleport, walked or ridden through) keep their own rule."""
+        if aid not in self._routed or zone.name in self._joined or self._landed.get(aid) == zone.name:
+            return False
+        transfer = self.transfers.get(aid)
+        return transfer is None or transfer.zone != zone.name
 
     def standing(self, pool: AgentPool) -> np.ndarray:
         """Mask over the pool's rows of the pedestrians standing on a running belt."""
@@ -555,7 +575,8 @@ class TeleportZones:
 
         One held for `timeout_ticks` (0: never) lands anyway. On a half with a `delay` (the stair flight the halves leave
         out) the pedestrian boards the flight instead (`_fly`). A pedestrian whose type does not climb the half's kind is
-        never carried over."""
+        never carried over. Nor is a routed pedestrian on a half its route does not take and did not land on (`_passing`):
+        it walks over it."""
         rows = self._on_stairs(pool)
         on = {int(pool.agent_ids[i]): zone.name for i, zone in rows}
         self._landed = {aid: name for aid, name in self._landed.items() if on.get(aid) == name}
@@ -570,6 +591,8 @@ class TeleportZones:
                 continue
             climbs = self._climbs.get(aid)
             if aid in self._flights or (climbs is not None and zone.kind not in climbs):
+                continue
+            if self._passing(aid, zone):
                 continue
             dest = self.zones[routed or zone.destinations[0]]
             landing = self._landing(zone, dest, x, y, float(pool.theta[i]))
