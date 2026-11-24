@@ -450,3 +450,30 @@ def test_warped_speed_and_sway_profiles_average_to_zero_over_a_cycle(agent_facto
     assert np.abs(factors.mean(axis=0) - 1.0).max() < 2e-3
     assert np.abs(sways.mean(axis=0)).max() < 2e-3
     assert np.ptp(factors[:, 0]) > 0.15 and np.ptp(sways[:, 0]) > 0.06
+
+
+def test_progress_after_a_reverse_counts_from_where_the_reverse_left_the_row(agent_factory: Callable[..., BaseAgent]) -> None:
+    """A row that backed off and then rolls forward again makes progress: it must not count as stalled against its best
+    distance from before the reverse (which made it reverse every RESTALL_AFTER_S while walkers blocked it: a loop)."""
+    pool, ext = _pool()
+    pool.add_agent(_agent(agent_factory, 1, _loc(kinematics=1, recovery_stall_after_s=0.5, recovery_reverse_m=0.3), pivot_angular_velocity=2.0))
+    pool.goal_pos[0] = (5.0, 0.0)
+    pool.has_goal[0] = True
+    pool.desired_vel[0] = 1.0
+    pool.theta[0] = 0.0
+
+    _stalled(pool, ext, 0.55)
+    _stalled(pool, ext, 2 * DT)
+    assert ext.mode[0] == MODE_NORMAL and ext.cooldown[0] > 0.0
+    _stalled(pool, ext, 0.55)
+    assert ext.mode[0] == MODE_REVERSE
+    pool.pos[0] = (-0.3, 0.0)
+    _stalled(pool, ext, 0.3 / REVERSE_SPEED + 2 * DT)
+    assert ext.mode[0] == MODE_NORMAL and ext.cooldown[0] > 0.0
+
+    pool.pos[0] = (-0.2, 0.0)
+    _stalled(pool, ext, 0.45)
+    assert ext.mode[0] == MODE_NORMAL
+    assert ext.stall_timer[0] == pytest.approx(0.45, abs=2 * DT)
+    _stalled(pool, ext, 0.1)
+    assert ext.mode[0] == MODE_REVERSE
