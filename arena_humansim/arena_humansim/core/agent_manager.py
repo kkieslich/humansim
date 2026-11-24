@@ -516,6 +516,8 @@ class AgentManager(TimeNode):
         self._external_timeout_ticks = max(1, int(round(_EXTERNAL_TIMEOUT_S / self._dt)))
         self._external_velocity_ticks = max(1, int(round(_EXTERNAL_VELOCITY_WINDOW_S / self._dt)))
         self._walls: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {}
+        #: bumped at every change of `_walls`: the wall markers are sent again only then, without comparing every wall each tick
+        self._walls_rev = 0
         self._obstacles: dict[str, ObstacleData] = {}
         self._lane_sources: dict[str, SourceConfig] = {}
         self._zones = TeleportZones()
@@ -1860,6 +1862,7 @@ class AgentManager(TimeNode):
                 self._walls,
                 self._world_knowledge._objects,
                 self._obstacles,
+                walls_rev=self._walls_rev,
             )
             if mlvl >= 2 and self._marker_pub.watched:
                 modules: list[Perception | GlobalPlanner | LocalPlanner] = list(self._perception_cache.values())
@@ -3029,6 +3032,7 @@ class AgentManager(TimeNode):
         self._interaction_scripts.clear()
         self._interaction_scripts_by_tick.clear()
         self._walls.clear()
+        self._walls_rev += 1
         self._obstacles.clear()
         self._lane_sources.clear()
         self._zones.clear_transfers()
@@ -3420,6 +3424,7 @@ class AgentManager(TimeNode):
                 changed.append(self._walls[name])
             self._walls[name] = ((start.x, start.y), (end.x, end.y))
             changed.append(self._walls[name])
+        self._walls_rev += 1
         self._rebuild_lanes(changed)
         self._refresh_planners()
         self._publish_world_geometry()
@@ -3436,6 +3441,7 @@ class AgentManager(TimeNode):
         else:
             changed = [wall for name in request.names if (wall := self._walls.pop(name, None)) is not None]
             response.message = f"Removed {len(request.names)} wall(s), remaining {len(self._walls)}"
+        self._walls_rev += 1
         self._rebuild_lanes(changed)
         self._refresh_planners()
         self._publish_world_geometry()

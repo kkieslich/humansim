@@ -44,6 +44,8 @@ class Router:
         self._index, self._walls = mesh.index, mesh.con_edges
         self._blocked = np.zeros(0, np.int64)
         self._slow: np.ndarray | None = None
+        #: the graph's arcs, their order and neighbour slots, kept while only the congestion weights change
+        self._topology: tuple[np.ndarray, ...] | None = None
         self._graph()
 
     def set_blocked(self, edges: np.ndarray) -> None:
@@ -55,6 +57,7 @@ class Router:
             self._walls = np.vstack([mesh.con_edges, np.column_stack([mesh.ea[self._blocked], mesh.eb[self._blocked]])])
             self._index = SegIndex(mesh.P[self._walls[:, 0]], mesh.P[self._walls[:, 1]])
         self._trees.clear()
+        self._topology = None
         self._graph()
 
     def set_congestion(self, slowdown: np.ndarray | None) -> None:
@@ -69,27 +72,38 @@ class Router:
         return self._index.point_clearance(np.atleast_2d(np.asarray(pts, dtype=np.float64)), self.comfort)
 
     def _graph(self) -> None:
+        """The arc graph over the mesh edges, weighted by the congestion. Its arcs, their order, the neighbour slots and
+        the components depend only on the radius and the blocked edges (`_topology`): a congestion update (every
+        `congestion_interval` on every router) only weighs the arcs again."""
         mesh = self.mesh
         E = len(mesh.ea)
-        self._open = ~mesh.e_con & (mesh.e_len >= 2 * self.r - 1e-9)
-        self._open[self._blocked] = False
-        m = (mesh.arc_w >= 2 * self.r - 1e-9) & self._open[mesh.arc_a] & self._open[mesh.arc_b]
-        a, b = mesh.arc_a[m], mesh.arc_b[m]
+        if self._topology is None:
+            self._open = ~mesh.e_con & (mesh.e_len >= 2 * self.r - 1e-9)
+            self._open[self._blocked] = False
+            m = (mesh.arc_w >= 2 * self.r - 1e-9) & self._open[mesh.arc_a] & self._open[mesh.arc_b]
+            a, b = mesh.arc_a[m], mesh.arc_b[m]
+            src, dst = np.concatenate([a, b]), np.concatenate([b, a])
+            order = np.argsort(src, kind="stable")
+            src, dst = src[order], dst[order]
+            indptr = np.searchsorted(src, np.arange(E + 1))
+            rank = np.arange(len(src)) - indptr[src]
+            nbr = np.full((E, 4), -1, np.int64)
+            nbr[src, rank] = dst
+            c = mesh.arc_c[m]
+            cst = np.concatenate([c, c])[order]
+            _, comp = connected_components(csr_matrix((cst, dst, indptr), shape=(E, E)), directed=False)
+            self._topology = (m, a, b, order, src, rank)
+            self._indptr, self._indices, self._comp = indptr, dst, comp
+            self._nbr = nbr.tolist()
+        m, a, b, order, src, rank = self._topology
         c = mesh.arc_c[m]
         if self._slow is not None:
             c = c * 0.5 * (self._slow[a] + self._slow[b])
-        src, dst, cst = np.concatenate([a, b]), np.concatenate([b, a]), np.concatenate([c, c])
-        order = np.argsort(src, kind="stable")
-        src, dst, cst = src[order], dst[order], cst[order]
-        indptr = np.searchsorted(src, np.arange(E + 1))
-        rank = np.arange(len(src)) - indptr[src]
-        nbr = np.full((E, 4), -1, np.int64)
+        cst = np.concatenate([c, c])[order]
         nc = np.zeros((E, 4))
-        nbr[src, rank] = dst
         nc[src, rank] = cst
-        _, comp = connected_components(csr_matrix((cst, dst, indptr), shape=(E, E)), directed=False)
-        self._indptr, self._indices, self._data, self._comp = indptr, dst, cst, comp
-        self._nbr, self._cst = nbr.tolist(), nc.tolist()
+        self._data = cst
+        self._cst = nc.tolist()
 
     def _seg_clear(self, A: np.ndarray, B: np.ndarray, owner: np.ndarray, n_owner: int, pad: float) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray, int, float] | None]:
         """Exact min wall distance per owner for path segments A->B (inf where nothing is within pad)."""
@@ -456,7 +470,10 @@ class Router:
         B = np.vstack([p[1:] for p in polys])
         return self._seg_clear(A, B, np.repeat(np.arange(len(polys)), cnt), len(polys), self.r)[0]
 
-    def plan_many(self, starts: np.ndarray, goal: np.ndarray) -> list[Route | None]:
+    def plan_many(self, starts: np.ndarray, goal: np.ndarray, verify: bool = True) -> list[Route | None]:
+        """Routes from each start to `goal`. Without `verify` the funnelled routes are not checked against the walls (nor
+        repaired where they cut a corner closer than the radius) and a start in sight of the goal is not looked for
+        first: routes only priced, by length, not walked."""
         starts = np.atleast_2d(np.asarray(starts, dtype=np.float64))
         g = np.asarray(goal, dtype=np.float64)
         n = len(starts)
@@ -473,6 +490,8 @@ class Router:
         euclid = np.hypot(*(starts - g).T)
 
         cand = np.nonzero(ok & (~np.isfinite(reach) | (reach <= 1.5 * euclid + 1.0) | (ts == gt[0])))[0]
+        if not verify:  # priced only: a route in sight of its goal funnels to the straight line anyway
+            cand = cand[~np.isfinite(reach[cand]) | (ts[cand] == gt[0])]
         if len(cand):
             for i in cand[self.line_of_sight(starts[cand], np.repeat(g[None], len(cand), 0))]:
                 out[i] = (np.array([starts[i], g]), np.zeros(0, np.int64))
@@ -493,13 +512,21 @@ class Router:
         if todo and self._rho is not None:
             soft = [self._comfort_pull(starts[i], g, ev) for i, ev in zip(todo, evs, strict=True)]
             have = [k for k, poly in enumerate(soft) if poly is not None]
-            if have:
+            if have and not verify:
+                for k in have:
+                    out[todo[k]] = (soft[k], evs[k]["ch"])
+            elif have:
                 clear = self._clear_many([poly for poly in soft if poly is not None])
                 for k, c in zip(have, clear, strict=True):
                     if c >= self.r - VERIFY_EPS:
                         out[todo[k]] = (soft[k], evs[k]["ch"])
             keep = [k for k, i in enumerate(todo) if out[i] is None]
             todo, evs = [todo[k] for k in keep], [evs[k] for k in keep]
+        if todo and not verify:
+            for i, ev in zip(todo, evs, strict=True):
+                if out[i] is None:
+                    out[i] = (self._pull(starts[i], g, ev), ev["ch"])
+            todo = []
         if todo:
             polys = [self._pull(starts[i], g, ev) for i, ev in zip(todo, evs, strict=True)]
             clear = self._clear_many(polys)

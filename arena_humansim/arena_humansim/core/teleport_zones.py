@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import enum
 import math
 import operator
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 
 import attrs
 import numpy as np
@@ -323,70 +324,103 @@ class TeleportZones:
                 self._routed.add(aid)
         paced_at = now if self.route_choice else None
         blocked: dict[tuple[str, ...], set[str]] = {}
+        order = {agent.state.agent_id: k for k, agent in enumerate(agents)}
         for planner, group in groups.items():
             graph = self._graph(planner)
             comps = planner.components([agent.state.pose for agent, _ in group] + [cmd.target_pose for _, cmd in group])
             plans = planner.get_cached_paths() if self._joined else {}
+            created: list[int] = []
+            waiting: list[tuple[Generator, tuple]] = []
             for k, (agent, cmd) in enumerate(group):
-                aid = agent.state.agent_id
-                near = (agent.state.pose.x, agent.state.pose.y)
-                goal = (round(cmd.target_pose.x, 3), round(cmd.target_pose.y, 3))
-                transfer = self.transfers.get(aid)
-                if transfer is not None and transfer.goal != goal:
-                    transfer = None
-                    del self.transfers[aid]
-                banned = self._banned.get(aid)
-                if banned is not None and banned[0] != goal:
-                    banned = None
-                    del self._banned[aid]
-                climbs = agent.params.climbs
-                if climbs not in blocked:
-                    blocked[climbs] = self._blocked(climbs)
-                if transfer is not None and self._joined.get(transfer.zone) == transfer.destination:
-                    zone = self.zones[transfer.zone]
-                    on = zone.contains(*near) or self.zones[transfer.destination].contains(*near)
-                    if transfer.aboard and not on and zone.along(*near) > zone.length:
-                        del self.transfers[aid]
-                        transfer = None
-                    else:
-                        transfer.aboard = on
-                if transfer is not None and transfer.ride and not self._aboard(transfer, *near) and (transfer.zone in blocked[climbs] or (comps[k] and not comps[k] & graph.sides[transfer.zone]) or (transfer.zone not in self._joined and transfer.destination in blocked[climbs])):
-                    del self.transfers[aid]
-                    transfer = None
-                again = paced_at is not None and transfer is not None and transfer.ride and transfer.phase == Phase.WALK and not self._aboard(transfer, *near) and paced_at >= self._next_choice.get(aid, -math.inf)
-                if transfer is None or again or (transfer.phase == Phase.WALK and not transfer.ride and not self._aboard(transfer, *near)):
-                    start, end = comps[k], comps[len(group) + k]
-                    keep = None if transfer is None else (transfer.zone, transfer.destination)
-                    edge = self._route(graph, start, end, blocked[climbs] | set(() if banned is None else banned[1]), near, keep)
-                    if edge is None and banned is not None and len(banned[1]) > 1:
-                        self._banned[aid] = (goal, banned[1][-1:])
-                        edge = self._route(graph, start, end, blocked[climbs] | set(banned[1][-1:]), near, keep)
-                    if edge is None and banned is not None:
-                        del self._banned[aid]
-                        edge = self._route(graph, start, end, blocked[climbs], near, keep)
-                    ride = False
-                    walkable = bool({graph.area.get(c, c) for c in start} & {graph.area.get(c, c) for c in end})
-                    if (edge is None and walkable) or (edge is not None and edge[0] in self._joined):
-                        held = (transfer.zone, transfer.destination) if again and transfer is not None else None
-                        timed = self._ride(planner, agent, cmd.target_pose, goal, blocked[climbs] | set(self._banned[aid][1] if aid in self._banned else ()), paced_at, held)
-                        if timed is not None:
-                            edge, ride = timed, True
-                    if edge is None:
-                        self.transfers.pop(aid, None)
-                        plan = plans.get(aid)
-                        if plan and any((name in blocked[climbs] or not self.zones[name].destinations) and self.zones[name].contains(plan[-1].x, plan[-1].y) and not self.zones[name].contains(*goal) for name in self._joined):
-                            self.through[aid] = agent.state.pose
-                        continue
-                    if transfer is None or (transfer.zone, transfer.destination) != edge:
-                        transfer = self.transfers[aid] = Transfer(goal=goal, zone=edge[0], destination=edge[1], ride=ride, side=self.zones[edge[0]].across(*near))
-                z = self.zones[transfer.zone]
-                if z.kind:
-                    out[aid] = attrs.evolve(cmd, target_pose=self._inner(z, transfer.side))
-                    if transfer.aboard:
-                        self.through[aid] = z.point(z.length + self.zones[transfer.destination].length + THROUGH_CLEAR, z.across(*near))
-                    continue
-                out[aid] = attrs.evolve(cmd, target_pose=z.wait if transfer.phase in (Phase.WALK, Phase.WAIT) else z.slots[transfer.slot])
+                walker = self._steer_one(k, agent, cmd, group, graph, comps, plans, blocked, paced_at, out, created)
+                request = next(walker, None)
+                if request is not None:
+                    waiting.append((walker, request))
+            for (walker, _), timed in zip(waiting, self._ride_many(planner, [request for _, request in waiting]), strict=True):
+                with contextlib.suppress(StopIteration):
+                    walker.send(timed)
+            # transfers made this call in the walkers' order, as one pass over them makes them (`hold` serves them in order)
+            for aid in sorted(created, key=order.__getitem__):
+                if aid in self.transfers:
+                    self.transfers[aid] = self.transfers.pop(aid)
         return out
+
+    def _steer_one(
+        self,
+        k: int,
+        agent: BaseAgent,
+        cmd: HighLevelCommand,
+        group: list[tuple[BaseAgent, HighLevelCommand]],
+        graph: _Graph,
+        comps: list[frozenset[int]],
+        plans: dict[int, list[Pose2D]],
+        blocked: dict[tuple[str, ...], set[str]],
+        paced_at: float | None,
+        out: dict[int, HighLevelCommand],
+        created: list[int],
+    ) -> Generator[tuple, tuple[str, str] | None, None]:
+        """`steer` for the `k`th walker of a planner's `group`. Where it weighs walking against the stairs it yields its
+        `_ride` request and goes on with the answer, so `steer` prices the requests of all its walkers in one batch."""
+        aid = agent.state.agent_id
+        near = (agent.state.pose.x, agent.state.pose.y)
+        goal = (round(cmd.target_pose.x, 3), round(cmd.target_pose.y, 3))
+        transfer = self.transfers.get(aid)
+        if transfer is not None and transfer.goal != goal:
+            transfer = None
+            del self.transfers[aid]
+        banned = self._banned.get(aid)
+        if banned is not None and banned[0] != goal:
+            banned = None
+            del self._banned[aid]
+        climbs = agent.params.climbs
+        if climbs not in blocked:
+            blocked[climbs] = self._blocked(climbs)
+        if transfer is not None and self._joined.get(transfer.zone) == transfer.destination:
+            zone = self.zones[transfer.zone]
+            on = zone.contains(*near) or self.zones[transfer.destination].contains(*near)
+            if transfer.aboard and not on and zone.along(*near) > zone.length:
+                del self.transfers[aid]
+                transfer = None
+            else:
+                transfer.aboard = on
+        if transfer is not None and transfer.ride and not self._aboard(transfer, *near) and (transfer.zone in blocked[climbs] or (comps[k] and not comps[k] & graph.sides[transfer.zone]) or (transfer.zone not in self._joined and transfer.destination in blocked[climbs])):
+            del self.transfers[aid]
+            transfer = None
+        again = paced_at is not None and transfer is not None and transfer.ride and transfer.phase == Phase.WALK and not self._aboard(transfer, *near) and paced_at >= self._next_choice.get(aid, -math.inf)
+        if transfer is None or again or (transfer.phase == Phase.WALK and not transfer.ride and not self._aboard(transfer, *near)):
+            start, end = comps[k], comps[len(group) + k]
+            keep = None if transfer is None else (transfer.zone, transfer.destination)
+            edge = self._route(graph, start, end, blocked[climbs] | set(() if banned is None else banned[1]), near, keep)
+            if edge is None and banned is not None and len(banned[1]) > 1:
+                self._banned[aid] = (goal, banned[1][-1:])
+                edge = self._route(graph, start, end, blocked[climbs] | set(banned[1][-1:]), near, keep)
+            if edge is None and banned is not None:
+                del self._banned[aid]
+                edge = self._route(graph, start, end, blocked[climbs], near, keep)
+            ride = False
+            walkable = bool({graph.area.get(c, c) for c in start} & {graph.area.get(c, c) for c in end})
+            if (edge is None and walkable) or (edge is not None and edge[0] in self._joined):
+                held = (transfer.zone, transfer.destination) if again and transfer is not None else None
+                timed = yield (agent, cmd.target_pose, goal, blocked[climbs] | set(self._banned[aid][1] if aid in self._banned else ()), paced_at, held)
+                if timed is not None:
+                    edge, ride = timed, True
+            if edge is None:
+                self.transfers.pop(aid, None)
+                plan = plans.get(aid)
+                if plan and any((name in blocked[climbs] or not self.zones[name].destinations) and self.zones[name].contains(plan[-1].x, plan[-1].y) and not self.zones[name].contains(*goal) for name in self._joined):
+                    self.through[aid] = agent.state.pose
+                return
+            if transfer is None or (transfer.zone, transfer.destination) != edge:
+                if aid not in self.transfers:
+                    created.append(aid)
+                transfer = self.transfers[aid] = Transfer(goal=goal, zone=edge[0], destination=edge[1], ride=ride, side=self.zones[edge[0]].across(*near))
+        z = self.zones[transfer.zone]
+        if z.kind:
+            out[aid] = attrs.evolve(cmd, target_pose=self._inner(z, transfer.side))
+            if transfer.aboard:
+                self.through[aid] = z.point(z.length + self.zones[transfer.destination].length + THROUGH_CLEAR, z.across(*near))
+            return
+        out[aid] = attrs.evolve(cmd, target_pose=z.wait if transfer.phase in (Phase.WALK, Phase.WAIT) else z.slots[transfer.slot])
 
     def _inner(self, zone: Zone, across: float = 0.0) -> Pose2D:
         """Where a stair half is walked to: its lane point on the hold line, on a pair joined in place a point short of the seam `across` meters off its center line."""
@@ -412,57 +446,86 @@ class TeleportZones:
         With route choice (`now` given) the halves beside their partner count too, the walks take the planner's congestion
         weights (`GlobalPlanner.path_cost`), and the walker keeps the ride it holds (`held`) or walking unless another way
         is quicker by `SWITCH_SHARE` of it and by `SWITCH_M` of walking, until its next choice is due."""
-        aid = agent.state.agent_id
-        key = (goal, frozenset(blocked))
-        paced = now is not None
-        walking = self._walks.get(aid) == key
-        if walking and held is None and (not paced or now < self._next_choice.get(aid, -math.inf)):
-            return None
-        choose = self.route_choice and paced
-        rides = [(name, dest) for name, zone in sorted(self.zones.items()) if name not in blocked and (name in self._joined or (choose and zone.belt >= 0.0)) for dest in zone.destinations if dest in self.zones and (name in self._joined or dest not in blocked)]
-        if paced:
-            self._next_choice[aid] = now + CHOICE_INTERVAL + (aid % CHOICE_STAGGER) * CHOICE_INTERVAL / CHOICE_STAGGER
-        if not rides:
-            self._walks[aid] = key
-            return None
-        near = agent.state.pose
-        speed = max(agent.params.desired_velocity, 0.1)
+        return self._ride_many(planner, [(agent, target, goal, blocked, now, held)])[0]
 
-        def walked(path: list[Pose2D] | None) -> float:
-            if not choose:
-                return _walk_time(path, speed)
-            return math.inf if not path else planner.path_cost(path) / speed
+    def _ride_many(self, planner: GlobalPlanner, requests: Sequence[tuple[BaseAgent, Pose2D, tuple[float, float], set[str], float | None, tuple[str, str] | None]]) -> list[tuple[str, str] | None]:
+        """`_ride` for each request (agent, target, goal, blocked, now, held), the same answer each would get alone, with
+        the walks of all requests planned in one `GlobalPlanner.paths` call per stage instead of several per walker: a
+        crowd's route choices otherwise cost more than the rest of the tick (at ~300 walkers a choice falls due for ~60
+        walkers a second, each planning its walk, its ways to and from every stair, and on between them)."""
+        out: list[tuple[str, str] | None] = [None] * len(requests)
+        work: list[dict] = []
+        for k, (agent, target, goal, blocked, now, held) in enumerate(requests):
+            aid = agent.state.agent_id
+            key = (goal, frozenset(blocked))
+            paced = now is not None
+            walking = self._walks.get(aid) == key
+            if walking and held is None and (not paced or now < self._next_choice.get(aid, -math.inf)):
+                continue
+            choose = self.route_choice and paced
+            rides = [(name, dest) for name, zone in sorted(self.zones.items()) if name not in blocked and (name in self._joined or (choose and zone.belt >= 0.0)) for dest in zone.destinations if dest in self.zones and (name in self._joined or dest not in blocked)]
+            if paced:
+                self._next_choice[aid] = now + CHOICE_INTERVAL + (aid % CHOICE_STAGGER) * CHOICE_INTERVAL / CHOICE_STAGGER
+            if not rides:
+                self._walks[aid] = key
+                continue
+            work.append({"k": k, "aid": aid, "key": key, "agent": agent, "target": target, "held": held, "walking": walking, "choose": choose, "rides": rides, "near": agent.state.pose, "speed": max(agent.params.desired_velocity, 0.1)})
+        if not work:
+            return out
 
-        walk = walked(planner.paths([(near, target)])[0])
-        ride = [self._ride_time(name, dest, speed, agent.params.stair_effort, planner if choose else None) for name, dest in rides]
-        reach = [math.hypot(self.zones[name].entry.x - near.x, self.zones[name].entry.y - near.y) / speed for name, _ in rides]
-        rest = [math.hypot(target.x - self.zones[dest].entry.x, target.y - self.zones[dest].entry.y) / speed for _, dest in rides]
-        first, last = min(map(operator.add, reach, ride)), min(map(operator.add, ride, rest))
-        kept = [i for i in range(len(rides)) if min(reach[i], first) + ride[i] + min(rest[i], last) < walk or rides[i] == held]
-        rides, ride = [rides[i] for i in kept], [ride[i] for i in kept]
-        options: dict[tuple[str, str] | None, float] = {None: walk}
-        if rides:
-            mouths = [self.zones[name].entry for name, _ in rides]
-            lands = [self.zones[dest].entry for _, dest in rides]
-            walks = [walked(path) for path in planner.paths([*((near, mouth) for mouth in mouths), *((land, target) for land in lands)])]
-            board, rest = walks[: len(rides)], walks[len(rides) :]
-            comps = planner.components(lands + mouths)
-            legs = [(i, j) for i in range(len(rides)) if math.isinf(rest[i]) for j in range(len(rides)) if comps[i] & comps[len(rides) + j]]
-            onward = dict(zip(legs, (walked(path) for path in planner.paths([(lands[i], mouths[j]) for i, j in legs])), strict=True))
-            for _ in rides:
-                for (i, j), hop in onward.items():
-                    rest[i] = min(rest[i], hop + ride[j] + rest[j])
-            options.update((rides[i], board[i] + ride[i] + rest[i]) for i in range(len(rides)))
-        order = {edge: k for k, edge in enumerate(options)}
-        best = min(options, key=lambda e: (options[e], order[e]))
-        if choose and (held is not None or walking) and best != held:
-            kept_time = options.get(held, math.inf)
-            if math.isfinite(kept_time) and options[best] + max(SWITCH_M / speed, SWITCH_SHARE * kept_time) >= kept_time:
-                best = held
-        if best is not None:
-            return best
-        self._walks[aid] = key
-        return None
+        def walked(w: dict, path: list[Pose2D] | None) -> float:
+            if not w["choose"]:
+                return _walk_time(path, w["speed"])
+            return math.inf if not path else planner.path_cost(path) / w["speed"]
+
+        for w, path in zip(work, planner.paths([(w["near"], w["target"]) for w in work]), strict=True):
+            near, target, speed, rides = w["near"], w["target"], w["speed"], w["rides"]
+            walk = walked(w, path)
+            ride = [self._ride_time(name, dest, speed, w["agent"].params.stair_effort, planner if w["choose"] else None) for name, dest in rides]
+            reach = [math.hypot(self.zones[name].entry.x - near.x, self.zones[name].entry.y - near.y) / speed for name, _ in rides]
+            rest = [math.hypot(target.x - self.zones[dest].entry.x, target.y - self.zones[dest].entry.y) / speed for _, dest in rides]
+            first, last = min(map(operator.add, reach, ride)), min(map(operator.add, ride, rest))
+            kept = [i for i in range(len(rides)) if min(reach[i], first) + ride[i] + min(rest[i], last) < walk or rides[i] == w["held"]]
+            w["walk"], w["rides"], w["ride"] = walk, [rides[i] for i in kept], [ride[i] for i in kept]
+            w["mouths"] = [self.zones[name].entry for name, _ in w["rides"]]
+            w["lands"] = [self.zones[dest].entry for _, dest in w["rides"]]
+        riding = [w for w in work if w["rides"]]
+        legs = [leg for w in riding for leg in (*((w["near"], mouth) for mouth in w["mouths"]), *((land, w["target"]) for land in w["lands"]))]
+        paths = iter(planner.paths(legs))
+        points = [p for w in riding for p in (*w["lands"], *w["mouths"])]
+        comps_all = iter(planner.components(points) if points else [])
+        hops: list[tuple[dict, tuple[int, int]]] = []
+        for w in riding:
+            n = len(w["rides"])
+            walks = [walked(w, next(paths)) for _ in range(2 * n)]
+            w["board"], w["rest"] = walks[:n], walks[n:]
+            comps = [next(comps_all) for _ in range(2 * n)]
+            hops.extend((w, (i, j)) for i in range(n) if math.isinf(w["rest"][i]) for j in range(n) if comps[i] & comps[n + j])
+        onward_paths = planner.paths([(w["lands"][i], w["mouths"][j]) for w, (i, j) in hops])
+        for w in riding:
+            w["onward"] = {}
+        for (w, leg), path in zip(hops, onward_paths, strict=True):
+            w["onward"][leg] = walked(w, path)
+        for w in work:
+            rides, ride, held, speed = w["rides"], w["ride"], w["held"], w["speed"]
+            options: dict[tuple[str, str] | None, float] = {None: w["walk"]}
+            if rides:
+                board, rest = w["board"], w["rest"]
+                for _ in rides:
+                    for (i, j), hop in w["onward"].items():
+                        rest[i] = min(rest[i], hop + ride[j] + rest[j])
+                options.update((rides[i], board[i] + ride[i] + rest[i]) for i in range(len(rides)))
+            order = {edge: k for k, edge in enumerate(options)}
+            best = min(options, key=lambda e: (options[e], order[e]))
+            if w["choose"] and (held is not None or w["walking"]) and best != held:
+                kept_time = options.get(held, math.inf)
+                if math.isfinite(kept_time) and options[best] + max(SWITCH_M / speed, SWITCH_SHARE * kept_time) >= kept_time:
+                    best = held
+            if best is not None:
+                out[w["k"]] = best
+                continue
+            self._walks[w["aid"]] = w["key"]
+        return out
 
     def _ride_time(self, name: str, dest: str, speed: float, effort: float, crowding: GlobalPlanner | None = None) -> float:
         """Time over a stair from its entry to its partner's: carried at belt speed, climbed at stair speed times the effort on a still one, and the flight's `delay` between two halves side by side.
