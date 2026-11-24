@@ -237,6 +237,10 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         plans = self._plan([(k, ends[2 * k], ends[2 * k + 1]) for k in range(len(legs))])
         return [plans.get(k) for k in range(len(legs))]
 
+    def path_cost(self, path: Sequence[Pose2D]) -> float:
+        """Walking cost of a planned path [m]: its length, weighted by congestion where the planner weighs it."""
+        return float(sum(math.hypot(b.x - a.x, b.y - a.y) for a, b in zip(path, path[1:], strict=False)))
+
     def _sees(self, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
         """Whether each straight leg is walkable as a whole path."""
         if self._wall_grid is None or self._wall_grid[0] is not self._wall_segments:

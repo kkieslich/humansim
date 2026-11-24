@@ -29,11 +29,13 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def _nearest_reachable(self, start, target) -> Pose2D | None: ...
     def components(self, poses) -> list[frozenset[int]]: ...
     def paths(self, legs) -> list[list[Pose2D] | None]: ...
+    def path_cost(self, path) -> float: ...
 ```
 
 A subclass implements only `_has_map` and `_plan`. The base class owns everything else: the per-agent path cache, the replan rule, and stepping along a cached path.
 
 - `paths` plans (start, goal) legs between snapped terminals through `_plan`, None where none reaches the goal, straight lines without a map. The stair ride choice times walking and riding along them.
+- `path_cost` is optional, default the path's length. `navmesh` weighs it by the congestion along it while `congestion_interval` is on, and the stair route choice (`zone_route_choice`) times walks by it.
 - `_has_map` gates the whole planner. While false every `NAVIGATE` agent gets its raw target as its subgoal, no `_plan` call.
 - `_plan` takes `(agent_id, start pose, target pose)` requests and returns final, already-smoothed waypoints per agent, first waypoint the agent's own position, last the snapped terminal, or `None` if the target is unreachable.
 - `compute` is concrete: skips non-`NAVIGATE` commands, replans when the target moved past `_replan_distance` from the cached goal, advances a fresh cache entry with `advance_along_path`, and on `None` asks `_nearest_reachable` for a substitute target. A route to the substitute is cached under the original target, so it is not replanned every tick. Without a substitute it pops the cache entry and falls back to `snap_terminal(target)`.

@@ -54,6 +54,7 @@ ARRIVAL_R_EXIT = Param[float]("arrival_r_exit", 0.30, "Radius in meters at which
 ARRIVAL_TAU_BRAKE = Param[float]("arrival_tau_brake", 0.15, "Braking time constant in seconds of a latched agent, at least dt.")
 ZONE_WAIT_TIMEOUT = Param[float]("zone_wait_timeout", 30.0, "Sim seconds after reaching a teleport zone's wait pose or taking a spot before a rider not yet teleported leaves the zone and is routed again.")
 ZONE_LET_OUT_TIMEOUT = Param[float]("zone_let_out_timeout", 10.0, "Sim seconds of an open zone that a waiting rider leaves to those getting out before it boards anyway (0 = board at once).")
+ZONE_ROUTE_CHOICE = Param[bool]("zone_route_choice", False, "Walkers that climb also ride a stair or escalator half beside its partner where that is quicker than walking, the walks timed on the planner's congestion weights, and choose again every 5-10 s; false: only halves joined in place are timed against walking.")
 PUBLISH_MARKERS = Param[int]("publish_markers", 0, "RViz marker level: 0 = off, 1 = infrastructure, labels and interactions, 2 = full.", constraint=Range(0, 2))
 PROFILE_PHASES = Param[bool]("profile_phases", False, "Time the tick phases.")
 PROFILE_INTERVAL = Param[int]("profile_interval", 0, "Log the tick phase profile every N ticks (0 = never).")
@@ -104,6 +105,7 @@ AGENT_MANAGER_PARAMS = (
     ARRIVAL_TAU_BRAKE,
     ZONE_WAIT_TIMEOUT,
     ZONE_LET_OUT_TIMEOUT,
+    ZONE_ROUTE_CHOICE,
     PUBLISH_MARKERS,
     PROFILE_PHASES,
     PROFILE_INTERVAL,
