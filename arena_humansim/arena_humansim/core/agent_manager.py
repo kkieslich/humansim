@@ -51,6 +51,7 @@ from arena_humansim_msgs.srv import (
     SetWaypoints,
     SetZoneAccess,
     SpawnAgents,
+    StartClock,
     TeleportAgents,
     UpdateRobot,
 )
@@ -198,6 +199,8 @@ _RECONFIGURABLE_PARAMS = _TUNABLE_PARAMS | {
     "gesture_mode",
     # takes effect at the next reset or remove-all, the running crowd keeps its streams
     "seed",
+    # takes effect at the next reset or remove-all
+    "start_on_request",
 }
 
 _EXTERNAL_TIMEOUT_S = 2.0
@@ -518,6 +521,9 @@ class AgentManager(TimeNode):
         self._subsystem_epoch_ns: int = 0
         self._last_clock_ns: int = -1
         self._last_frame: AgentFrameMsg | None = None
+        # start_on_request: no tick until start_clock, which gives the epoch of the next first tick
+        self._clock_held = False
+        self._start_epoch_ns: int | None = None
         self._pending_scenario_spawns: deque[tuple[int, AgentStateMsg]] = deque()
         self._scenario_awareness_overrides: dict[int, AwarenessSpec] = {}
         self._pending_stimuli: deque[tuple[int, int, str, float]] = deque()
@@ -668,6 +674,11 @@ class AgentManager(TimeNode):
             ResetSimulation,
             "reset",
             self._reset_callback,
+        )
+        self._start_clock_srv = self.create_service(
+            StartClock,
+            "start_clock",
+            self._start_clock_callback,
         )
         self._get_profile_srv = self.create_service(
             GetProfile,
@@ -2223,9 +2234,14 @@ class AgentManager(TimeNode):
 
     def _subsystem_timer_callback(self, msg: Clock):
         now_ns = msg.clock.sec * 1_000_000_000 + msg.clock.nanosec
+        if self._clock_held:
+            return
         if self._tick_count == 0:
+            epoch_ns = now_ns if self._start_epoch_ns is None else self._start_epoch_ns
+            if now_ns < epoch_ns:
+                return
             self._publish_world_geometry()
-            self._subsystem_epoch_ns = now_ns
+            self._subsystem_epoch_ns = epoch_ns
         dt_ns = int(self._dt * 1e9)
         covered = (now_ns - self._subsystem_epoch_ns) // dt_ns + 1
         owed = covered - self._tick_count
@@ -2242,6 +2258,31 @@ class AgentManager(TimeNode):
             self._accumulated_spawned.extend(self._last_spawned_ids)
             self._accumulated_despawned.extend(self._last_despawned_ids)
         self._check_overrun(time.perf_counter() - t0)
+
+    def _hold_clock(self) -> None:
+        """A reset or remove-all just set the tick count back: with `start_on_request` no tick runs until start_clock."""
+        self._start_epoch_ns = None
+        self._clock_held = self._mode == MODE_SUBSYSTEM and bool(self.get_parameter("start_on_request").value)
+
+    def _start_clock_callback(
+        self,
+        request: StartClock.Request,
+        response: StartClock.Response,
+    ) -> StartClock.Response:
+        """Release a clock held since the last reset or remove-all: the first tick is stamped `epoch`, tick k `epoch + k * dt`.
+
+        A crowd started at the same epoch is the same crowd at the same stamps, however far the clock moved while it was held.
+        """
+        if self._tick_count > 0:
+            response.success = False
+            response.message = f"ticking since {self._subsystem_epoch_ns} ns ({self._tick_count} ticks), a reset or remove-all starts a new clock"
+            return response
+        self._start_epoch_ns = request.epoch.sec * 1_000_000_000 + request.epoch.nanosec
+        self._clock_held = False
+        response.success = True
+        response.message = f"first tick at {self._start_epoch_ns} ns"
+        self._logger.info(response.message)
+        return response
 
     def _feedback_callback(
         self,
@@ -2888,6 +2929,7 @@ class AgentManager(TimeNode):
             self._next_agent_id = 1
             self._next_robot_id = -1
             self._tick_count = 0
+            self._hold_clock()
             response.success = True
             response.message = f"Removed all {count} agent(s)"
         else:
@@ -2955,6 +2997,7 @@ class AgentManager(TimeNode):
         self._next_robot_id = -1
         self._tick_count = 0
         self._sim_time_ns = 0
+        self._hold_clock()
         self._last_spawned_ids = []
         self._last_despawned_ids = []
         self._pinned.clear()
