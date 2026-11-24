@@ -32,6 +32,7 @@ ANIMATION = Param[str]("animation", "noop", "Animation module name.")
 COLLISION = Param[str]("collision", "wall_projection", "Collision resolver module name.")
 OCCLUSION = Param[str]("occlusion", "bitmap", "Occlusion module name.")
 FRAME_ID = Param[str]("frame_id", "map", "TF frame stamped on every published pose, wall and marker.")
+START_ON_REQUEST = Param[bool]("start_on_request", False, "Subsystem mode: after a reset or remove-all, tick only once start_clock gives the epoch of the first tick.")
 MODE = Param[str]("mode", MODE_MASTER, "master owns /clock and ticks on a wall timer, subsystem ticks on /clock.", constraint=Choices(MODE_MASTER, MODE_SUBSYSTEM))
 LOG_DIR = Param[str]("log_dir", "", "Directory for simulation replay logs (empty = no logging).")
 REPLAY_MODE = Param[str]("replay_mode", "", "Replay log to load and play back (empty = no replay).")
@@ -77,6 +78,7 @@ AGENT_MANAGER_PARAMS = (
     OCCLUSION,
     FRAME_ID,
     MODE,
+    START_ON_REQUEST,
     LOG_DIR,
     REPLAY_MODE,
     WAYPOINT_THRESHOLD,
