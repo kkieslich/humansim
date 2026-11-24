@@ -677,7 +677,7 @@ class NavMeshPlanner(GlobalPlanner):
             elif (tick - moved[2]) * self._dt >= TURN_STUCK_S:
                 stuck.add(aid)
         claims: dict[int, tuple[float, float, int]] = {}
-        for aid, (_, _, narrow, _, phase) in seen.items():
+        for aid, (_, _, narrow, _, _) in seen.items():
             mouth = narrow.points[0]
             claim = self._turn_claims.get(aid)
             if claim is None or math.hypot(claim[0] - mouth[0], claim[1] - mouth[1]) > 1.0:
