@@ -304,7 +304,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
             del self._blockers[aid]
         for aid in [a for a in self._waited if a not in walkers]:
             del self._waited[aid]
-        for aid, robots in self._blockers.items():
+        for robots in self._blockers.values():
             for rid in [r for r, (x, y, _) in robots.items() if r not in still or math.hypot(still[r][0] - x, still[r][1] - y) > 1e-9]:
                 del robots[rid]
         window = max(1, round(BLOCK_WAIT_S / self._dt))
