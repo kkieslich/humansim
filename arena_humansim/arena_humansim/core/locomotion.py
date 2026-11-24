@@ -310,6 +310,10 @@ class LocomotionExtension(PoolAware):
         mode = np.where(rotate_done, MODE_NORMAL, mode)
         self.cooldown[rec] = np.where(rotate_done, COOLDOWN_S, self.cooldown[rec])
         self.stall_timer[rec] = np.where(rotate_done, 0.0, self.stall_timer[rec])
+        # progress after a recovery counts from where the manoeuvre left the row: the reverse moved it away from its goal on
+        # purpose, and measured against the best distance before it every reverse looked like a fresh stall (reverse again
+        # after RESTALL_AFTER_S unless it regained reverse_m + IMPROVE_M within that second): a reverse loop in a crowd
+        self.best_goal_dist[rec] = np.where(rotate_done, dist, self.best_goal_dist[rec])
 
         threshold = np.where(self.cooldown[rec] > 0.0, np.minimum(self.stall_after[rec], RESTALL_AFTER_S), self.stall_after[rec])
         stalled = tracked & (mode == MODE_NORMAL) & ~rotate_done & (self.stall_timer[rec] >= threshold)
