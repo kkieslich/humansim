@@ -70,6 +70,18 @@ Paths keep `comfort_radius` clearance from walls where the passage allows it, an
 
 Agents and targets beyond the meshed area are joined to it by a straight leg, or routed directly when the straight line is clear.
 
+### Crowd flow
+
+The navmesh shapes every route it plans for the crowd, whether or not its walker follows a [pedestrian lane](../../../README.md#pedestrian-lanes):
+
+- Width: an agent routes with its own radius plus `clearance_margin` from the walls (rounded up to 0.05 m, one router per clearance), and with the inflation radius where no route keeps that.
+- Side: a route's inner corners move `lane_offset` to `lane_side` where the walkers' bodies keep 0.05 m from the walls (the whole offset, half, or none), so opposite directions keep to opposite sides of a passage. `sfm` (and `hsfm`) add a sideways share `side_bias` of the push from an oncoming walker towards the same side.
+- Congestion: every `congestion_interval` seconds each mesh edge is weighted by how much slower walkers move at the density within 1.5 m of it (Weidmann 1993, capped at 20x), so routes avoid jams.
+- Stalls: an agent that moved less than 0.3 m in `stall_time` seconds plans anew (`GlobalPlanner._stalled`), on the congestion weights where they are on.
+- Narrow gaps: an agent the crowd pushed into a gap narrower than the inflation radius, with a route to its target before, walks back out along a body-radius route to the first point within 3 m that keeps the inflation radius (`_escape`).
+
+The windows count `compute` calls of `dt x bt_tick_interval` sim seconds (`set_timing`). A walker on a pedestrian lane track walks its track's legs (at most 3 m, `DIRECT_RANGE`) straight where the line between is clear, so the route shaping above leaves its track as the lane built it; the side bias, stall replanning and escape apply to it as to anyone. `paths` (the stair ride timing) plans its legs at the inflation radius without any agent's state.
+
 ## Shared helpers
 
 - `simplify_path(waypoints, min_area=0.01)` - Visvalingam-Whyatt decimation, in the base module. Use this before returning paths so LOS-connected runs collapse to endpoints.

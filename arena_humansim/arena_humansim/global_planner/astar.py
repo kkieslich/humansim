@@ -4,6 +4,7 @@ import math
 import os
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import numpy as np
 import pyastar2d
@@ -92,7 +93,7 @@ class AStarPlanner(GlobalPlanner):
 
         self._pool = ThreadPoolExecutor(max_workers=max((os.cpu_count() or 2) - 1, 1))
 
-    def configure(self, *, inflation_radius: float, resolution: float, comfort_radius: float) -> None:
+    def configure(self, *, inflation_radius: float, resolution: float, comfort_radius: float, **_: Any) -> None:  # noqa: ANN401
         if (inflation_radius, resolution) == (self._inflation_radius, self._resolution):
             return
         self._inflation_radius = inflation_radius

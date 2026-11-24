@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 from scipy.ndimage import binary_dilation
@@ -177,7 +178,7 @@ class DijkstraPlanner(GlobalPlanner):
         self._free_labels: np.ndarray | None = None
         self._origin: Pose2D = Pose2D()
 
-    def configure(self, *, inflation_radius: float, resolution: float, comfort_radius: float) -> None:
+    def configure(self, *, inflation_radius: float, resolution: float, comfort_radius: float, **_: Any) -> None:  # noqa: ANN401
         if (inflation_radius, resolution) == (self._inflation_radius, self._resolution):
             return
         self._inflation_radius = inflation_radius

@@ -110,7 +110,7 @@ from arena_humansim.core.spawn_scheduler import SpawnScheduler
 from arena_humansim.core.teleport_zones import TeleportZones, Zone
 from arena_humansim.core.viz import MarkerPublisher, publish_infrastructure, publish_module_markers
 from arena_humansim.core.world_knowledge import FormationSpec, WorldKnowledge, WorldObject
-from arena_humansim.global_planner import GlobalPlanner
+from arena_humansim.global_planner import LANE_SIDES, GlobalPlanner
 from arena_humansim.local_planner import LocalPlanner
 from arena_humansim.occlusion import Occluder
 from arena_humansim.params import AGENT_MANAGER_PARAMS, GESTURE_ENABLED, MODE_MASTER, MODE_SUBSYSTEM
@@ -191,6 +191,11 @@ _RECONFIGURABLE_PARAMS = _TUNABLE_PARAMS | {
     "global_planner.inflation_radius",
     "global_planner.resolution",
     "global_planner.comfort_radius",
+    "global_planner.clearance_margin",
+    "global_planner.lane_side",
+    "global_planner.lane_offset",
+    "global_planner.congestion_interval",
+    "global_planner.stall_time",
     "local_planner",
     "publish_markers",
     "rtf",
@@ -437,6 +442,7 @@ class AgentManager(TimeNode):
         self._policy_names = [self._module_selections["local_planner"]]
         self._policy_name_to_idx = {self._module_selections["local_planner"]: 0}
         self._policies = [self._local_planner]
+        self._set_side(self._local_planner)
         self._interaction_manager = InteractionManager(rng_manager=self._rng)
         self._interaction_manager.set_contact_mode(
             str(self.get_parameter("contact_mode").value),
@@ -822,6 +828,8 @@ class AgentManager(TimeNode):
         for name, registry in (("local_planner", LocalPlanner), ("global_planner", GlobalPlanner)):
             if name in incoming and incoming[name] not in registry.list_available():
                 return SetParametersResult(successful=False, reason=f"{name}: unknown module {incoming[name]!r}, available: {', '.join(registry.list_available())}")
+        if "global_planner.lane_side" in incoming and incoming["global_planner.lane_side"] not in LANE_SIDES:
+            return SetParametersResult(successful=False, reason=f"global_planner.lane_side must be one of {', '.join(LANE_SIDES)}, not {incoming['global_planner.lane_side']!r}")
         return SetParametersResult(successful=True)
 
     def set_parameters_atomically(self, parameter_list: list[Parameter]) -> SetParametersResult:
@@ -964,7 +972,20 @@ class AgentManager(TimeNode):
             inflation_radius=self._float_param("global_planner.inflation_radius"),
             resolution=self._float_param("global_planner.resolution"),
             comfort_radius=self._float_param("global_planner.comfort_radius"),
+            clearance_margin=self._float_param("global_planner.clearance_margin"),
+            lane_side=str(self.get_parameter("global_planner.lane_side").value),
+            lane_offset=self._float_param("global_planner.lane_offset"),
+            congestion_interval=self._float_param("global_planner.congestion_interval"),
         )
+        # the global planner runs on behaviour-tree ticks: its windows count calls of dt * bt_tick_interval seconds
+        self._global_planner.set_timing(self._dt * self._bt_tick_interval, self._float_param("global_planner.stall_time"))
+        for planner in getattr(self, "_policies", ()):
+            self._set_side(planner)
+
+    def _set_side(self, planner: object) -> None:
+        """The lane side for a local planner that sidesteps oncoming walkers (`set_side`)."""
+        if hasattr(planner, "set_side"):
+            planner.set_side(str(self.get_parameter("global_planner.lane_side").value))
 
     def _attach_late(self, planner: LocalPlanner | GlobalPlanner) -> None:
         """Wire a planner created after __init__ into the pool and the walls."""
@@ -974,6 +995,7 @@ class AgentManager(TimeNode):
         segments = self._walls_of(planner, self._all_wall_segments())
         if segments:
             planner.set_walls(segments)
+        self._set_side(planner)
 
     def _resolve_policy_idx(self, name: str) -> int:
         if not name:

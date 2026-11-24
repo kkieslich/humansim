@@ -225,6 +225,11 @@ Config format and stage semantics: [`config/benchmark/README.md`](arena_humansim
 | `global_planner.inflation_radius` | `0.38` | Wall clearance of planned paths (m), rounded up to whole grid cells |
 | `global_planner.resolution` | `0.2` | Planning grid cell size (m), grid planners only |
 | `global_planner.comfort_radius` | `0.6` | Preferred wall clearance of navmesh paths (m), relaxed in narrow passages, navmesh only |
+| `global_planner.clearance_margin` | `0.25` | Navmesh: each agent routes with its own radius plus this margin from the walls where a route keeps it, else with the inflation radius; `0` routes every agent with the inflation radius |
+| `global_planner.lane_side` | `right` | Navmesh: the side of a passage routes keep to (`right`, `left`, `none`), and the side `sfm` walkers sidestep to from an oncoming walker |
+| `global_planner.lane_offset` | `0.76` | Navmesh: how far a route's inner corners move to the lane side where the clearance allows (the whole offset, half of it, or none), m |
+| `global_planner.congestion_interval` | `5.0` | Navmesh: every this many sim seconds routes weigh each passage by its current density (Weidmann's speed-density relation), `0` = off |
+| `global_planner.stall_time` | `8.0` | An agent that moves less than 0.3 m in this many sim seconds plans its route anew, `0` = never |
 | `local_planner` | `sfm` | Default local planner module name |
 | `local_planner.<key>` | `0` | Mean of a local planner param (`relaxation_time`, `repulsion_strength`, `repulsion_range`, `anisotropy`, and for `hsfm` `lateral_gain`, `lateral_damping`, `angular_gain`, `angular_damping`). `0` leaves the agent type's own value |
 | `animation` | `noop` | Animation module name |
@@ -265,6 +270,7 @@ A `set_parameters` call on a running node is validated and stored at once and ta
 | Parameter | Effect at the reset |
 |---|---|
 | `global_planner.inflation_radius`, `global_planner.resolution`, `global_planner.comfort_radius` | The planner rebuilds its grid or mesh from the current walls and drops cached paths |
+| `global_planner.clearance_margin`, `global_planner.lane_side`, `global_planner.lane_offset`, `global_planner.congestion_interval`, `global_planner.stall_time` | The navmesh drops its per-clearance routers and cached paths, the local planners take the new lane side |
 | `global_planner`, `local_planner` | The module is created on first use and gets the current walls and pool. An unknown module name is rejected at the set |
 | `local_planner.<key>` | Mean of a local planner param (`relaxation_time`, `repulsion_strength`, ...). It replaces the mean of the agent type and keeps its spread. `0` leaves the agent type's own value. Declared for the keys of the startup planner and of every planner selected through `local_planner` |
 | `waypoint_threshold`, `min_speed_for_heading`, `arrival_r_enter`, `arrival_r_exit`, `arrival_tau_brake`, `zone_wait_timeout`, `zone_let_out_timeout`, `force_local_planner`, `profile_phases`, `profile_interval` | The node re-reads them. `arrival_r_enter` must stay below `arrival_r_exit` |
