@@ -29,7 +29,12 @@ LANE_SIDES = ("none", "right", "left")
 #: move further in (the wall), so the other one's offset is all the room between them [m]
 LANE_OFFSET_M = 0.76
 GLOBAL_PLANNER_COMFORT_RADIUS = Param[float]("global_planner.comfort_radius", 0.6, "Preferred wall clearance of navmesh paths in meters, relaxed in narrow passages.", constraint=Range(0.0, 5.0))
-GLOBAL_PLANNER_CLEARANCE_MARGIN = Param[float]("global_planner.clearance_margin", 0.25, "Navmesh: each agent routes with its own radius plus this margin from the walls where a route keeps it, else with the inflation radius; 0 routes every agent with the inflation radius [m]. 0.25 lies between the 0.20 m (corridor walls) and 0.46 m (wide concourses) boundary layers of Pauls' effective-width model.", constraint=Range(0.0, 2.0))
+GLOBAL_PLANNER_CLEARANCE_MARGIN = Param[float](
+    "global_planner.clearance_margin",
+    0.25,
+    "Navmesh: each agent routes with its own radius plus this margin from the walls where a route keeps it, else with the inflation radius; 0 routes every agent with the inflation radius [m]. 0.25 lies between the 0.20 m (corridor walls) and 0.46 m (wide concourses) boundary layers of Pauls' effective-width model.",
+    constraint=Range(0.0, 2.0),
+)
 GLOBAL_PLANNER_LANE_SIDE = Param[str]("global_planner.lane_side", "right", "Navmesh: the side of a passage a route keeps to, relative to the walking direction; a consistent side preference makes counter-flows separate into lanes (Helbing et al. 2001; Moussaid et al. 2009).", constraint=Choices(*LANE_SIDES))
 GLOBAL_PLANNER_LANE_OFFSET = Param[float]("global_planner.lane_offset", LANE_OFFSET_M, "Navmesh: how far a route's inner corners move to the lane side where the clearance allows (the whole offset, half of it, or none) [m]; 0.76 is Fruin's walking lane.", constraint=Range(0.0, 2.0))
 GLOBAL_PLANNER_CONGESTION_INTERVAL = Param[float]("global_planner.congestion_interval", 5.0, "Navmesh: every this many seconds routes weigh each passage by how much slower walkers move there at its current density, by Weidmann's speed-density relation (0 = off) [s].", constraint=Range(0.0, 600.0))
