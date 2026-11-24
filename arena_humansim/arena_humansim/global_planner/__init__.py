@@ -10,7 +10,7 @@ import attrs
 import numpy as np
 
 from arena_humansim.core.agents import BaseAgent
-from arena_humansim.core.pool import PoolAware
+from arena_humansim.core.pool import KIND_ROBOT, PoolAware
 from arena_humansim.params import LANE_OFFSET_M, LANE_SIDES  # noqa: F401 - the node parameters' defaults, re-exported
 from arena_humansim.utils import ModuleRegistry
 from arena_humansim.utils.loggable import Loggable
@@ -29,6 +29,14 @@ PlanRequest = tuple[int, Pose2D, Pose2D]
 DIRECT_RANGE = 3.0
 #: An agent that moves less than this in `stall_time` seconds has stalled [m]
 STALL_M = 0.3
+#: A robot that moves less than `ROBOT_STILL_M` [m] in `ROBOT_STILL_S` [s] stands still (parked, docked, waiting, jammed):
+#: a walker it blocks may plan round it. A moving robot is never on a walker's map; local forces handle it.
+ROBOT_STILL_S, ROBOT_STILL_M = 3.0, 0.15
+#: A walker blocked by a robot that stands still: its body within `BLOCK_NEAR` [m] of the robot's body, and it moved less
+#: than `STALL_M` in the last `BLOCK_WAIT_S` [s] (it waited that long before it goes round)
+BLOCK_NEAR, BLOCK_WAIT_S = 0.6, 2.0
+
+Robots = dict[int, tuple[float, float, float]]
 
 
 def simplify_path(
@@ -103,6 +111,12 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         self._tick = 0
         self._stall_time = 0.0
         self._progress: dict[int, tuple[float, float, int]] = {}
+        #: the robots of the next `compute` (id: x, y, radius), where each stands since (x, y, tick), and per walker the
+        #: robots standing still that blocked it (id: x, y, radius where it stands); a walker's progress over `BLOCK_WAIT_S`
+        self._robots: Robots = {}
+        self._robot_since: dict[int, tuple[float, float, int]] = {}
+        self._blockers: dict[int, Robots] = {}
+        self._waited: dict[int, tuple[float, float, int]] = {}
         self._warmup()
 
     def _warmup(self) -> None:
@@ -135,6 +149,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
                 distances = min_distances_to_paths(positions, [points for _, _, points in tracked])
                 deviations = dict(zip([agent_id for agent_id, _, _ in tracked], distances.tolist(), strict=True))
         unchanged = {aid for aid, d in deviations.items() if d <= self._replan_distance and self._path_cache[aid][0] == (round(navigate[aid].x, 3), round(navigate[aid].y, 3))}
+        self._note_blockers(agents, agent_positions)
         blind = self._blind(unchanged, agent_positions) | self._stalled(unchanged, agent_positions)
         unchanged -= blind
         straight = [aid for aid, target in navigate.items() if has_map and aid not in unchanged and (pos := agent_positions.get(aid)) is not None and (math.hypot(target.x - pos.x, target.y - pos.y) <= DIRECT_RANGE or (aid in deviations and self._path_cache[aid][3] >= len(self._path_cache[aid][1]) - 2))]
@@ -258,6 +273,56 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         """Walking cost of a planned path [m]: its length, weighted by congestion where the planner weighs it."""
         return float(sum(math.hypot(b.x - a.x, b.y - a.y) for a, b in zip(path, path[1:], strict=False)))
 
+    def set_robots(self, robots: Robots) -> None:
+        """The robots the walkers of the next `compute` share the floor with (id: x, y, body radius). Only a robot that
+        stands still for `ROBOT_STILL_S` counts for routes, and only for the walkers it blocks (`_note_blockers`)."""
+        self._robots = dict(robots)
+
+    def still_robots(self) -> Robots:
+        """The robots standing still for `ROBOT_STILL_S` at the last `compute`: id, where they stand and their radius."""
+        window = max(1, round(ROBOT_STILL_S / self._dt))
+        return {rid: (anchor[0], anchor[1], self._robots[rid][2]) for rid, anchor in self._robot_since.items() if rid in self._robots and self._tick - anchor[2] >= window}
+
+    def blockers(self) -> dict[int, Robots]:
+        """Per walker the robots standing still that blocked it and that its routes go round."""
+        return {aid: dict(robots) for aid, robots in self._blockers.items() if robots}
+
+    def _note_blockers(self, agents: list[BaseAgent], positions: dict[int, Pose2D]) -> None:
+        """Track which robots stand still and which walkers they block. A walker is blocked by a robot standing still for
+        `ROBOT_STILL_S` where its body is within `BLOCK_NEAR` of the robot's body and it moved less than `STALL_M` in the
+        last `BLOCK_WAIT_S`: from then on its routes go round that robot (`_reroute`) until the robot moves again. Runs at
+        the start of each `compute`, before its tick is counted."""
+        for rid, (x, y, _) in self._robots.items():
+            anchor = self._robot_since.get(rid)
+            if anchor is None or math.hypot(x - anchor[0], y - anchor[1]) > ROBOT_STILL_M:
+                self._robot_since[rid] = (x, y, self._tick)
+        for rid in [r for r in self._robot_since if r not in self._robots]:
+            del self._robot_since[rid]
+        still = self.still_robots()
+        walkers = {a.state.agent_id for a in agents if int(getattr(a.state, "kind", 0)) != KIND_ROBOT}
+        for aid in [a for a in self._blockers if a not in walkers]:
+            del self._blockers[aid]
+        for aid in [a for a in self._waited if a not in walkers]:
+            del self._waited[aid]
+        for aid, robots in self._blockers.items():
+            for rid in [r for r, (x, y, _) in robots.items() if r not in still or math.hypot(still[r][0] - x, still[r][1] - y) > 1e-9]:
+                del robots[rid]
+        window = max(1, round(BLOCK_WAIT_S / self._dt))
+        for aid in walkers:
+            pos = positions.get(aid)
+            if pos is None:
+                continue
+            anchor = self._waited.get(aid)
+            if anchor is None or math.hypot(pos.x - anchor[0], pos.y - anchor[1]) > STALL_M:
+                self._waited[aid] = (pos.x, pos.y, self._tick)
+                continue
+            if not still or self._tick - anchor[2] < window:
+                continue
+            radius = self._radius_of(aid)
+            for rid, (x, y, r) in still.items():
+                if math.hypot(pos.x - x, pos.y - y) - r - radius <= BLOCK_NEAR:
+                    self._blockers.setdefault(aid, {})[rid] = (x, y, r)
+
     def _sees(self, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
         """Whether each straight leg is walkable as a whole path."""
         if self._wall_grid is None or self._wall_grid[0] is not self._wall_segments:
@@ -283,6 +348,9 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         hand a new agent the path and progress of the agent that had its id in the previous episode."""
         self._path_cache.clear()
         self._cached_results = {}
+        self._blockers.clear()
+        self._waited.clear()
+        self._robot_since.clear()
 
     def configure(self, *, inflation_radius: float, resolution: float, comfort_radius: float, **_: Any) -> None:  # noqa: ANN401
         """Planner settings; a planner ignores the ones it has no use for (the grid planners: clearance margin, lanes)."""

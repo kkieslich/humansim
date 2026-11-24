@@ -1652,7 +1652,9 @@ class AgentManager(TimeNode):
                     needs_subgoal_ids.add(int(pool.agent_ids[i]))
             subgoal_agents = [a for a in agents if a.state.agent_id in needs_subgoal_ids]
             steered = self._zones.steer(subgoal_agents, self._high_level_cmds, now=self._tick_count * self._dt)
+            robots = self._robot_bodies(pool)
             for planner, group in _group_by(subgoal_agents, key=lambda a: a.global_planner):
+                planner.set_robots(robots)
                 planner.compute(group, steered)
 
             self._cached_intermediate_goals = {}
@@ -2220,6 +2222,14 @@ class AgentManager(TimeNode):
         breakdown = ", ".join(f"{name}={ms:.1f}ms" for name, ms in phases.items() if ms > 0.5)
         self._logger.warn(f"sim cannot keep up: tick took {elapsed * 1000:.1f}ms (budget {self._dt * 1000:.1f}ms), {self._overrun_count} overrun(s) since last report, {self._pool.n} agents" + (f" [{breakdown}]" if breakdown else ""))
         self._overrun_count = 0
+
+    @staticmethod
+    def _robot_bodies(pool: AgentPool) -> dict[int, tuple[float, float, float]]:
+        """Where each robot-kind agent stands and its body radius (id: x, y, radius), for the global planners: a robot
+        standing still is on the routes of the walkers it blocks."""
+        n = pool.n
+        rows = np.flatnonzero(pool.kind[:n] == KIND_ROBOT)
+        return {int(pool.agent_ids[i]): (float(pool.pos[i, 0]), float(pool.pos[i, 1]), float(pool.agent_radius[i])) for i in rows}
 
     def _robots_done(self) -> bool:
         pool = self._pool
