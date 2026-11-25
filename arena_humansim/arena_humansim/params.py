@@ -49,6 +49,12 @@ COLLISION = Param[str]("collision", "wall_projection", "Collision resolver modul
 OCCLUSION = Param[str]("occlusion", "bitmap", "Occlusion module name.")
 FRAME_ID = Param[str]("frame_id", "map", "TF frame stamped on every published pose, wall and marker.")
 START_ON_REQUEST = Param[bool]("start_on_request", False, "Subsystem mode: after a reset or remove-all, tick only once start_clock gives the epoch of the first tick.")
+INPUT_BARRIER = Param[bool](
+    "input_barrier",
+    False,
+    "Subsystem mode: tick k+1 runs only once a world_state stamped with tick k's stamp has come in, the orchestrator's sign that every input it decided on tick k's frame is in, so each input lands between the same two ticks in every run.",
+)
+INPUT_BARRIER_TIMEOUT = Param[float]("input_barrier_timeout", 10.0, "Wall seconds a tick waits for its input barrier before it runs without it (and the run stops being input-deterministic), 0 = wait forever.")
 MODE = Param[str]("mode", MODE_MASTER, "master owns /clock and ticks on a wall timer, subsystem ticks on /clock.", constraint=Choices(MODE_MASTER, MODE_SUBSYSTEM))
 LOG_DIR = Param[str]("log_dir", "", "Directory for simulation replay logs (empty = no logging).")
 REPLAY_MODE = Param[str]("replay_mode", "", "Replay log to load and play back (empty = no replay).")
@@ -101,6 +107,8 @@ AGENT_MANAGER_PARAMS = (
     FRAME_ID,
     MODE,
     START_ON_REQUEST,
+    INPUT_BARRIER,
+    INPUT_BARRIER_TIMEOUT,
     LOG_DIR,
     REPLAY_MODE,
     WAYPOINT_THRESHOLD,

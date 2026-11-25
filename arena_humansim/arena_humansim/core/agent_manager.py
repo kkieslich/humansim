@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import array
+import hashlib
+import json
 import math
+import os
 import time
 from collections import deque
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
@@ -12,6 +15,7 @@ import attrs
 import numpy as np
 import rclpy
 import rclpy.executors
+import rclpy.service
 import rclpy.subscription
 import rclpy.timer
 from arena_humansim_msgs.msg import AgentFrame as AgentFrameMsg
@@ -66,6 +70,7 @@ from rclpy.clock import Clock as RclClock
 from rclpy.clock import ClockType
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.serialization import serialize_message
 from rosgraph_msgs.msg import Clock
 from std_msgs.msg import Header
 
@@ -207,7 +212,12 @@ _RECONFIGURABLE_PARAMS = _TUNABLE_PARAMS | {
     "seed",
     # takes effect at the next reset or remove-all
     "start_on_request",
+    "input_barrier",
+    "input_barrier_timeout",
 }
+
+#: jsonl file the engine writes every input it takes to, with the tick it lands before (debugging run-to-run differences)
+_INPUT_TRACE = os.environ.get("HS_INPUT_TRACE", "")
 
 _EXTERNAL_TIMEOUT_S = 2.0
 _EXTERNAL_ADOPT_RADIUS = 1.0
@@ -235,7 +245,8 @@ class _ExternalEntity:
     saved_policy_idx: int | None = None
     vel: tuple[float, float] = (0.0, 0.0)
     pose: tuple[float, float] | None = None
-    stamp: float = 0.0
+    #: header stamp of the last fed pose in ns: velocities from whole-ns differences are the same floats on every epoch
+    stamp_ns: int = 0
 
 
 _NP_TYPES: dict[str, type[np.generic]] = {"B": np.uint8, "H": np.uint16, "h": np.int16, "i": np.int32, "I": np.uint32, "f": np.float32, "d": np.float64}
@@ -534,6 +545,12 @@ class AgentManager(TimeNode):
         # start_on_request: no tick until start_clock, which gives the epoch of the next first tick
         self._clock_held = False
         self._start_epoch_ns: int | None = None
+        # input_barrier: stamp of the newest tick the orchestrator has acknowledged with a world_state, the clock time
+        # the barrier holds back (None while nothing waits) and since when, in wall seconds, nothing has moved
+        self._barrier_ns: int = -1
+        self._barrier_covered: int | None = None
+        self._barrier_wait_since: float | None = None
+        self._barrier_timeouts = 0
         self._pending_scenario_spawns: deque[tuple[int, AgentStateMsg]] = deque()
         self._scenario_awareness_overrides: dict[int, AwarenessSpec] = {}
         self._pending_stimuli: deque[tuple[int, int, str, float]] = deque()
@@ -1482,6 +1499,25 @@ class AgentManager(TimeNode):
             if entity.agent_id == aid:
                 del self._external_entities[ext_id]
 
+    def create_service(self, srv_type: Any, srv_name: str, callback: Callable[..., Any], **kwargs: Any) -> rclpy.service.Service:  # noqa: ANN401
+        """With HS_INPUT_TRACE set, every request a service takes is noted with the tick it lands before."""
+        if _INPUT_TRACE and srv_name != "get_profile":
+            inner = callback
+
+            def callback(request: Any, response: Any) -> Any:  # noqa: ANN401
+                detail = {key: getattr(request, key) for key in ("agent_id", "stimulus", "intensity") if isinstance(getattr(request, key, None), int | float | str)}
+                self._trace_input(srv_name, serialize_message(request), **detail)
+                return inner(request, response)
+
+        return super().create_service(srv_type, srv_name, callback, **kwargs)
+
+    def _trace_input(self, name: str, payload: bytes, **extra: object) -> None:
+        trace = getattr(self, "_input_trace_file", None)
+        if trace is None:
+            trace = self._input_trace_file = open(_INPUT_TRACE, "a", buffering=1)  # noqa: SIM115
+        record = {"tick": getattr(self, "_tick_count", 0), "clock_ns": getattr(self, "_last_clock_ns", -1), "input": name, "digest": hashlib.blake2b(payload, digest_size=6).hexdigest(), **extra}
+        trace.write(json.dumps(record) + "\n")
+
     def _phase_end(self, name: str, t0: float):
         self._tick_phases[name] = (time.perf_counter() - t0) * 1000.0
 
@@ -2198,6 +2234,7 @@ class AgentManager(TimeNode):
             "feedback",
             self._feedback_callback,
         )
+        self._barrier_timer = self.create_timer(0.25, self._barrier_watchdog, clock=RclClock(clock_type=ClockType.STEADY_TIME))
 
     def _forget_agents(self) -> None:
         """Clear what every global planner keeps per agent id, for a crowd that numbers its agents from 1 again."""
@@ -2289,7 +2326,7 @@ class AgentManager(TimeNode):
                 return
             self._publish_world_geometry()
             self._subsystem_epoch_ns = epoch_ns
-        dt_ns = int(self._dt * 1e9)
+        dt_ns = self._dt_ns
         covered = (now_ns - self._subsystem_epoch_ns) // dt_ns + 1
         owed = covered - self._tick_count
         if owed <= 0:
@@ -2298,6 +2335,42 @@ class AgentManager(TimeNode):
             self._last_clock_ns = max(self._last_clock_ns, now_ns)
             return
         self._last_clock_ns = now_ns
+        self._run_owed(covered)
+
+    @property
+    def _dt_ns(self) -> int:
+        return int(self._dt * 1e9)
+
+    def _barrier_allows(self) -> int | None:
+        """How many ticks the input barrier lets the clock have run, None without a barrier.
+
+        Tick 0 takes the inputs given before the clock started; tick k + 1 runs once a world_state stamped with tick k's
+        stamp has come in. An orchestrator sends that world_state after the frame of tick k, once every input it decided
+        for tick k is in, so each input lands between the same two ticks however the messages race.
+        """
+        if self._mode != MODE_SUBSYSTEM or not bool(self.get_parameter("input_barrier").value):
+            return None
+        if self._barrier_ns < self._subsystem_epoch_ns:
+            return 1
+        dt_ns = self._dt_ns
+        return (self._barrier_ns - self._subsystem_epoch_ns + dt_ns // 2) // dt_ns + 2
+
+    def _run_owed(self, covered: int, force: bool = False) -> None:
+        """Run the ticks the clock has covered up to `covered` ticks in all, as far as the input barrier lets them."""
+        target = covered
+        allowed = None if force else self._barrier_allows()
+        if allowed is not None and allowed < covered:
+            target = allowed
+            if self._barrier_covered is None or self._barrier_wait_since is None or target > self._tick_count:
+                self._barrier_wait_since = time.perf_counter()
+            self._barrier_covered = covered
+        else:
+            self._barrier_covered = None
+            self._barrier_wait_since = None
+        owed = target - self._tick_count
+        if owed <= 0:
+            return
+        dt_ns = self._dt_ns
         t0 = time.perf_counter()
         for _ in range(owed):
             self._sim_time_ns = self._tick_count * dt_ns
@@ -2306,10 +2379,25 @@ class AgentManager(TimeNode):
             self._accumulated_despawned.extend(self._last_despawned_ids)
         self._check_overrun(time.perf_counter() - t0)
 
+    def _barrier_watchdog(self) -> None:
+        """Run ticks the input barrier has held back longer than `input_barrier_timeout` wall seconds without it."""
+        if self._barrier_covered is None or self._barrier_wait_since is None:
+            return
+        timeout = float(self._float_param("input_barrier_timeout"))
+        waited = time.perf_counter() - self._barrier_wait_since
+        if timeout <= 0.0 or waited < timeout:
+            return
+        self._barrier_timeouts += 1
+        self._logger.error(f"input barrier: no world_state for tick {self._tick_count - 1} in {waited:.1f} s, running ticks {self._tick_count}..{self._barrier_covered - 1} without it ({self._barrier_timeouts} time(s) this run): from here inputs can land a tick early or late, the run is not input-deterministic")
+        self._run_owed(self._barrier_covered, force=True)
+
     def _hold_clock(self) -> None:
         """A reset or remove-all just set the tick count back: with `start_on_request` no tick runs until start_clock."""
         self._start_epoch_ns = None
         self._clock_held = self._mode == MODE_SUBSYSTEM and bool(self.get_parameter("start_on_request").value)
+        self._barrier_ns = -1
+        self._barrier_covered = None
+        self._barrier_wait_since = None
 
     def _start_clock_callback(
         self,
@@ -2370,12 +2458,24 @@ class AgentManager(TimeNode):
 
     def _world_state_callback(self, msg: AgentStatesMsg):
         self._latest_world_state = msg
+        if self._mode != MODE_SUBSYSTEM or self._tick_count == 0:
+            return
+        # an acknowledgement names a tick that has run: a world_state stamped later (a pose sent ahead) releases nothing
+        stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        last_tick_ns = self._subsystem_epoch_ns + (self._tick_count - 1) * self._dt_ns
+        if self._barrier_ns < stamp_ns <= last_tick_ns:
+            self._barrier_ns = stamp_ns
+        if self._barrier_covered is not None:
+            self._run_owed(self._barrier_covered)
 
     def _consume_world_state(self) -> WorldState:
         world: WorldState = {}
         if self._latest_world_state is not None:
             stamp = self._latest_world_state.header.stamp
-            now = stamp.sec + stamp.nanosec * 1e-9
+            now_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+            if _INPUT_TRACE:
+                agents = self._latest_world_state.agents
+                self._trace_input("world_state", serialize_message(self._latest_world_state), stamp_ns=now_ns, n=len(agents), poses=[(a.name, a.pose.x, a.pose.y, a.velocity.x, a.velocity.y) for a in agents])
             for agent_msg in self._latest_world_state.agents:
                 world[agent_msg.agent_id] = WorldAgentState(
                     pose=Pose2D(
@@ -2385,13 +2485,13 @@ class AgentManager(TimeNode):
                     ),
                     velocity=(agent_msg.velocity.x, agent_msg.velocity.y),
                 )
-                self._ingest_external_agent(agent_msg, now)
+                self._ingest_external_agent(agent_msg, now_ns)
             self._latest_world_state = None
         self._expire_external_entities()
         self._apply_external_velocity_pins()
         return world
 
-    def _ingest_external_agent(self, agent_msg: AgentStateMsg, stamp: float) -> None:
+    def _ingest_external_agent(self, agent_msg: AgentStateMsg, stamp_ns: int) -> None:
         """Teleport the pool entity bound to this world_state id, binding or spawning it on first sight."""
         entity = self._external_entities.get(agent_msg.agent_id)
         if entity is None:
@@ -2413,13 +2513,13 @@ class AgentManager(TimeNode):
         radius = agent_msg.radius if agent_msg.radius > 0 else 0.3
         self._teleport_agent(entity.agent_id, agent_msg.pose.x, agent_msg.pose.y, agent_msg.pose.theta, radius)
         fed = (agent_msg.velocity.x, agent_msg.velocity.y)
-        entity.vel = fed if entity.saved_policy_idx is not None or any(fed) else self._velocity_between(entity, agent_msg.pose, stamp)
+        entity.vel = fed if entity.saved_policy_idx is not None or any(fed) else self._velocity_between(entity, agent_msg.pose, stamp_ns)
         entity.pose = (agent_msg.pose.x, agent_msg.pose.y)
-        entity.stamp = stamp
+        entity.stamp_ns = stamp_ns
 
-    def _velocity_between(self, entity: _ExternalEntity, pose: Pose2DMsg, stamp: float) -> tuple[float, float]:
+    def _velocity_between(self, entity: _ExternalEntity, pose: Pose2DMsg, stamp_ns: int) -> tuple[float, float]:
         """Velocity from the entity's previous fed pose to this one, zero across a stale gap or a jump."""
-        elapsed = stamp - entity.stamp
+        elapsed = (stamp_ns - entity.stamp_ns) / 1e9
         if entity.pose is None or not 0.0 < elapsed <= _EXTERNAL_VELOCITY_WINDOW_S:
             return (0.0, 0.0)
         vx = (pose.x - entity.pose[0]) / elapsed
@@ -2961,6 +3061,7 @@ class AgentManager(TimeNode):
             self._behavior_trees.clear()
             self._agent_name_to_id.clear()
             self._external_entities.clear()
+            self._latest_world_state = None  # robot poses sent for the old crowd would come back as mirrors at tick 0
             self._prone.clear()
             self._parked_from.clear()
             self._rising.clear()
