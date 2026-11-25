@@ -31,12 +31,17 @@ CHOICE_STAGGER = 20
 #: ... and a walker leaves its choice only for one quicker by this share of it, and at least by `SWITCH_M` of walking
 SWITCH_SHARE = 0.1
 SWITCH_M = 3.0
+#: Route choice: a stair is left out of a walker's choice, its way there unplanned, only where even the shortest way to it
+#: is slower than walking by more than this [s] (float rounding)
+PRICE_SLACK = 1e-6
 #: A stair half's hold keeps at least this from every wall, or no walker reaches its hold line and no one ever crosses [m]
 HOLD_CLEARANCE = 0.25
 #: A pedestrian on a stair flight stays this far short of its landing until it lands, so waiting fliers never stand on landings [m]
 FLIGHT_WAIT_GAP = 1.0
 #: Landing spots a flight tries when its own is taken: steps across the partner half, within its footprint [m]
 LANDING_STEP = 0.6
+#: `_box` reaches this far past a zone, so float rounding at its edge leaves no one out [m]
+BOX_PAD = 1e-6
 
 
 def _inside(pts: tuple[tuple[float, float], ...], x: float, y: float) -> bool:
@@ -60,6 +65,15 @@ def _slots(zone: Zone) -> tuple[Pose2D, ...]:
     spots = [Pose2D(x=x, y=y, theta=zone.hold.theta) for x in axes[0] for y in axes[1] if _inside(zone.footprint, x, y)]
     spots.sort(key=lambda p: -math.hypot(p.x - zone.entry.x, p.y - zone.entry.y))
     return tuple(spots) or (zone.hold,)
+
+
+def _box(zone: Zone) -> tuple[float, float, float, float]:
+    """A box (x0, y0, x1, y1) round every point `zone.contains`: its footprint, and its hold disc where that counts."""
+    xs, ys = [x for x, _ in zone.footprint], [y for _, y in zone.footprint]
+    if not zone.kind:
+        xs += [zone.hold.x - HOLD_RADIUS, zone.hold.x + HOLD_RADIUS]
+        ys += [zone.hold.y - HOLD_RADIUS, zone.hold.y + HOLD_RADIUS]
+    return min(xs) - BOX_PAD, min(ys) - BOX_PAD, max(xs) + BOX_PAD, max(ys) + BOX_PAD
 
 
 def _walk_time(path: list[Pose2D] | None, speed: float) -> float:
@@ -473,15 +487,22 @@ class TeleportZones:
         if not work:
             return out
 
-        def walked(w: dict, path: list[Pose2D] | None) -> float:
-            if not w["choose"]:
-                return _walk_time(path, w["speed"])
-            return math.inf if not path else planner.path_cost(path) / w["speed"]
+        def walked(ws: Sequence[dict], paths: Sequence[list[Pose2D] | None]) -> list[float]:
+            """The walk time of each walker's path, the congestion-weighted ones priced in one `path_costs` call."""
+            out = [math.inf if not path else _walk_time(path, w["speed"]) for w, path in zip(ws, paths, strict=True)]
+            weighed = [(k, path) for k, (w, path) in enumerate(zip(ws, paths, strict=True)) if w["choose"] and path]
+            for (k, _), cost in zip(weighed, planner.path_costs([path for _, path in weighed]), strict=True):
+                out[k] = cost / ws[k]["speed"]
+            return out
 
-        for w, path in zip(work, planner.paths([(w["near"], w["target"]) for w in work]), strict=True):
+        # each stair half's congestion-weighted run both ways, once for all walkers (`_ride_time`)
+        names = sorted(self.zones)
+        runs = planner.path_costs([run for name in names for run in ([self.zones[name].entry, self.zones[name].hold], [self.zones[name].hold, self.zones[name].entry])]) if any(w["choose"] for w in work) else []
+        crowded = {name: (runs[2 * k], runs[2 * k + 1]) for k, name in enumerate(names)} if runs else None
+        walks = walked(work, planner.paths([(w["near"], w["target"]) for w in work]))
+        for w, walk in zip(work, walks, strict=True):
             near, target, speed, rides = w["near"], w["target"], w["speed"], w["rides"]
-            walk = walked(w, path)
-            ride = [self._ride_time(name, dest, speed, w["agent"].params.stair_effort, planner if w["choose"] else None) for name, dest in rides]
+            ride = [self._ride_time(name, dest, speed, w["agent"].params.stair_effort, planner if w["choose"] else None, crowded) for name, dest in rides]
             reach = [math.hypot(self.zones[name].entry.x - near.x, self.zones[name].entry.y - near.y) / speed for name, _ in rides]
             rest = [math.hypot(target.x - self.zones[dest].entry.x, target.y - self.zones[dest].entry.y) / speed for _, dest in rides]
             first, last = min(map(operator.add, reach, ride)), min(map(operator.add, ride, rest))
@@ -490,22 +511,37 @@ class TeleportZones:
             w["mouths"] = [self.zones[name].entry for name, _ in w["rides"]]
             w["lands"] = [self.zones[dest].entry for _, dest in w["rides"]]
         riding = [w for w in work if w["rides"]]
-        legs = [leg for w in riding for leg in (*((w["near"], mouth) for mouth in w["mouths"]), *((land, w["target"]) for land in w["lands"]))]
-        paths = iter(planner.paths(legs))
+        # the ways on from each landing first: walkers with one goal share them (`paths` answers them once). A way that
+        # cannot beat walking even with the shortest possible way to its stair (`leg_floors`) is out, and the walker's
+        # own way to that stair is not planned: it never is the quickest, so the choice is the one all ways would give
+        rests = iter(walked([w for w in riding for _ in w["lands"]], planner.paths([(land, w["target"]) for w in riding for land in w["lands"]])))
+        floors = iter(planner.leg_floors([(w["near"], mouth) for w in riding for mouth in w["mouths"]]))
+        boards: list[tuple[dict, int]] = []
+        for w in riding:
+            n = len(w["rides"])
+            w["rest"] = [next(rests) for _ in range(n)]
+            w["board"] = [math.inf] * n
+            w["out"] = set()
+            for i in range(n):
+                floor = next(floors) / w["speed"]
+                if math.isfinite(w["rest"][i]) and w["rides"][i] != w["held"] and floor + w["ride"][i] + w["rest"][i] > w["walk"] + PRICE_SLACK:
+                    w["out"].add(i)
+                else:
+                    boards.append((w, i))
+        for (w, i), board in zip(boards, walked([w for w, _ in boards], planner.paths([(w["near"], w["mouths"][i]) for w, i in boards])), strict=True):
+            w["board"][i] = board
         points = [p for w in riding for p in (*w["lands"], *w["mouths"])]
         comps_all = iter(planner.components(points) if points else [])
         hops: list[tuple[dict, tuple[int, int]]] = []
         for w in riding:
             n = len(w["rides"])
-            walks = [walked(w, next(paths)) for _ in range(2 * n)]
-            w["board"], w["rest"] = walks[:n], walks[n:]
             comps = [next(comps_all) for _ in range(2 * n)]
             hops.extend((w, (i, j)) for i in range(n) if math.isinf(w["rest"][i]) for j in range(n) if comps[i] & comps[n + j])
-        onward_paths = planner.paths([(w["lands"][i], w["mouths"][j]) for w, (i, j) in hops])
+        onward = walked([w for w, _ in hops], planner.paths([(w["lands"][i], w["mouths"][j]) for w, (i, j) in hops]))
         for w in riding:
             w["onward"] = {}
-        for (w, leg), path in zip(hops, onward_paths, strict=True):
-            w["onward"][leg] = walked(w, path)
+        for (w, leg), hop in zip(hops, onward, strict=True):
+            w["onward"][leg] = hop
         for w in work:
             rides, ride, held, speed = w["rides"], w["ride"], w["held"], w["speed"]
             options: dict[tuple[str, str] | None, float] = {None: w["walk"]}
@@ -514,7 +550,7 @@ class TeleportZones:
                 for _ in rides:
                     for (i, j), hop in w["onward"].items():
                         rest[i] = min(rest[i], hop + ride[j] + rest[j])
-                options.update((rides[i], board[i] + ride[i] + rest[i]) for i in range(len(rides)))
+                options.update((rides[i], board[i] + ride[i] + rest[i]) for i in range(len(rides)) if i not in w["out"])
             order = {edge: k for k, edge in enumerate(options)}
             best = min(options, key=lambda e: (options[e], order[e]))
             if w["choose"] and (held is not None or w["walking"]) and best != held:
@@ -527,16 +563,19 @@ class TeleportZones:
             self._walks[w["aid"]] = w["key"]
         return out
 
-    def _ride_time(self, name: str, dest: str, speed: float, effort: float, crowding: GlobalPlanner | None = None) -> float:
+    def _ride_time(self, name: str, dest: str, speed: float, effort: float, crowding: GlobalPlanner | None = None, crowded: dict[str, tuple[float, float]] | None = None) -> float:
         """Time over a stair from its entry to its partner's: carried at belt speed, climbed at stair speed times the effort on a still one, and the flight's `delay` between two halves side by side.
 
-        With a `crowding` planner the run is weighted by its congestion on the two halves, as its walks are."""
+        With a `crowding` planner the run is weighted by its congestion on the two halves, as its walks are; `crowded`
+        holds those runs' costs per half (entry to hold, hold to entry) where the caller priced them already."""
         zone, far = self.zones[name], self.zones[dest]
         run = math.hypot(zone.hold.x - zone.entry.x, zone.hold.y - zone.entry.y) + math.hypot(far.hold.x - far.entry.x, far.hold.y - far.entry.y)
         flight = 0.0 if name in self._joined else max(0.0, zone.delay)
         slow = 1.0
         if crowding is not None and run > 0.0:
-            slow = max(1.0, (crowding.path_cost([zone.entry, zone.hold]) + crowding.path_cost([far.hold, far.entry])) / run)
+            up = crowded[name][0] if crowded is not None else crowding.path_cost([zone.entry, zone.hold])
+            down = crowded[dest][1] if crowded is not None else crowding.path_cost([far.hold, far.entry])
+            slow = max(1.0, (up + down) / run)
         return (run / abs(zone.belt) if zone.belt else run / min(speed, STAIR_SPEED) * effort) * slow + flight
 
     def _blocked(self, climbs: tuple[str, ...]) -> set[str]:
@@ -854,14 +893,21 @@ class TeleportZones:
     def _alighting(self, pool: AgentPool) -> set[str]:
         """Zones someone stands in who is not waiting for, boarding or holding in that zone."""
         out: set[str] = set()
-        for i in range(pool.n):
-            transfer = self.transfers.get(int(pool.agent_ids[i]))
-            x, y = float(pool.pos[i, 0]), float(pool.pos[i, 1])
-            for zone in self.zones.values():
-                if zone.name in out or (transfer is not None and transfer.zone == zone.name and transfer.phase != Phase.WALK):
+        n = pool.n
+        if not n:
+            return out
+        pos, ids = pool.pos[:n], pool.agent_ids[:n]
+        for zone in self.zones.values():
+            # only who stands in the box round the zone (and round its hold, where that counts) can stand in it
+            x0, y0, x1, y1 = _box(zone)
+            near = np.flatnonzero((pos[:, 0] >= x0) & (pos[:, 0] <= x1) & (pos[:, 1] >= y0) & (pos[:, 1] <= y1))
+            for i in near.tolist():
+                transfer = self.transfers.get(int(ids[i]))
+                if transfer is not None and transfer.zone == zone.name and transfer.phase != Phase.WALK:
                     continue
-                if zone.contains(x, y):
+                if zone.contains(float(pos[i, 0]), float(pos[i, 1])):
                     out.add(zone.name)
+                    break
         return out
 
     def _zone_robots(self, pool: AgentPool) -> dict[str, list[tuple[float, float, float]]]:

@@ -9,7 +9,7 @@ import pytest
 
 from arena_humansim.core.agents.base import BaseAgent
 from arena_humansim.core.pool import KIND_ROBOT, AgentPool
-from arena_humansim.core.teleport_zones import FLIGHT_WAIT_GAP, LANDING_BACKOFF, LANDING_STEP, STAIR_SPEED, TeleportZones, Transfer, Zone
+from arena_humansim.core.teleport_zones import FLIGHT_WAIT_GAP, LANDING_BACKOFF, LANDING_STEP, STAIR_SPEED, Phase, TeleportZones, Transfer, Zone
 from arena_humansim.global_planner.dijkstra import DijkstraPlanner
 from arena_humansim.utils.types import CommandType, HighLevelCommand, Pose2D, Segments
 
@@ -854,3 +854,28 @@ def test_a_pedestrian_held_on_a_seam_for_the_wait_timeout_lands_anyway(agent_fac
     [(aid, x, y, _)] = tz.hold(pool, 10, 10, 0.05, 0)
     assert (aid, x, y) == (1, pytest.approx(22.8), pytest.approx(0.45 + LANDING_BACKOFF))
     assert tz._held == set() and tz._held_since == {}
+
+
+def test_alighting_finds_whoever_stands_in_a_zone_as_testing_every_zone_for_everyone(agent_factory: Callable[..., BaseAgent]) -> None:
+    """The zones someone stands in who is not waiting for, boarding or holding in that zone: the same as testing every
+    pedestrian against every zone (a cabin's hold disc reaches past its footprint)."""
+    zones = [*_low(), *_lift(), _up(), _up_b()]
+    tz = _zones(zones)
+    rng = np.random.default_rng(11)
+    spots = [(float(rng.uniform(-0.5, 30.5)), float(rng.uniform(-0.5, 6.5))) for _ in range(150)]
+    spots += [(z.hold.x + 0.29, z.hold.y) for z in zones] + [(x, y) for z in zones for x, y in z.footprint]
+    pool = AgentPool(capacity=len(spots))
+    for aid, (x, y) in enumerate(spots, start=1):
+        pool.add_agent(agent_factory(agent_id=aid, x=x, y=y))
+    for aid in range(1, len(spots) + 1, 3):
+        x, y = spots[aid - 1]
+        inside = [z.name for z in zones if z.contains(x, y)]
+        if inside:
+            tz.transfers[aid] = Transfer(goal=(GOAL_B.x, GOAL_B.y), zone=inside[0], destination=tz.zones[inside[0]].destinations[0], phase=Phase.WAIT if aid % 2 else Phase.WALK)
+    every = set()
+    for i in range(pool.n):
+        transfer = tz.transfers.get(int(pool.agent_ids[i]))
+        x, y = float(pool.pos[i, 0]), float(pool.pos[i, 1])
+        every.update(z.name for z in zones if not (transfer is not None and transfer.zone == z.name and transfer.phase != Phase.WALK) and z.contains(x, y))
+    assert tz._alighting(pool) == every
+    assert every

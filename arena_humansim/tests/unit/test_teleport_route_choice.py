@@ -185,6 +185,12 @@ class _Timed:
         self.legs.extend(legs)
         return [[start, goal] for start, goal in legs]
 
+    def path_costs(self, paths: Sequence[Sequence[Pose2D]]) -> list[float]:
+        return [self.path_cost(path) for path in paths]
+
+    def leg_floors(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
+        return [0.0] * len(legs)
+
     def path_cost(self, path: Sequence[Pose2D]) -> float:
         start, goal = (round(path[0].x, 2), round(path[0].y, 2)), (round(path[-1].x, 2), round(path[-1].y, 2))
         if (start, goal) in self.between:
@@ -302,7 +308,7 @@ def test_a_jam_weighs_the_path_cost(planner: NavMeshPlanner) -> None:
     assert planner.path_cost(path) > 12.0
 
 
-def test_one_steer_prices_every_walker_as_alone_in_three_batches(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_one_steer_prices_every_walker_as_alone_in_four_batches(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, monkeypatch: pytest.MonkeyPatch) -> None:
     spots = [(5.0, 2.0 + 0.5 * k) for k in range(12)] + [(25.0, 2.0 + 0.5 * k) for k in range(12)]
     walkers = [_walker(agent_factory, planner, aid, x, y) for aid, (x, y) in enumerate(spots, start=1)]
     cmds = {**_go(walkers[:12], IN_B), **_go(walkers[12:], IN_A)}
@@ -324,4 +330,127 @@ def test_one_steer_prices_every_walker_as_alone_in_three_batches(agent_factory: 
         assert (transfer is None) == (both is None)
         assert transfer is None or (transfer.zone, transfer.destination, transfer.ride) == (both.zone, both.destination, both.ride)
     assert list(together.transfers) == [w.state.agent_id for w in walkers if w.state.agent_id in together.transfers]
-    assert len(calls) <= 3 and sum(calls) > len(walkers)
+    assert len(calls) <= 4 and sum(calls) > len(walkers)
+
+
+def _crowd_steers(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner) -> tuple[list[tuple], int]:
+    """Five steers of a 60-walker crowd in both rooms and the corridor, half of it heading for each room, in a jam
+    round A's stair mouth: every command, transfer, walk memo and choice time after each, and the legs planned."""
+    rng = np.random.default_rng(3)
+    spots = [(float(rng.uniform(1.0, 9.0)), float(rng.uniform(1.0, 9.0))) for _ in range(20)]
+    spots += [(float(rng.uniform(21.0, 29.0)), float(rng.uniform(1.0, 9.0))) for _ in range(20)]
+    spots += [(float(rng.uniform(7.0, 22.0)), float(rng.uniform(19.8, 21.2))) for _ in range(20)]
+    walkers = [_walker(agent_factory, planner, aid, x, y) for aid, (x, y) in enumerate(spots, start=1)]
+    goals = [IN_B, IN_A, Pose2D(x=8.0, y=2.0), Pose2D(x=28.0, y=8.0)]
+    cmds = {}
+    for k, walker in enumerate(walkers):
+        cmds.update(_go([walker], goals[k % len(goals)]))
+    xs, ys = np.meshgrid(np.linspace(8.0, 12.0, 8), np.linspace(4.2, 5.8, 4))
+    planner._set_slowdown(planner._slowdown_at(np.vstack([np.column_stack([xs.ravel(), ys.ravel()]), np.array(spots)])))
+    legs = []
+    paths = planner.paths
+    planner.paths = lambda asked: legs.append(len(asked)) or paths(asked)  # type: ignore[method-assign]
+    tz = _zones(_stairs())
+    seen = []
+    for step in range(5):
+        for walker in walkers:
+            walker.state.pose = Pose2D(x=walker.state.pose.x + 0.3 * math.cos(walker.state.agent_id + step), y=walker.state.pose.y)
+        out = tz.steer(walkers, cmds, now=step * CHOICE_INTERVAL / 2.0)
+        seen.append(
+            (
+                {aid: (cmd.target_pose.x, cmd.target_pose.y) for aid, cmd in out.items()},
+                {aid: (t.zone, t.destination, t.ride) for aid, t in tz.transfers.items()},
+                list(tz.transfers),
+                dict(tz._walks),
+                dict(tz._next_choice),
+            )
+        )
+    return seen, sum(legs)
+
+
+def test_left_out_stairs_change_no_choice_of_a_crowd(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stair left out of a walker's choice (its shortest possible way still slower than walking) is one pricing every
+    way would not choose: the same crowd steered with every way planned (no floor) takes the same choices."""
+    pruned, few = _crowd_steers(agent_factory, planner)
+    every = NavMeshPlanner(inflation_radius=0.38, comfort_radius=0.6)
+    every.set_walls(WALLS)
+    monkeypatch.setattr(every, "leg_floors", lambda legs: [-math.inf] * len(legs))
+    full, many = _crowd_steers(agent_factory, every)
+    assert pruned == full
+    assert any(choice for _, choice, *_ in pruned)
+    assert few < many
+
+
+def test_leg_floors_are_below_the_priced_path_costs(planner: NavMeshPlanner) -> None:
+    rng = np.random.default_rng(5)
+    legs = [(Pose2D(x=float(rng.uniform(1.0, 29.0)), y=float(rng.uniform(1.0, 9.0))), Pose2D(x=float(rng.uniform(1.0, 29.0)), y=float(rng.uniform(1.0, 9.0)))) for _ in range(40)]
+    legs += [(Pose2D(x=0.2, y=5.0), Pose2D(x=10.0, y=5.0)), (Pose2D(x=5.0, y=9.9), Pose2D(x=20.0, y=5.0))]
+    xs, ys = np.meshgrid(np.linspace(3.0, 7.0, 10), np.linspace(4.0, 6.0, 6))
+    planner._set_slowdown(planner._slowdown_at(np.column_stack([xs.ravel(), ys.ravel()])))
+    paths = planner.paths(legs)
+    costs = planner.path_costs([path for path in paths if path])
+    floors = [floor for floor, path in zip(planner.leg_floors(legs), paths, strict=True) if path]
+    assert len(floors) > 15
+    assert all(floor <= cost + 1e-9 for floor, cost in zip(floors, costs, strict=True))
+
+
+def test_path_costs_are_the_path_costs_one_by_one(planner: NavMeshPlanner) -> None:
+    paths = [[Pose2D(x=1.0, y=5.0), Pose2D(x=9.0, y=5.0)], [Pose2D(x=2.0, y=2.0)], [Pose2D(x=4.0, y=4.0), Pose2D(x=4.0, y=4.0)], [Pose2D(x=1.0, y=1.0), Pose2D(x=5.0, y=5.0), Pose2D(x=9.0, y=5.5)]]
+    assert planner.path_costs(paths) == [planner.path_cost(path) for path in paths]
+    xs, ys = np.meshgrid(np.linspace(3.0, 7.0, 10), np.linspace(4.0, 6.0, 6))
+    planner._set_slowdown(planner._slowdown_at(np.column_stack([xs.ravel(), ys.ravel()])))
+    assert planner.path_costs(paths) == [planner.path_cost(path) for path in paths]
+    assert planner.path_costs(paths)[0] > 12.0
+
+
+def _lanes_one_by_one(planner: NavMeshPlanner, router: object, polyline: np.ndarray) -> np.ndarray:
+    """jazzy's `NavMeshPlanner._lanes` for one route (59d217a), the reference of `_lanes_many`."""
+    from arena_humansim.global_planner.navmesh import LANE_WALL_GAP, MIN_BODY_RADIUS
+    from arena_humansim.utils.router import VERIFY_EPS
+
+    if planner._lane_side == "none" or planner._lane_offset <= 0.0 or len(polyline) < 3 or router.r < planner._inflation_radius - 1e-9:  # type: ignore[attr-defined]
+        return polyline
+    body = max(router.r - planner._margin, MIN_BODY_RADIUS) + LANE_WALL_GAP  # type: ignore[attr-defined]
+    sign = 1.0 if planner._lane_side == "right" else -1.0
+    d = np.diff(polyline, axis=0)
+    d /= np.maximum(np.hypot(d[:, 0], d[:, 1]), 1e-9)[:, None]
+    normals = sign * np.column_stack([d[:, 1], -d[:, 0]])
+    n = normals[:-1] + normals[1:]
+    length = np.hypot(n[:, 0], n[:, 1])
+    n = np.where(length[:, None] > 1e-6, n / np.maximum(length, 1e-9)[:, None], normals[:-1])
+    inner = polyline[1:-1]
+    moved = inner.copy()
+    settled = np.zeros(len(inner), dtype=bool)
+    for share in (1.0, 0.5):
+        cand = inner + n * (planner._lane_offset * share)
+        fits = ~settled & (router.clearance(cand) >= body)  # type: ignore[attr-defined]
+        moved[fits] = cand[fits]
+        settled |= fits
+    if not settled.any():
+        return polyline
+    out = polyline.copy()
+    out[1:-1] = moved
+    if router._clear_many([out])[0] >= body - VERIFY_EPS:  # type: ignore[attr-defined]
+        return out
+    out[1:-1] = inner + (moved - inner) * 0.5
+    return out if router._clear_many([out])[0] >= body - VERIFY_EPS else polyline  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_lane_shifts_of_many_routes_at_once_are_those_one_by_one(side: str) -> None:
+    planner = NavMeshPlanner(inflation_radius=0.38, comfort_radius=0.6, lane_side=side, lane_offset=0.4)
+    planner.set_walls(WALLS)
+    router = planner._router
+    assert router is not None
+    rng = np.random.default_rng(7)
+    starts = [Pose2D(x=float(rng.uniform(1.0, 9.0)), y=float(rng.uniform(1.0, 9.0))) for _ in range(30)]
+    starts += [Pose2D(x=float(rng.uniform(21.0, 29.0)), y=float(rng.uniform(1.0, 9.0))) for _ in range(30)]
+    found = [np.array([(p.x, p.y) for p in path]) for path in planner.paths([(s, IN_B if s.x < 15.0 else IN_A) for s in starts]) if path]
+    # the routes over the corridor turn four corners; straight and two-point ones stay as they are
+    polylines = [*found, *(np.array([(4.5, y), (4.5, 14.0), (14.0, 20.5), (24.5, 14.0), (24.5, 8.0)]) for y in (2.0, 5.0)), np.array([(1.0, 1.0), (2.0, 2.0)])]
+    assert sum(len(p) >= 3 for p in polylines) > 20
+    many = planner._lanes_many(router, polylines)
+    for polyline, batched in zip(polylines, many, strict=True):
+        alone = _lanes_one_by_one(planner, router, polyline)
+        assert batched.tobytes() == alone.tobytes()
+    assert any(not np.array_equal(b, p) for b, p in zip(many, polylines, strict=True))
