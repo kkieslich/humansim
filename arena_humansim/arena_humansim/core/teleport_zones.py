@@ -330,7 +330,7 @@ class TeleportZones:
             comps = planner.components([agent.state.pose for agent, _ in group] + [cmd.target_pose for _, cmd in group])
             plans = planner.get_cached_paths() if self._joined else {}
             created: list[int] = []
-            waiting: list[tuple[Generator, tuple]] = []
+            waiting: list[tuple[Generator[tuple, tuple[str, str] | None, None], tuple]] = []
             for k, (agent, cmd) in enumerate(group):
                 walker = self._steer_one(k, agent, cmd, group, graph, comps, plans, blocked, paced_at, out, created)
                 request = next(walker, None)

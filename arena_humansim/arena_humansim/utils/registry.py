@@ -1,7 +1,12 @@
 from collections.abc import Callable
+from typing import Generic, TypeVar
+
+#: Declared invariant: with a PEP 695 parameter basedpyright infers the variance, and checking
+#: `_registry: ModuleRegistry[X] = ModuleRegistry()` before it has inferred it fails with an internal error
+T = TypeVar("T")
 
 
-class ModuleRegistry[T]:
+class ModuleRegistry(Generic[T]):  # noqa: UP046 - the variance stays declared, see T
     def __init__(self) -> None:
         self._registry: dict[str, Callable[[], type[T]]] = {}
         self._labels: dict[str, str] = {}
