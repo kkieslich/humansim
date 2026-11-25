@@ -72,7 +72,7 @@ from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.serialization import serialize_message
 from rosgraph_msgs.msg import Clock
-from std_msgs.msg import Header
+from std_msgs.msg import Header, UInt32
 from std_msgs.msg import String as StringMsg
 
 from arena_humansim.animation import MotionAnimation
@@ -2262,6 +2262,10 @@ class AgentManager(TimeNode):
             self._feedback_callback,
         )
         self._barrier_timer = self.create_timer(0.25, self._barrier_watchdog, clock=RclClock(clock_type=ClockType.STEADY_TIME))
+        # how often the input barrier ran ticks without their acknowledgement since the crowd's tick 0 (latched): an
+        # orchestrator records a nonzero count against the episode, whose crowd is then not input-deterministic
+        self._barrier_timeouts_pub = self.create_publisher(UInt32, "input_barrier_timeouts", QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._publish_barrier_timeouts()
 
     def _forget_agents(self) -> None:
         """Clear what every global planner keeps per agent id, for a crowd that numbers its agents from 1 again."""
@@ -2475,6 +2479,11 @@ class AgentManager(TimeNode):
         state.update({f"peak_{key}": round(value, 3) if isinstance(value, float) else value for key, value in peaks.items()})
         self._catch_up_pub.publish(StringMsg(data=json.dumps(state)))
 
+    def _publish_barrier_timeouts(self) -> None:
+        pub = getattr(self, "_barrier_timeouts_pub", None)
+        if pub is not None:
+            pub.publish(UInt32(data=self._barrier_timeouts))
+
     def _barrier_watchdog(self) -> None:
         """Run ticks the input barrier has held back longer than `input_barrier_timeout` wall seconds without it."""
         if self._barrier_covered is None or self._barrier_wait_since is None:
@@ -2484,7 +2493,8 @@ class AgentManager(TimeNode):
         if timeout <= 0.0 or waited < timeout:
             return
         self._barrier_timeouts += 1
-        self._logger.error(f"input barrier: no world_state for tick {self._tick_count - 1} in {waited:.1f} s, running ticks {self._tick_count}..{self._barrier_covered - 1} without it ({self._barrier_timeouts} time(s) this run): from here inputs can land a tick early or late, the run is not input-deterministic")
+        self._publish_barrier_timeouts()
+        self._logger.error(f"input barrier: no world_state for tick {self._tick_count - 1} in {waited:.1f} s, running ticks {self._tick_count}..{self._barrier_covered - 1} without it ({self._barrier_timeouts} time(s) since tick 0): from here inputs can land a tick early or late, the run is not input-deterministic")
         self._run_owed(self._barrier_covered, force=True)
 
     def _hold_clock(self) -> None:
@@ -2500,6 +2510,9 @@ class AgentManager(TimeNode):
         self._catch_up_left = False
         self._forced_covered = None
         self._stop_catch_up()
+        if self._barrier_timeouts:
+            self._barrier_timeouts = 0
+            self._publish_barrier_timeouts()
 
     def _start_clock_callback(
         self,
