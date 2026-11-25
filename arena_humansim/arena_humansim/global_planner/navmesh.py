@@ -219,6 +219,8 @@ class NavMeshPlanner(GlobalPlanner):
         self._commands: dict[int, PassageCommand] = {}
         self._gives_way: set[tuple[int, int]] = set()
         self._ray_grid: tuple[list, WallGrid] | None = None
+        #: the wall ends no other wall meets (`_free_ends`), for the walls they were found on
+        self._free: tuple[list, np.ndarray] | None = None
         #: narrow-passage turns of walkers without a `passage` block: measured routes, claims (mouth x, y, tick), and
         #: where each walker last moved (x, y, tick) and whether the last `compute` held it
         self._turn_ways: dict[int, TurnWay] = {}
@@ -600,6 +602,9 @@ class NavMeshPlanner(GlobalPlanner):
             c, si = math.cos(tilt), math.sin(tilt)
             d = np.column_stack([c * normal[slant, 0] - si * normal[slant, 1], si * normal[slant, 0] + c * normal[slant, 1]])
             width[slant] = np.minimum(width[slant], self._cast(spots[slant], d, TURN_FAR) + self._cast(spots[slant], -d, TURN_FAR))
+        ends = self._free_ends()
+        if len(ends):
+            width = np.minimum(width, self._jamb_width(spots, normal, ends, limit))
         tight = width < limit
         edges = np.flatnonzero(np.diff(np.concatenate([[False], tight, [False]]).astype(np.int8)))
         narrows = []
@@ -607,6 +612,53 @@ class NavMeshPlanner(GlobalPlanner):
             start = float(s[a]) if a else -self._narrow_behind(points, limit)
             narrows.append((Narrow(start, float(s[b - 1]), start - TURN_HOLD, spots[a:b], tangents[a:b]), float(width[a:b].min())))
         return TurnWay(waypoints, points, at, narrows)
+
+    def _free_ends(self) -> np.ndarray:
+        """The wall ends no other wall meets: the jambs of the doors and gaps in walls without thickness, (n, 2)."""
+        if self._free is not None and self._free[0] is self._wall_segments:
+            return self._free[1]
+        segs = np.array(self._wall_segments, dtype=np.float64).reshape(-1, 4)
+        segs = segs[np.hypot(*(segs[:, 2:] - segs[:, :2]).T) > TOL]
+        ends = np.concatenate([segs[:, :2], segs[:, 2:]])
+        owner = np.concatenate([np.arange(len(segs)), np.arange(len(segs))])
+        _, at, count = np.unique(np.round(ends / TOL).astype(np.int64), axis=0, return_inverse=True, return_counts=True)
+        free = []
+        for k in np.flatnonzero(count[at.reshape(-1)] == 1).tolist():
+            d, _ = _pt_seg(ends[k][None], segs[:, :2], segs[:, 2:])
+            d[owner[k]] = np.inf
+            if not (d <= TOL).any():
+                free.append(ends[k])
+        self._free = (self._wall_segments, np.array(free, dtype=np.float64).reshape(-1, 2))
+        return self._free[1]
+
+    def _jamb_width(self, spots: np.ndarray, normal: np.ndarray, ends: np.ndarray, limit: float) -> np.ndarray:
+        """How narrow the route is at each of `spots` beside a free wall end within `limit` of it: on each side of the
+        route, the way to the nearest such end in sight within the widest `TURN_TILT` of the side's normal, or on a side
+        without one to the nearest wall along the `TURN_TILT` rays; inf where no free end is near.
+
+        A door in a wall without thickness (the arena-world walls are lines) has no chord through a point beside it that
+        ends on walls at both ends, so the rays of `_turn_way` find it no narrower than the rooms it joins."""
+        width = np.full(len(spots), np.inf)
+        reach = np.hypot(spots[:, None, 0] - ends[None, :, 0], spots[:, None, 1] - ends[None, :, 1])
+        cone = math.cos(max(abs(t) for t in TURN_TILT)) - 1e-9
+        for i in np.flatnonzero((reach < limit).any(axis=1)).tolist():
+            near = np.flatnonzero(reach[i] < limit)
+            to = ends[near] - spots[i]
+            dist = reach[i, near]
+            u = to / dist[:, None]
+            seen = self._cast(np.repeat(spots[i][None], len(near), 0), u, dist - 1e-3) >= dist - 1e-3 - 1e-9
+            side = []
+            for sign in (1.0, -1.0):
+                n = sign * normal[i]
+                mine = seen & (u @ n >= cone)
+                if mine.any():
+                    side.append(float(dist[mine].min()))
+                    continue
+                rays = np.array([(math.cos(t) * n[0] - math.sin(t) * n[1], math.sin(t) * n[0] + math.cos(t) * n[1]) for t in TURN_TILT])
+                side.append(float(self._cast(np.repeat(spots[i][None], len(rays), 0), rays, TURN_FAR).min()))
+            if len(side) == 2 and side[0] + side[1] < width[i]:
+                width[i] = side[0] + side[1]
+        return width
 
     @staticmethod
     def _same_tail(old: list[Pose2D], new: list[Pose2D]) -> bool:

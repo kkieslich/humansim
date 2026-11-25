@@ -126,3 +126,50 @@ def test_walkers_away_from_narrow_passages_get_no_commands(agent_factory: Callab
     walkers = [_walker(agent_factory, 1, -8.0), _walker(agent_factory, 2, 8.0)]
     planner.compute(walkers, _go({1: EAST, 2: WEST}))
     assert planner.passage_commands() == {}
+
+
+def _door_planner(width: float) -> NavMeshPlanner:
+    """Two halls of 10 x 10 m on either side of a wall without thickness at x = 0 (as the arena-world walls are lines),
+    with a door `width` wide in its middle."""
+    w = width / 2.0
+    outline = [(-10.0, -5.0), (10.0, -5.0), (10.0, 5.0), (-10.0, 5.0)]
+    walls = [*zip(outline, outline[1:] + outline[:1], strict=True), ((0.0, -5.0), (0.0, -w)), ((0.0, w), (0.0, 5.0))]
+    planner = NavMeshPlanner(inflation_radius=0.38, comfort_radius=0.6, clearance_margin=0.25, lane_side="left", lane_offset=LANE_OFFSET_M)
+    planner.set_walls(walls)
+    planner.set_timing(0.05, 8.0)
+    return planner
+
+
+@pytest.mark.parametrize(("start", "goal"), [((-6.0, 0.0), (6.0, 0.0)), ((6.0, 0.0), (-6.0, 0.0)), ((-6.0, -2.0), (6.0, 2.5))])
+def test_a_door_in_a_wall_without_thickness_is_a_narrow_stretch(start: tuple[float, float], goal: tuple[float, float]) -> None:
+    """No chord through a point beside such a door ends on walls at both ends; its jambs make it as narrow as it is."""
+    planner = _door_planner(1.2)
+    path = planner.paths([(Pose2D(x=start[0], y=start[1]), Pose2D(x=goal[0], y=goal[1]))])[0]
+    way = planner._turn_way(path, 2 * 0.325 + 0.8 + 0.1)
+    assert len(way.narrows) == 1
+    narrow, width = way.narrows[0]
+    assert width == pytest.approx(1.2, abs=0.05)
+    mouth = narrow.points[len(narrow.points) // 2]
+    assert abs(mouth[0]) < 0.3 and abs(mouth[1]) < 0.6
+
+
+def test_a_wide_door_and_the_walls_beside_it_are_no_narrow_stretch() -> None:
+    planner = _door_planner(3.0)
+    path = planner.paths([(Pose2D(x=-6.0, y=0.0), Pose2D(x=6.0, y=0.0))])[0]
+    assert planner._turn_way(path, 2 * 0.325 + 0.8 + 0.1).narrows == []
+    along = planner.paths([(Pose2D(x=-6.0, y=4.0), Pose2D(x=-6.0, y=-4.0))])[0]
+    assert planner._turn_way(along, 2 * 0.325 + 0.8 + 0.1).narrows == []
+
+
+@pytest.mark.parametrize(("width", "radius", "waits"), [(1.2, 0.325, True), (1.0, 0.25, True), (1.2, 0.25, False)])
+def test_one_waits_before_a_door_in_a_wall_without_thickness_while_one_comes_through(width: float, radius: float, waits: bool, agent_factory: Callable[..., BaseAgent]) -> None:
+    """A wheelchair user (0.65 m) and an adult do not pass in a 1.2 m door, two adults do not in a 1.0 m one."""
+    planner = _door_planner(width)
+    inside = _walker(agent_factory, 1, -0.1, radius=radius)
+    coming = _walker(agent_factory, 2, 3.0)
+    planner.compute([inside, coming], _go({1: (6.0, 0.0), 2: (-6.0, 0.0)}))
+    assert _hold(planner, 1) is None
+    hold = _hold(planner, 2)
+    assert (hold is not None) is waits
+    if waits:
+        assert hold is not None and hold[0] > 0.5
