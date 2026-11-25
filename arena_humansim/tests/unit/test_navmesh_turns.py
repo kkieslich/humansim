@@ -13,7 +13,7 @@ import pytest
 
 from arena_humansim.core.agents.base import BaseAgent
 from arena_humansim.global_planner import LANE_OFFSET_M
-from arena_humansim.global_planner.navmesh import TURN_HOLD, TURN_STUCK_S, TURN_YIELD_S, NavMeshPlanner
+from arena_humansim.global_planner.navmesh import TURN_HOLD, TURN_STUCK_S, TURN_YIELD_S, Narrow, NavMeshPlanner
 from arena_humansim.utils.types import CommandType, HighLevelCommand, Pose2D
 
 WEST, EAST = (-12.0, 0.0), (12.0, 0.0)
@@ -216,3 +216,29 @@ def test_the_waiting_walkers_of_one_end_line_up_in_the_order_they_came(agent_fac
     spot_far, spot_near = _hold(planner, 3), _hold(planner, 4)
     assert spot_far is not None and spot_near is not None
     assert spot_far[0] < spot_near[0]  # the one that came first stands nearer the mouth (x = 5)
+
+
+def test_one_of_the_waiting_end_pushed_to_the_mouth_rolls_back(agent_factory: Callable[..., BaseAgent]) -> None:
+    """The crowd pushed a walker of the end that does not have the passage past its hold line, not yet into the
+    stretch: it rolls back behind the line and keeps no one of the other end waiting."""
+    planner = _planner(1.0)
+    first = _walker(agent_factory, 1, -7.0)
+    planner.compute([first], _go({1: EAST}))
+    pushed = _walker(agent_factory, 2, 5.3)
+    planner.compute([first, pushed], _go({1: EAST, 2: WEST}))
+    assert _hold(planner, 1) is None
+    command = planner.passage_commands()[2]
+    assert command.back is True
+    assert command.hold is not None and command.hold[0] > 5.3
+
+
+def test_a_passage_no_call_saw_for_a_second_is_forgotten_with_its_end() -> None:
+    planner = _planner(1.0)
+    narrow = Narrow(0.0, 1.0, -TURN_HOLD, np.array([[0.0, 0.0], [1.0, 0.0]]), np.array([[1.0, 0.0], [1.0, 0.0]]))
+    seen = {1: (0.0, 0.25, narrow, 1.0, "near")}
+    first = planner._turn_passage([1], seen, 0)
+    first.serving = -1
+    assert planner._turn_passage([1], seen, int(0.5 / 0.05)) is first
+    later = planner._turn_passage([1], seen, int(0.5 / 0.05) + int(1.5 / 0.05))
+    assert later is not first
+    assert later.serving == 0
