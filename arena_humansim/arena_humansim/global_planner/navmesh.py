@@ -815,6 +815,12 @@ class NavMeshPlanner(GlobalPlanner):
             self._serve(passage, [a for a in members if against[a]], seen, claims, way_of, back, stuck, tick)
             for aid in members:
                 serving[aid] = passage.serving
+        # one of the end that does not have the passage whom the crowd behind pushed past its hold line, but not yet into
+        # the stretch, rolls back behind the line: it neither keeps the other end waiting nor stands in its way out
+        for aid in busy:
+            s, _, narrow, _, phase = seen[aid]
+            if phase == "inside" and s < narrow.start and serving[aid] not in (0, way_of[aid]) and any(o not in stuck for o in against[aid]):
+                back.add(aid)
         held: set[int] = set()
         for aid in busy:
             phase = seen[aid][4]
@@ -871,7 +877,7 @@ class NavMeshPlanner(GlobalPlanner):
         for aid in contested:
             if aid in stuck or aid in back:
                 continue
-            if seen[aid][4] == "inside":
+            if seen[aid][4] == "inside" and seen[aid][0] >= seen[aid][2].start:
                 inside.add(way_of[aid])
             else:
                 first[way_of[aid]] = min(first.get(way_of[aid], tick), claims[aid][2])
