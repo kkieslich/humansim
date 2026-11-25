@@ -77,6 +77,14 @@ TURN_TILT = (0.0, math.pi / 6, -math.pi / 6, math.pi / 3, -math.pi / 3)
 #: A walker that has moved less than `STALL_M` in this long while not held for its turn no longer keeps those at the
 #: other end of its narrow stretch waiting (one that stands in or before the stretch for another reason) [s]
 TURN_STUCK_S = 20.0
+#: The end of a narrow passage that has it keeps it while those at the other end have waited less than this [s] (counted
+#: from when it got the passage): two crowds take it in platoons, and no end waits much longer than this plus the time
+#: the walkers inside need to come out. No source, our choice
+TURN_YIELD_S = 10.0
+#: A walker keeps its place in the order of a passage (its claim) while its route leads through the stretch whose mouth
+#: lies within this of the one it claimed [m], also where the crowd pushed it back beyond `LINE_UP`; a passage is the
+#: same between two calls where its walkers' stretches lie within this of where it was
+TURN_SAME = 1.5
 #: A walker blocked by a robot standing still goes round it this far from the robot's body [m], on points of a circle
 #: round the robot at most `ROUND_STEP` [rad] apart, its route checked against the robot every `ROUND_SAMPLE` [m]
 ROUND_GAP, ROUND_STEP, ROUND_SAMPLE = 0.2, math.pi / 6.0, 0.1
@@ -159,6 +167,21 @@ class Way:
 
 
 @attrs.define
+class TurnPassage:
+    """One narrow passage that walkers take by turns (`_take_turns`): where it is, a direction along it that says which
+    end is which (+1 along, -1 against), the end that has it (0 none) and since when [tick], and the last call that saw
+    it [tick]."""
+
+    x: float
+    y: float
+    ux: float
+    uy: float
+    serving: int = 0
+    since: int = 0
+    seen: int = 0
+
+
+@attrs.define
 class TurnWay:
     """A route measured for stretches narrower than its walker needs to pass an oncoming walker (`_turn_way`): the
     cached waypoint list it belongs to, its points, their distance along it, and each narrow stretch with its least
@@ -227,6 +250,7 @@ class NavMeshPlanner(GlobalPlanner):
         self._turn_claims: dict[int, tuple[float, float, int]] = {}
         self._turn_moved: dict[int, tuple[float, float, int]] = {}
         self._turn_held: set[int] = set()
+        self._turn_passages: list[TurnPassage] = []
         #: per blocked walker: the route `_reroute` last saw or made for it with the robots it goes round, and the side it
         #: goes round each robot by (+1 counter-clockwise, -1 clockwise); routers that also keep off robots standing still
         self._rounded: dict[int, tuple[list[Pose2D], tuple]] = {}
@@ -685,10 +709,13 @@ class NavMeshPlanner(GlobalPlanner):
 
         A stretch of a walker's route narrower than its body, `WIDEST_BODY` and `PASS_GAP` is one it may have to take by
         turns. Two walkers whose such stretches are one passage taken in opposite directions (`_meet`), and
-        narrower there than their two bodies and `PASS_GAP`, do not both go in: within `LINE_UP` of the stretch a walker
-        holds `TURN_HOLD` before it while one coming the other way is inside, or while one waiting at the other end
-        claimed the stretch before every walker waiting at its own end. Two that met inside: the one that came less far
-        rolls back behind its hold line. A walker that stood `TURN_STUCK_S` without being held keeps no one waiting.
+        narrower there than their two bodies and `PASS_GAP`, do not both go in. The walkers whose stretches meet form one
+        passage (`_turn_passage`), and one end of it has it at a time (`_serve`): within `LINE_UP` of the stretch a walker
+        of the other end, or one while someone coming the other way is inside, holds `TURN_HOLD` before it, in line
+        beside the mouth with the others of its end in the order they came. A walker's place in that order (its claim)
+        dates from when it first came within `LINE_UP` and lasts while its route leads through the stretch, also where the
+        crowd pushed it back. Two that met inside: the one that came less far rolls back behind its hold line. A walker
+        that stood `TURN_STUCK_S` without being held keeps no one waiting.
         Without this rule two streams that meet in a passage narrower than two bodies press against each other, and the
         walkers behind keep pressing in from both ends, so neither front can give way."""
         navigating = {aid for aid, cmd in high_level_commands.items() if isinstance(cmd, HighLevelCommand) and cmd.type == CommandType.NAVIGATE}
@@ -696,6 +723,7 @@ class NavMeshPlanner(GlobalPlanner):
         for aid in [a for a in self._turn_ways if a not in present]:
             del self._turn_ways[aid]
         seen: dict[int, tuple[float, float, Narrow, float, str]] = {}
+        ahead: dict[int, np.ndarray] = {}
         for aid, agent in present.items():
             manner = self._manners.get(aid)
             entry = self._path_cache.get(aid)
@@ -715,6 +743,7 @@ class NavMeshPlanner(GlobalPlanner):
             if hit is None:
                 continue
             narrow, width = hit
+            ahead[aid] = narrow.points[0]
             if s > narrow.line + HOLD_SLACK:
                 phase = "inside"
             elif s >= narrow.start - LINE_UP:
@@ -733,28 +762,36 @@ class NavMeshPlanner(GlobalPlanner):
                 self._turn_moved[aid] = (pose.x, pose.y, tick)
             elif (tick - moved[2]) * self._dt >= TURN_STUCK_S:
                 stuck.add(aid)
+        # a walker's place in the order of its passage: from when it first came within `LINE_UP`, for as long as its route
+        # leads through the same stretch (a crowd that pushes it back does not cost it its place)
         claims: dict[int, tuple[float, float, int]] = {}
-        for aid, (_, _, narrow, _, _) in seen.items():
-            mouth = narrow.points[0]
+        for aid, mouth in ahead.items():
             claim = self._turn_claims.get(aid)
-            if claim is None or math.hypot(claim[0] - mouth[0], claim[1] - mouth[1]) > 1.0:
-                claim = (float(mouth[0]), float(mouth[1]), tick)
-            claims[aid] = claim
+            if claim is not None and math.hypot(claim[0] - mouth[0], claim[1] - mouth[1]) <= TURN_SAME:
+                claims[aid] = claim
+            elif aid in seen:
+                claims[aid] = (float(mouth[0]), float(mouth[1]), tick)
         self._turn_claims = claims
         busy = list(seen)
         against: dict[int, list[int]] = {aid: [] for aid in busy}
-        beside: dict[int, list[int]] = {aid: [aid] for aid in busy}
+        group = {aid: aid for aid in busy}
+
+        def root(a: int) -> int:
+            while group[a] != a:
+                group[a] = group[group[a]]
+                a = group[a]
+            return a
+
         for i, a in enumerate(busy):
             for b in busy[i + 1 :]:
                 sa, sb = seen[a], seen[b]
                 width = min(sa[3], sb[3])
                 met = self._meet(sa[2], sb[2], max(width, 2.0 * (sa[1] + sb[1])))
+                if met != 0:
+                    group[root(a)] = root(b)
                 if met < 0 and width < 2.0 * (sa[1] + sb[1]) + PASS_GAP:
                     against[a].append(b)
                     against[b].append(a)
-                elif met > 0:
-                    beside[a].append(b)
-                    beside[b].append(a)
         back: set[int] = set()
         for aid in busy:
             s, _, narrow, _, phase = seen[aid]
@@ -764,17 +801,31 @@ class NavMeshPlanner(GlobalPlanner):
                 so = seen[other]
                 if so[4] == "inside" and other not in stuck and (s - narrow.line, -aid) < (so[0] - so[2].line, -other):
                     back.add(aid)
+        passages: dict[int, list[int]] = {}
+        for aid in busy:
+            passages.setdefault(root(aid), []).append(aid)
+        way_of: dict[int, int] = {}
+        serving: dict[int, int] = {}
+        for members in passages.values():
+            passage = self._turn_passage(members, seen, tick)
+            ref = np.array([passage.ux, passage.uy])
+            for aid in members:
+                narrow = seen[aid][2]
+                way_of[aid] = 1 if float(narrow.tangents[len(narrow.tangents) // 2] @ ref) >= 0.0 else -1
+            self._serve(passage, [a for a in members if against[a]], seen, claims, way_of, back, stuck, tick)
+            for aid in members:
+                serving[aid] = passage.serving
         held: set[int] = set()
         for aid in busy:
-            s, _, narrow, _, phase = seen[aid]
+            phase = seen[aid][4]
             hold = aid in back
             if phase == "near" and against[aid]:
-                ours = min((claims[o][2], o) for o in beside[aid] if seen[o][4] == "near")
-                hold = any(o not in stuck and ((seen[o][4] == "inside" and o not in back) or (seen[o][4] == "near" and (claims[o][2], o) < ours)) for o in against[aid])
+                # the end that does not have the passage waits, as does one while someone of the other end is inside
+                hold = way_of[aid] != serving[aid] or any(o not in stuck and seen[o][4] == "inside" and o not in back for o in against[aid])
             if hold:
                 held.add(aid)
-        # the waiting walkers of one end stand in line beside the mouth, nearest first, so that those coming out pass
-        order = sorted((a for a in held if a not in back), key=lambda a: (round(claims[a][0], 0), round(claims[a][1], 0), seen[a][2].start - seen[a][0]))
+        # the waiting walkers of one end stand in line beside the mouth in the order they came, so that those coming out pass
+        order = sorted((a for a in held if a not in back), key=lambda a: (round(claims[a][0], 0), round(claims[a][1], 0), claims[a][2], a))
         place: dict[int, int] = {}
         for a in order:
             mouth = (round(claims[a][0], 0), round(claims[a][1], 0))
@@ -790,6 +841,46 @@ class NavMeshPlanner(GlobalPlanner):
                     goals[aid] = Pose2D(x=x, y=y, theta=goals[aid].theta)
             self._commands[aid] = PassageCommand(hold=(x, y, ux, uy), back=aid in back)
         self._turn_held = held
+
+    def _turn_passage(self, members: list[int], seen: dict, tick: int) -> TurnPassage:
+        """The passage the narrow stretches of `members` belong to: the one of the last call within `TURN_SAME` of them, or
+        a new one where none is. Passages no call saw for a second are forgotten."""
+        mids = np.array([seen[a][2].points[len(seen[a][2].points) // 2] for a in members])
+        best, gap = None, TURN_SAME
+        for passage in self._turn_passages:
+            d = float(np.hypot(mids[:, 0] - passage.x, mids[:, 1] - passage.y).min())
+            if d <= gap:
+                best, gap = passage, d
+        if best is None:
+            narrow = seen[members[0]][2]
+            t = narrow.tangents[len(narrow.tangents) // 2]
+            best = TurnPassage(float(mids[0, 0]), float(mids[0, 1]), float(t[0]), float(t[1]), seen=tick)
+            self._turn_passages.append(best)
+        best.seen = tick
+        self._turn_passages = [p for p in self._turn_passages if (tick - p.seen) * self._dt <= 1.0]
+        return best
+
+    def _serve(self, passage: TurnPassage, contested: list[int], seen: dict, claims: dict, way_of: dict[int, int], back: set[int], stuck: set[int], tick: int) -> None:
+        """Which end of `passage` has it, from the walkers that cannot pass someone coming the other way (`contested`).
+
+        The end whose first walker came first gets it, and keeps it while its walkers come; the other end gets it once
+        this end has none left before or in the passage, or once its first walker has waited `TURN_YIELD_S` (counted from
+        when this end got the passage). Those of this end already inside come out first."""
+        first: dict[int, int] = {}
+        inside: set[int] = set()
+        for aid in contested:
+            if aid in stuck or aid in back:
+                continue
+            if seen[aid][4] == "inside":
+                inside.add(way_of[aid])
+            else:
+                first[way_of[aid]] = min(first.get(way_of[aid], tick), claims[aid][2])
+        if passage.serving not in first and passage.serving not in inside:
+            passage.serving = next(iter(inside)) if len(inside) == 1 else min(first, key=lambda d: (first[d], d)) if first else 0
+            passage.since = tick
+        elif -passage.serving in first and (tick - max(first[-passage.serving], passage.since)) * self._dt >= TURN_YIELD_S:
+            passage.serving = -passage.serving
+            passage.since = tick
 
     @staticmethod
     def _way_at(way: TurnWay, arc: float) -> tuple[float, float, float, float]:

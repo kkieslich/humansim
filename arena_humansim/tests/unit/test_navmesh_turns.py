@@ -13,7 +13,7 @@ import pytest
 
 from arena_humansim.core.agents.base import BaseAgent
 from arena_humansim.global_planner import LANE_OFFSET_M
-from arena_humansim.global_planner.navmesh import TURN_HOLD, TURN_STUCK_S, NavMeshPlanner
+from arena_humansim.global_planner.navmesh import TURN_HOLD, TURN_STUCK_S, TURN_YIELD_S, NavMeshPlanner
 from arena_humansim.utils.types import CommandType, HighLevelCommand, Pose2D
 
 WEST, EAST = (-12.0, 0.0), (12.0, 0.0)
@@ -173,3 +173,46 @@ def test_one_waits_before_a_door_in_a_wall_without_thickness_while_one_comes_thr
     assert (hold is not None) is waits
     if waits:
         assert hold is not None and hold[0] > 0.5
+
+
+def test_a_walker_the_crowd_pushed_back_keeps_its_place_in_the_order(agent_factory: Callable[..., BaseAgent]) -> None:
+    planner = _planner(1.0)
+    early = _walker(agent_factory, 2, 8.0)
+    planner.compute([early], _go({2: WEST}))
+    stamp = planner._turn_claims[2][2]
+    early.state.pose.x, early.state.pose.y = 12.0, 3.0  # pushed back beyond LINE_UP: its route still leads through the passage
+    later = _walker(agent_factory, 5, -8.0)
+    for _ in range(5):
+        planner.compute([early, later], _go({2: WEST, 5: EAST}))
+    assert planner._turn_claims[2][2] == stamp and 2 not in planner._turn_held
+    early.state.pose.x, early.state.pose.y = 8.0, 0.0
+    planner.compute([early, later], _go({2: WEST, 5: EAST}))
+    assert _hold(planner, 2) is None
+    assert _hold(planner, 5) is not None
+
+
+def test_the_end_that_has_the_passage_yields_once_the_other_end_waited_its_time(agent_factory: Callable[..., BaseAgent]) -> None:
+    """Platoons: the end that came first keeps the passage while its walkers come, at most `TURN_YIELD_S` while the
+    other end waits; then the other end gets it."""
+    planner = _planner(1.0)
+    east = _walker(agent_factory, 1, -7.0)
+    planner.compute([east], _go({1: EAST}))
+    west = _walker(agent_factory, 2, 8.0)
+    held = []
+    for _ in range(int(TURN_YIELD_S / 0.05) + 3):
+        planner.compute([east, west], _go({1: EAST, 2: WEST}))
+        held.append((_hold(planner, 1) is not None, _hold(planner, 2) is not None))
+    assert held[0] == (False, True)
+    assert held[-1] == (True, False)
+
+
+def test_the_waiting_walkers_of_one_end_line_up_in_the_order_they_came(agent_factory: Callable[..., BaseAgent]) -> None:
+    planner = _planner(1.0)
+    inside = _walker(agent_factory, 1, 0.0)
+    far = _walker(agent_factory, 3, 9.0)
+    planner.compute([inside, far], _go({1: EAST, 3: WEST}))
+    near = _walker(agent_factory, 4, 6.5)
+    planner.compute([inside, far, near], _go({1: EAST, 3: WEST, 4: WEST}))
+    spot_far, spot_near = _hold(planner, 3), _hold(planner, 4)
+    assert spot_far is not None and spot_near is not None
+    assert spot_far[0] < spot_near[0]  # the one that came first stands nearer the mouth (x = 5)
