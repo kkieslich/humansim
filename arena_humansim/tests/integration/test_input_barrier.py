@@ -55,9 +55,9 @@ def _subsystem(manager_factory: Callable[..., AgentManager], scenario: ScenarioC
     return mgr
 
 
-def _start(mgr: AgentManager) -> None:
+def _start(mgr: AgentManager, epoch_ns: int = EPOCH_NS) -> None:
     request = StartClock.Request()
-    request.epoch.sec, request.epoch.nanosec = divmod(EPOCH_NS, NS)
+    request.epoch.sec, request.epoch.nanosec = divmod(epoch_ns, NS)
     assert mgr._start_clock_callback(request, StartClock.Response()).success
 
 
@@ -92,17 +92,17 @@ def _walker(x: float, y: float, gx: float, gy: float) -> AgentStateMsg:
 class _Orchestrator:
     """The adapter's part: on the frame of tick k it decides inputs from that frame's stamp alone and sends them."""
 
-    def __init__(self, mgr: AgentManager, robots: bool) -> None:
+    def __init__(self, mgr: AgentManager, robots: bool, epoch_ns: int = EPOCH_NS) -> None:
         self.mgr = mgr
         self.robots = robots
+        self.epoch_ns = epoch_ns
 
     def robot_pose(self, t: float) -> tuple[float, float] | None:
         # parked beside the door, then driving through it at 0.4 m/s
         return None if not self.robots else (-1.5 + 0.4 * max(t - 1.0, 0.0), -0.5)
 
     def inputs(self, stamp_ns: int) -> list[Callable[[], None]]:
-        t = (stamp_ns - EPOCH_NS) / NS
-        k = round(t * NS / DT_NS)
+        k = (stamp_ns - self.epoch_ns) // DT_NS
         calls: list[Callable[[], None]] = []
         if k == 7:  # a delayed release
             request = SpawnAgents.Request()
@@ -116,15 +116,15 @@ class _Orchestrator:
         return calls
 
 
-def _run(manager_factory: Callable[..., AgentManager], scenario: ScenarioConfig, name: str, *, barrier: bool, robots: bool, order_seed: int, ticks: int) -> np.ndarray:
+def _run(manager_factory: Callable[..., AgentManager], scenario: ScenarioConfig, name: str, *, barrier: bool, robots: bool, order_seed: int, ticks: int, epoch_ns: int = EPOCH_NS) -> np.ndarray:
     """Tracks (tick, id, x, y) of a run whose clock messages come in before or after the orchestrator's inputs, as `order_seed` draws."""
     mgr = _subsystem(manager_factory, scenario, name, barrier)
     mgr._remove_agents_callback(RemoveAgents.Request(), RemoveAgents.Response())
     mgr._apply_scenario(scenario)
-    _start(mgr)
-    orchestrator = _Orchestrator(mgr, robots)
+    _start(mgr, epoch_ns)
+    orchestrator = _Orchestrator(mgr, robots, epoch_ns)
     order = random.Random(order_seed)
-    clock_ns = EPOCH_NS
+    clock_ns = epoch_ns
     mgr._subsystem_timer_callback(_clock(clock_ns))
     seen = -1
     rows: list[np.ndarray] = []
@@ -137,7 +137,7 @@ def _run(manager_factory: Callable[..., AgentManager], scenario: ScenarioConfig,
             n = mgr._pool.n
             rows.append(np.column_stack([np.full(n, mgr._tick_count - 1), mgr._pool.agent_ids[:n], mgr._pool.pos[:n, 0], mgr._pool.pos[:n, 1]]))
             # lockstep moves the clock on once the frame is out; the orchestrator's inputs race that clock
-            calls = [*orchestrator.inputs(stamp_ns), lambda s=stamp_ns: mgr._world_state_callback(_world_state(s, orchestrator.robot_pose((s - EPOCH_NS) / NS)))]
+            calls = [*orchestrator.inputs(stamp_ns), lambda s=stamp_ns: mgr._world_state_callback(_world_state(s, orchestrator.robot_pose((s - epoch_ns) // DT_NS * 0.05)))]
             clock_ns = stamp_ns + DT_NS
             clock_first = order.random() < 0.5
             if clock_first:
@@ -160,6 +160,15 @@ def test_with_the_barrier_racing_inputs_give_the_same_crowd(manager_factory: Cal
     for other in runs[1:]:
         assert other.shape == runs[0].shape
         assert np.array_equal(other, runs[0]), f"max deviation {np.abs(other - runs[0]).max():.3g} m"
+
+
+def test_the_crowd_does_not_depend_on_the_epoch(manager_factory: Callable[..., AgentManager]) -> None:
+    """A moving robot's velocity comes from whole-ns stamp differences: two epochs, the same crowd bit for bit."""
+    scenario = load_scenario(str(SCENARIOS / "bottleneck.yaml"))
+    a = _run(manager_factory, scenario, "epoch_a", barrier=True, robots=True, order_seed=0, ticks=80)
+    b = _run(manager_factory, scenario, "epoch_b", barrier=True, robots=True, order_seed=1, ticks=80, epoch_ns=987 * NS + 123_450_000)
+    assert a.shape == b.shape
+    assert np.array_equal(a, b), f"max deviation {np.abs(a - b).max():.3g} m"
 
 
 def test_without_the_barrier_the_same_inputs_land_a_tick_apart(manager_factory: Callable[..., AgentManager]) -> None:

@@ -245,7 +245,8 @@ class _ExternalEntity:
     saved_policy_idx: int | None = None
     vel: tuple[float, float] = (0.0, 0.0)
     pose: tuple[float, float] | None = None
-    stamp: float = 0.0
+    #: header stamp of the last fed pose in ns: velocities from whole-ns differences are the same floats on every epoch
+    stamp_ns: int = 0
 
 
 _NP_TYPES: dict[str, type[np.generic]] = {"B": np.uint8, "H": np.uint16, "h": np.int16, "i": np.int32, "I": np.uint32, "f": np.float32, "d": np.float64}
@@ -1510,7 +1511,7 @@ class AgentManager(TimeNode):
 
         return super().create_service(srv_type, srv_name, callback, **kwargs)
 
-    def _trace_input(self, name: str, payload: bytes, **extra: float | str) -> None:
+    def _trace_input(self, name: str, payload: bytes, **extra: object) -> None:
         trace = getattr(self, "_input_trace_file", None)
         if trace is None:
             trace = self._input_trace_file = open(_INPUT_TRACE, "a", buffering=1)  # noqa: SIM115
@@ -2471,9 +2472,10 @@ class AgentManager(TimeNode):
         world: WorldState = {}
         if self._latest_world_state is not None:
             stamp = self._latest_world_state.header.stamp
+            now_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
             if _INPUT_TRACE:
-                self._trace_input("world_state", serialize_message(self._latest_world_state), stamp_ns=stamp.sec * 1_000_000_000 + stamp.nanosec, n=len(self._latest_world_state.agents))
-            now = stamp.sec + stamp.nanosec * 1e-9
+                agents = self._latest_world_state.agents
+                self._trace_input("world_state", serialize_message(self._latest_world_state), stamp_ns=now_ns, n=len(agents), poses=[(a.name, a.pose.x, a.pose.y, a.velocity.x, a.velocity.y) for a in agents])
             for agent_msg in self._latest_world_state.agents:
                 world[agent_msg.agent_id] = WorldAgentState(
                     pose=Pose2D(
@@ -2483,13 +2485,13 @@ class AgentManager(TimeNode):
                     ),
                     velocity=(agent_msg.velocity.x, agent_msg.velocity.y),
                 )
-                self._ingest_external_agent(agent_msg, now)
+                self._ingest_external_agent(agent_msg, now_ns)
             self._latest_world_state = None
         self._expire_external_entities()
         self._apply_external_velocity_pins()
         return world
 
-    def _ingest_external_agent(self, agent_msg: AgentStateMsg, stamp: float) -> None:
+    def _ingest_external_agent(self, agent_msg: AgentStateMsg, stamp_ns: int) -> None:
         """Teleport the pool entity bound to this world_state id, binding or spawning it on first sight."""
         entity = self._external_entities.get(agent_msg.agent_id)
         if entity is None:
@@ -2511,13 +2513,13 @@ class AgentManager(TimeNode):
         radius = agent_msg.radius if agent_msg.radius > 0 else 0.3
         self._teleport_agent(entity.agent_id, agent_msg.pose.x, agent_msg.pose.y, agent_msg.pose.theta, radius)
         fed = (agent_msg.velocity.x, agent_msg.velocity.y)
-        entity.vel = fed if entity.saved_policy_idx is not None or any(fed) else self._velocity_between(entity, agent_msg.pose, stamp)
+        entity.vel = fed if entity.saved_policy_idx is not None or any(fed) else self._velocity_between(entity, agent_msg.pose, stamp_ns)
         entity.pose = (agent_msg.pose.x, agent_msg.pose.y)
-        entity.stamp = stamp
+        entity.stamp_ns = stamp_ns
 
-    def _velocity_between(self, entity: _ExternalEntity, pose: Pose2DMsg, stamp: float) -> tuple[float, float]:
+    def _velocity_between(self, entity: _ExternalEntity, pose: Pose2DMsg, stamp_ns: int) -> tuple[float, float]:
         """Velocity from the entity's previous fed pose to this one, zero across a stale gap or a jump."""
-        elapsed = stamp - entity.stamp
+        elapsed = (stamp_ns - entity.stamp_ns) / 1e9
         if entity.pose is None or not 0.0 < elapsed <= _EXTERNAL_VELOCITY_WINDOW_S:
             return (0.0, 0.0)
         vx = (pose.x - entity.pose[0]) / elapsed
