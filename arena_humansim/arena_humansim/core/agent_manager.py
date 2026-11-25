@@ -1504,12 +1504,13 @@ class AgentManager(TimeNode):
             inner = callback
 
             def callback(request: Any, response: Any) -> Any:  # noqa: ANN401
-                self._trace_input(srv_name, serialize_message(request))
+                detail = {key: getattr(request, key) for key in ("agent_id", "stimulus", "intensity") if isinstance(getattr(request, key, None), int | float | str)}
+                self._trace_input(srv_name, serialize_message(request), **detail)
                 return inner(request, response)
 
         return super().create_service(srv_type, srv_name, callback, **kwargs)
 
-    def _trace_input(self, name: str, payload: bytes, **extra: int) -> None:
+    def _trace_input(self, name: str, payload: bytes, **extra: float | str) -> None:
         trace = getattr(self, "_input_trace_file", None)
         if trace is None:
             trace = self._input_trace_file = open(_INPUT_TRACE, "a", buffering=1)  # noqa: SIM115
