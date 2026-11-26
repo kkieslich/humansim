@@ -178,11 +178,13 @@ def _inside_polygon(points: tuple[tuple[float, float], ...], x: float, y: float)
 @attrs.define
 class NoGo:
     """The walls an agent class plans with where stair or escalator halves it does not climb are walled off
-    (`NavMeshPlanner.set_areas`): their mesh, its inflation router, the routers that keep wider clearances and the body
-    routers, and the congestion on its edges."""
+    (`NavMeshPlanner.set_areas`): their mesh, its inflation router, the walls it was meshed on and the mesh edges of the
+    walls added since (blocked, as on the main mesh), the routers that keep wider clearances and the body routers."""
 
     mesh: Mesh
     router: Router
+    meshed: set[tuple[float, ...]] = attrs.field(factory=set)
+    blocked: np.ndarray = attrs.field(factory=lambda: np.zeros(0, np.int64))
     routers: dict[float, Router] = attrs.field(factory=dict)
     body: dict[float, Router] = attrs.field(factory=dict)
 
@@ -278,6 +280,8 @@ class NavMeshPlanner(GlobalPlanner):
         #: walled-off mesh (`NoGo`), and per agent of the last `compute` that set (empty: it climbs every half)
         self._areas: dict[str, tuple[str, tuple[tuple[float, float], ...]]] = {}
         self._nogo: dict[frozenset[str], NoGo] = {}
+        #: how long each walled-off mesh took to build [ms], for the record
+        self.nogo_builds: list[float] = []
         self._class_of: dict[int, frozenset[str]] = {}
         #: per blocked walker: the route `_reroute` last saw or made for it with the robots it goes round, and the side it
         #: goes round each robot by (+1 counter-clockwise, -1 clockwise); routers that also keep off robots standing still
@@ -326,13 +330,14 @@ class NavMeshPlanner(GlobalPlanner):
     def set_walls(self, segments: Segments) -> None:
         self._forget_paths()
         self._snapped.clear()
-        self._nogo.clear()
         self._wall_segments = list(segments)
         segs = np.array(segments, dtype=np.float64).reshape(-1, 4)
         segs = segs[np.hypot(*(segs[:, 2:] - segs[:, :2]).T) > TOL]
         keys = _keys(segs)
         if self._block(keys):
+            self._block_nogo(keys)
             return
+        self._nogo.clear()
         self._mesh = None
         self._router = None
         self._routers = {}
@@ -391,25 +396,50 @@ class NavMeshPlanner(GlobalPlanner):
             self._nogo.clear()
             self._forget_paths()
 
-    def _closed_to(self, agent: Any) -> frozenset[str]:
-        """The halves an agent does not climb: those whose kind is not among its `climbs` (none without the attribute),
-        but for one it stands on (the crowd pushed it there): from there it plans its way off."""
+    def _block_nogo(self, keys: set[tuple[float, ...]]) -> None:
+        """The walled-off meshes through a change of walls the main mesh took by blocking (doors and other mechanisms
+        that add walls and take them away again): the walls added since each was meshed are blocked on it; one that
+        lost a wall it was meshed on, or cannot block one, is dropped and built again on first use."""
+        for closed, nogo in list(self._nogo.items()):
+            if not nogo.meshed <= keys:
+                del self._nogo[closed]
+                continue
+            added = np.array(sorted(keys - nogo.meshed), dtype=np.float64).reshape(-1, 4)
+            edges = nogo.mesh.free_edges(added[:, :2], added[:, 2:])
+            if (edges < 0).any():
+                del self._nogo[closed]
+                continue
+            nogo.blocked = edges
+            for router in (nogo.router, *nogo.routers.values(), *nogo.body.values()):
+                router.set_blocked(edges)
+
+    def _closed_to(self, agent: object) -> frozenset[str]:
+        """The halves an agent does not climb: those whose kind is not among its `climbs` (none without the attribute).
+        One that stands on such a half (the crowd pushed it there) plans on the open walls, its way off; so a class has
+        one walled-off mesh, not one per half its agents stand on."""
         climbs = getattr(getattr(agent, "params", None), "climbs", None)
         if climbs is None or not self._areas:
             return frozenset()
-        x, y = agent.state.pose.x, agent.state.pose.y
-        return frozenset(name for name, (kind, fp) in self._areas.items() if kind not in climbs and not _inside_polygon(fp, x, y))
+        pose = agent.state.pose  # pyright: ignore[reportAttributeAccessIssue]  # every planned agent has a state
+        closed = frozenset(name for name, (kind, _) in self._areas.items() if kind not in climbs)
+        if any(_inside_polygon(self._areas[name][1], pose.x, pose.y) for name in closed):
+            return frozenset()
+        return closed
 
     def _nogo_for(self, closed: frozenset[str]) -> NoGo:
         """The walled-off mesh for the halves `closed`, built on first use: the walls and the halves' outlines."""
         hit = self._nogo.get(closed)
         if hit is None:
-            segs = np.array(self._wall_segments, dtype=np.float64).reshape(-1, 4)
+            began = time.perf_counter()
+            walls = np.array(self._wall_segments, dtype=np.float64).reshape(-1, 4)
+            walls = walls[np.hypot(*(walls[:, 2:] - walls[:, :2]).T) > TOL]
             outlines = [(*a, *b) for name in sorted(closed) for fp in [self._areas[name][1]] for a, b in zip(fp, fp[1:] + fp[:1], strict=True)]
-            segs = np.vstack([segs, np.array(outlines, dtype=np.float64).reshape(-1, 4)])
+            segs = np.vstack([walls, np.array(outlines, dtype=np.float64).reshape(-1, 4)])
             segs = segs[np.hypot(*(segs[:, 2:] - segs[:, :2]).T) > TOL]
             mesh = Mesh.build(segs, 2 * max(self._comfort_radius, self._inflation_radius * 1.05))
-            hit = self._nogo[closed] = NoGo(mesh, Router(mesh, self._inflation_radius, self._comfort_radius))
+            hit = self._nogo[closed] = NoGo(mesh, Router(mesh, self._inflation_radius, self._comfort_radius), meshed=_keys(walls))
+            self.nogo_builds.append((time.perf_counter() - began) * 1e3)
+            self._logger.info(f"Walls meshed with {len(closed)} stair or escalator half(s) walled off: {len(mesh.V)} triangles, {self.nogo_builds[-1]:.0f} ms")
             if self._crowd is not None:
                 self._nogo_congestion(hit)
         return hit
@@ -434,6 +464,8 @@ class NavMeshPlanner(GlobalPlanner):
                 return nogo.router
             if clearance not in nogo.routers:
                 nogo.routers[clearance] = Router(nogo.mesh, clearance, self._comfort_radius)
+                if len(nogo.blocked):
+                    nogo.routers[clearance].set_blocked(nogo.blocked)
                 if self._crowd is not None:
                     self._nogo_congestion(nogo)
             return nogo.routers[clearance]
@@ -462,6 +494,8 @@ class NavMeshPlanner(GlobalPlanner):
             nogo = self._nogo_for(closed)
             if clearance not in nogo.body:
                 nogo.body[clearance] = Router(nogo.mesh, clearance, self._comfort_radius)
+                if len(nogo.blocked):
+                    nogo.body[clearance].set_blocked(nogo.blocked)
             return nogo.body[clearance]
         if clearance not in self._body_routers:
             router = Router(self._mesh, clearance, self._comfort_radius)

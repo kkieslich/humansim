@@ -208,3 +208,41 @@ def test_a_wheelchair_pushed_onto_a_half_plans_its_way_off(agent_factory: Callab
     chair.params = attrs.evolve(chair.params, agent_radius=0.325, climbs=())
     points = _go(planner, chair, (119.0, 46.0))
     assert np.hypot(points[-1].x - 119.0, points[-1].y - 46.0) < 0.5
+
+
+def _free_edge_near(planner: NavMeshPlanner, x: float, y: float) -> tuple[tuple[float, float], tuple[float, float]]:
+    """A mesh edge that is no wall, near (x, y): a wall there is taken by blocking, as a door that closes."""
+    mesh = planner._mesh
+    assert mesh is not None
+    for k in np.argsort(np.hypot(mesh.e_mid[:, 0] - x, mesh.e_mid[:, 1] - y)).tolist():
+        a, b = mesh.P[mesh.ea[k]], mesh.P[mesh.eb[k]]
+        if mesh.free_edges(np.array([a]), np.array([b]))[0] >= 0:
+            return (float(a[0]), float(a[1])), (float(b[0]), float(b[1]))
+    raise AssertionError("no free edge")
+
+
+def test_the_walled_off_mesh_lasts_through_walls_that_come_and_go(agent_factory: Callable[..., BaseAgent]) -> None:
+    """Doors and other mechanisms add walls and take them away again; the main mesh takes that by blocking edges, and
+    the walled-off mesh does the same instead of being built again."""
+    planner = _planner()
+    chair = agent_factory(agent_id=1, x=START[0], y=START[1])
+    chair.params = attrs.evolve(chair.params, agent_radius=0.325, climbs=())
+    _go(planner, chair, BEYOND)
+    assert len(planner.nogo_builds) == 1
+    door = _free_edge_near(planner, 119.5, 46.5)
+    walls = [*WALLS, *GATES, *BOX]
+    for k in range(6):
+        planner.set_walls([*walls, door] if k % 2 == 0 else walls)
+        points = _go(planner, chair, BEYOND)
+        assert not any(_in_a_half(p.x, p.y) for p in points)
+    assert len(planner.nogo_builds) == 1
+
+
+def test_wheelchair_users_on_different_halves_share_one_walled_off_mesh(agent_factory: Callable[..., BaseAgent]) -> None:
+    planner = _planner()
+    for aid, (x, y) in enumerate([START, (124.0, 46.5), (125.8, 46.0), (122.0, 45.5)], start=1):
+        chair = agent_factory(agent_id=aid, x=x, y=y)
+        chair.params = attrs.evolve(chair.params, agent_radius=0.325, climbs=())
+        cmd = {aid: HighLevelCommand(agent_id=aid, type=CommandType.NAVIGATE, target_pose=Pose2D(x=119.0, y=46.0), desired_velocity=0.9)}
+        planner.compute([chair], cmd)
+    assert len(planner.nogo_builds) == 1
