@@ -25,6 +25,10 @@ THROUGH_CLEAR = 1.0
 LANE_MARGIN = 0.5
 #: Route choice (`route_choice`): a walker chooses again between walking and the stairs at most this often [s]
 CHOICE_INTERVAL = 5.0
+#: A stair half or cabin struck off for a walker that could not walk to it comes back once the walker has moved this far
+#: from where it was struck [m], or `CHOICE_INTERVAL` later: whether the leg can be walked depends on where the walker
+#: comes from, and on robots standing still in its way that may leave
+STRIKE_MOVE_M = 2.0
 #: Route choice choices are spread over this many slots of a second `CHOICE_INTERVAL` by agent id (the next choice comes
 #: 5-10 s later), so a crowd that chose together does not choose again (and plan its paths) in one tick
 CHOICE_STAGGER = 20
@@ -212,9 +216,12 @@ class TeleportZones:
         self.transfers: dict[int, Transfer] = {}
         self.riders: set[int] = set()
         self._banned: dict[int, tuple[tuple[float, float], list[str]]] = {}
-        #: per walker, for its goal: the stair halves and cabins it could not walk to (`_strike_unroutable`), left out of
-        #: its choice until its goal changes
-        self._unwalkable: dict[int, tuple[tuple[float, float], set[str]]] = {}
+        #: per walker, for its goal: the stair halves and cabins it could not walk to (`_strike_unroutable`), each with
+        #: where it stood and when [s], left out of its choice until it moved `STRIKE_MOVE_M` or `CHOICE_INTERVAL` passed
+        self._unwalkable: dict[int, tuple[tuple[float, float], dict[str, tuple[float, float, float]]]] = {}
+        self._now = 0.0
+        #: per walker, the halves and cabins struck off for it before (later strikes of one are logged at debug level)
+        self._struck_before: dict[int, set[str]] = {}
         self._held: set[int] = set()
         self._walks: dict[int, tuple[tuple[float, float], frozenset[str]]] = {}
         self._joined: dict[str, str] = {}
@@ -292,6 +299,7 @@ class TeleportZones:
         self.transfers.clear()
         self._banned.clear()
         self._unwalkable.clear()
+        self._struck_before.clear()
         self._walks.clear()
         self.riders.clear()
         self._held.clear()
@@ -306,6 +314,7 @@ class TeleportZones:
         self.transfers.pop(aid, None)
         self._banned.pop(aid, None)
         self._unwalkable.pop(aid, None)
+        self._struck_before.pop(aid, None)
         self._walks.pop(aid, None)
         self._held.discard(aid)
         self.through.pop(aid, None)
@@ -324,6 +333,8 @@ class TeleportZones:
 
         With `route_choice`, `now` [s] paces each walker's choice between walking and riding (no pacing without it)."""
         self.through = {}
+        if now is not None:
+            self._now = now
         if not self.zones:
             return cmds
         out = dict(cmds)
@@ -396,10 +407,14 @@ class TeleportZones:
         if climbs not in blocked:
             blocked[climbs] = self._blocked(climbs)
         unwalkable = self._unwalkable.get(aid)
-        if unwalkable is not None and unwalkable[0] != goal:
-            unwalkable = None
-            del self._unwalkable[aid]
-        closed = blocked[climbs] if unwalkable is None else blocked[climbs] | unwalkable[1]
+        if unwalkable is not None:
+            for name, (sx, sy, since) in list(unwalkable[1].items()):
+                if unwalkable[0] != goal or math.hypot(near[0] - sx, near[1] - sy) > STRIKE_MOVE_M or self._now - since >= CHOICE_INTERVAL:
+                    del unwalkable[1][name]
+            if not unwalkable[1]:
+                unwalkable = None
+                del self._unwalkable[aid]
+        closed = blocked[climbs] if unwalkable is None else blocked[climbs] | set(unwalkable[1])
         if transfer is not None and self._joined.get(transfer.zone) == transfer.destination:
             zone = self.zones[transfer.zone]
             on = zone.contains(*near) or self.zones[transfer.destination].contains(*near)
@@ -449,11 +464,12 @@ class TeleportZones:
 
     def _strike_unroutable(self, planner: GlobalPlanner) -> None:
         """A walker whose route to the stair half or cabin it chose failed (`GlobalPlanner.unroutable`): that choice is
-        struck off for it while its goal stays (`_unwalkable`), and it chooses again. The stair choice
+        struck off for it (`_unwalkable`) until it moved `STRIKE_MOVE_M` from there or `CHOICE_INTERVAL` passed, and it
+        chooses again (where nothing else is left it walks at its goal, and the planner warns once it stands). The stair choice
         prices legs without checking their funnels against the walls, so it can choose a half whose entry the walker
         cannot walk to; without this the walker would walk to the nearest point it can reach, for good."""
         unroutable = getattr(planner, "unroutable", None)  # a planner stand-in without it reports none
-        for aid, target, _ in unroutable() if callable(unroutable) else ():
+        for aid, target, (x, y) in unroutable() if callable(unroutable) else ():
             transfer = self.transfers.get(aid)
             if transfer is None or transfer.aboard:
                 continue
@@ -462,8 +478,12 @@ class TeleportZones:
             if math.hypot(point.x - target[0], point.y - target[1]) > 1e-2:
                 continue
             del self.transfers[aid]
-            self._unwalkable.setdefault(aid, (transfer.goal, set()))[1].add(transfer.zone)
-            planner._logger.info(f"unroutable leg: agent {aid} cannot walk to {transfer.zone}; struck off for it, choosing again")
+            struck = self._unwalkable.setdefault(aid, (transfer.goal, {}))[1]
+            again = transfer.zone in self._struck_before.get(aid, ())
+            struck[transfer.zone] = (x, y, self._now)
+            self._struck_before.setdefault(aid, set()).add(transfer.zone)
+            log = planner._logger.debug if again else planner._logger.info
+            log(f"unroutable leg: agent {aid} cannot walk to {transfer.zone}; struck off for it, choosing again")
 
     def _inner(self, zone: Zone, across: float = 0.0) -> Pose2D:
         """Where a stair half is walked to: its lane point on the hold line, on a pair joined in place a point short of the seam `across` meters off its center line."""
