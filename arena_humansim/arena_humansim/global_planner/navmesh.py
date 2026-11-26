@@ -1191,6 +1191,24 @@ class NavMeshPlanner(GlobalPlanner):
             out[k] = float(lengths[k] * np.mean(slow[a:b]))
         return out
 
+    def leg_costs(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
+        """The congestion-weighted cost of each leg [m] on the main router's shortest-path tree toward its goal
+        (`Router.costs`, one tree per goal, kept until the next congestion update), between the snapped and framed ends
+        `paths` would plan between: no funnel, lane shift or wall check per leg. Through edge midpoints a few per cent
+        longer than the funnelled path where the way bends."""
+        if self._router is None:
+            return [math.hypot(b.x - a.x, b.y - a.y) for a, b in legs]
+        ends = self.snap_terminals([pose for leg in legs for pose in leg])
+        out = [math.inf] * len(legs)
+        by_goal: dict[tuple[float, float], list[int]] = {}
+        for k in range(len(legs)):
+            by_goal.setdefault((ends[2 * k + 1].x, ends[2 * k + 1].y), []).append(k)
+        for (gx, gy), ks in by_goal.items():
+            starts = self._inside(np.array([(ends[2 * k].x, ends[2 * k].y) for k in ks], dtype=np.float64))
+            for k, cost in zip(ks, self._router.costs(starts, self._inside(np.array([gx, gy], dtype=np.float64))).tolist(), strict=True):
+                out[k] = cost
+        return out
+
     def leg_floors(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
         """The straight distance between the two points each leg's priced path (`paths`) runs between: its first point
         is the snapped start, its last the target snapped once more (`_plan_group`). No path is shorter, and the

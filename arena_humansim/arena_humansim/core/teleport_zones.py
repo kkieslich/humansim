@@ -4,6 +4,7 @@ import contextlib
 import enum
 import math
 import operator
+from collections import Counter
 from collections.abc import Generator, Sequence
 
 import attrs
@@ -231,6 +232,13 @@ class TeleportZones:
         #: walkers that climb take a stair half beside its partner too where riding it is quicker than walking, the walks
         #: timed on the planner's congestion weights, and choose again every `CHOICE_INTERVAL` (`zone_route_choice`)
         self.route_choice = False
+        #: how route choice times a walk (`zone_route_pricing`): "tree", on the planner's shortest-path trees, or "paths",
+        #: on planned paths; with `shadow` (`zone_route_pricing_shadow`) each choice is priced both ways and counted:
+        #: choices per walker class, and per (class, what this pricing chose, what the other chose) where they differ
+        self.pricing = "tree"
+        self.shadow = False
+        self.shadow_choices: Counter[str] = Counter()
+        self.shadow_flips: Counter[tuple[str, str, str]] = Counter()
         #: per pedestrian the time [s] from which its route choice is due again (route choice only)
         self._next_choice: dict[int, float] = {}
         #: the tick each pedestrian held on a seam (its landing taken) was first held there
@@ -297,6 +305,8 @@ class TeleportZones:
 
     def clear_transfers(self) -> None:
         self.transfers.clear()
+        self.shadow_choices.clear()
+        self.shadow_flips.clear()
         self._banned.clear()
         self._unwalkable.clear()
         self._struck_before.clear()
@@ -537,81 +547,122 @@ class TeleportZones:
         if not work:
             return out
 
-        def walked(ws: Sequence[dict], paths: Sequence[list[Pose2D] | None]) -> list[float]:
-            """The walk time of each walker's path, the congestion-weighted ones priced in one `path_costs` call."""
-            out = [math.inf if not path else _walk_time(path, w["speed"]) for w, path in zip(ws, paths, strict=True)]
-            weighed = [(k, path) for k, (w, path) in enumerate(zip(ws, paths, strict=True)) if w["choose"] and path]
-            for (k, _), cost in zip(weighed, planner.path_costs([path for _, path in weighed]), strict=True):
-                out[k] = cost / ws[k]["speed"]
-            return out
-
         # each stair half's congestion-weighted run both ways, once for all walkers (`_ride_time`)
         names = sorted(self.zones)
         runs = planner.path_costs([run for name in names for run in ([self.zones[name].entry, self.zones[name].hold], [self.zones[name].hold, self.zones[name].entry])]) if any(w["choose"] for w in work) else []
         crowded = {name: (runs[2 * k], runs[2 * k + 1]) for k, name in enumerate(names)} if runs else None
-        walks = walked(work, planner.paths([(w["near"], w["target"]) for w in work]))
-        for w, walk in zip(work, walks, strict=True):
+        priced = self._price(planner, work, self.pricing, crowded)
+        other = self._price(planner, work, "paths" if self.pricing == "tree" else "tree", crowded) if self.shadow and any(w["choose"] for w in work) else None
+        for n, (w, p) in enumerate(zip(work, priced, strict=True)):
+            best = self._decide(w, p)
+            if other is not None and w["choose"]:
+                self._count_choice(w["agent"], best, self._decide(w, other[n]))
+            if best is not None:
+                out[w["k"]] = best
+                continue
+            self._walks[w["aid"]] = w["key"]
+        return out
+
+    def _price(self, planner: GlobalPlanner, work: Sequence[dict], pricing: str, crowded: dict[str, tuple[float, float]] | None) -> list[dict]:
+        """Each walker's options timed: its walk, and per stair it might ride its way there, the climb and the way on.
+
+        A walker that chooses (`route_choice`) has its walks timed by `pricing`: "tree" on the planner's shortest-path
+        trees (`GlobalPlanner.leg_costs`, one tree lookup per leg), "paths" on planned paths (`GlobalPlanner.paths`
+        weighed by `path_costs`); a walker that does not choose on planned paths' plain length. Every leg of a stage is
+        priced in one call."""
+
+        def walked(ws: Sequence[dict], legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
+            out = [math.inf] * len(legs)
+            treed = [k for k, w in enumerate(ws) if w["choose"] and pricing == "tree"]
+            for k, cost in zip(treed, planner.leg_costs([legs[k] for k in treed]) if treed else [], strict=True):
+                out[k] = cost / ws[k]["speed"]
+            planned = [k for k, w in enumerate(ws) if not (w["choose"] and pricing == "tree")]
+            paths = planner.paths([legs[k] for k in planned]) if planned else []
+            weighed = []
+            for k, path in zip(planned, paths, strict=True):
+                if path and ws[k]["choose"]:
+                    weighed.append((k, path))
+                elif path:
+                    out[k] = _walk_time(path, ws[k]["speed"])
+            for (k, _), cost in zip(weighed, planner.path_costs([path for _, path in weighed]), strict=True):
+                out[k] = cost / ws[k]["speed"]
+            return out
+
+        priced = [{} for _ in work]
+        for w, p, walk in zip(work, priced, walked(work, [(w["near"], w["target"]) for w in work]), strict=True):
             near, target, speed, rides = w["near"], w["target"], w["speed"], w["rides"]
             ride = [self._ride_time(name, dest, speed, w["agent"].params.stair_effort, planner if w["choose"] else None, crowded) for name, dest in rides]
             reach = [math.hypot(self.zones[name].entry.x - near.x, self.zones[name].entry.y - near.y) / speed for name, _ in rides]
             rest = [math.hypot(target.x - self.zones[dest].entry.x, target.y - self.zones[dest].entry.y) / speed for _, dest in rides]
             first, last = min(map(operator.add, reach, ride)), min(map(operator.add, ride, rest))
             kept = [i for i in range(len(rides)) if min(reach[i], first) + ride[i] + min(rest[i], last) < walk or rides[i] == w["held"]]
-            w["walk"], w["rides"], w["ride"] = walk, [rides[i] for i in kept], [ride[i] for i in kept]
-            w["mouths"] = [self.zones[name].entry for name, _ in w["rides"]]
-            w["lands"] = [self.zones[dest].entry for _, dest in w["rides"]]
-        riding = [w for w in work if w["rides"]]
+            p["walk"], p["rides"], p["ride"] = walk, [rides[i] for i in kept], [ride[i] for i in kept]
+            p["mouths"] = [self.zones[name].entry for name, _ in p["rides"]]
+            p["lands"] = [self.zones[dest].entry for _, dest in p["rides"]]
+        riding = [(w, p) for w, p in zip(work, priced, strict=True) if p["rides"]]
         # the ways on from each landing first: walkers with one goal share them (`paths` answers them once). A way that
         # cannot beat walking even with the shortest possible way to its stair (`leg_floors`) is out, and the walker's
-        # own way to that stair is not planned: it never is the quickest, so the choice is the one all ways would give
-        rests = iter(walked([w for w in riding for _ in w["lands"]], planner.paths([(land, w["target"]) for w in riding for land in w["lands"]])))
-        floors = iter(planner.leg_floors([(w["near"], mouth) for w in riding for mouth in w["mouths"]]))
-        boards: list[tuple[dict, int]] = []
-        for w in riding:
-            n = len(w["rides"])
-            w["rest"] = [next(rests) for _ in range(n)]
-            w["board"] = [math.inf] * n
-            w["out"] = set()
+        # own way to that stair is not priced: it never is the quickest, so the choice is the one all ways would give.
+        # Tree costs are cheap enough to price every way (and need no floor)
+        rests = iter(walked([w for w, p in riding for _ in p["lands"]], [(land, w["target"]) for w, p in riding for land in p["lands"]]))
+        floored = [(w, p) for w, p in riding if not (w["choose"] and pricing == "tree")]
+        floors = iter(planner.leg_floors([(w["near"], mouth) for w, p in floored for mouth in p["mouths"]]))
+        boards: list[tuple[dict, dict, int]] = []
+        for w, p in riding:
+            n = len(p["rides"])
+            p["rest"] = [next(rests) for _ in range(n)]
+            p["board"] = [math.inf] * n
+            p["out"] = set()
+            floor_at = not (w["choose"] and pricing == "tree")
             for i in range(n):
-                floor = next(floors) / w["speed"]
-                if math.isfinite(w["rest"][i]) and w["rides"][i] != w["held"] and floor + w["ride"][i] + w["rest"][i] > w["walk"] + PRICE_SLACK:
-                    w["out"].add(i)
+                floor = next(floors) / w["speed"] if floor_at else -math.inf
+                if math.isfinite(p["rest"][i]) and p["rides"][i] != w["held"] and floor + p["ride"][i] + p["rest"][i] > p["walk"] + PRICE_SLACK:
+                    p["out"].add(i)
                 else:
-                    boards.append((w, i))
-        for (w, i), board in zip(boards, walked([w for w, _ in boards], planner.paths([(w["near"], w["mouths"][i]) for w, i in boards])), strict=True):
-            w["board"][i] = board
-        points = [p for w in riding for p in (*w["lands"], *w["mouths"])]
+                    boards.append((w, p, i))
+        for (_, p, i), board in zip(boards, walked([w for w, _, _ in boards], [(w["near"], p["mouths"][i]) for w, p, i in boards]), strict=True):
+            p["board"][i] = board
+        points = [q for _, p in riding for q in (*p["lands"], *p["mouths"])]
         comps_all = iter(planner.components(points) if points else [])
-        hops: list[tuple[dict, tuple[int, int]]] = []
-        for w in riding:
-            n = len(w["rides"])
+        hops: list[tuple[dict, dict, tuple[int, int]]] = []
+        for w, p in riding:
+            n = len(p["rides"])
             comps = [next(comps_all) for _ in range(2 * n)]
-            hops.extend((w, (i, j)) for i in range(n) if math.isinf(w["rest"][i]) for j in range(n) if comps[i] & comps[n + j])
-        onward = walked([w for w, _ in hops], planner.paths([(w["lands"][i], w["mouths"][j]) for w, (i, j) in hops]))
-        for w in riding:
-            w["onward"] = {}
-        for (w, leg), hop in zip(hops, onward, strict=True):
-            w["onward"][leg] = hop
-        for w in work:
-            rides, ride, held, speed = w["rides"], w["ride"], w["held"], w["speed"]
-            options: dict[tuple[str, str] | None, float] = {None: w["walk"]}
-            if rides:
-                board, rest = w["board"], w["rest"]
-                for _ in rides:
-                    for (i, j), hop in w["onward"].items():
-                        rest[i] = min(rest[i], hop + ride[j] + rest[j])
-                options.update((rides[i], board[i] + ride[i] + rest[i]) for i in range(len(rides)) if i not in w["out"])
-            order = {edge: k for k, edge in enumerate(options)}
-            best = min(options, key=lambda e: (options[e], order[e]))
-            if w["choose"] and (held is not None or w["walking"]) and best != held:
-                kept_time = options.get(held, math.inf)
-                if math.isfinite(kept_time) and options[best] + max(SWITCH_M / speed, SWITCH_SHARE * kept_time) >= kept_time:
-                    best = held
-            if best is not None:
-                out[w["k"]] = best
-                continue
-            self._walks[w["aid"]] = w["key"]
-        return out
+            hops.extend((w, p, (i, j)) for i in range(n) if math.isinf(p["rest"][i]) for j in range(n) if comps[i] & comps[n + j])
+        onward = walked([w for w, _, _ in hops], [(p["lands"][i], p["mouths"][j]) for _, p, (i, j) in hops])
+        for _, p in riding:
+            p["onward"] = {}
+        for (_, p, leg), hop in zip(hops, onward, strict=True):
+            p["onward"][leg] = hop
+        return priced
+
+    def _decide(self, w: dict, p: dict) -> tuple[str, str] | None:
+        """The quickest of a walker's priced options (`_price`), None for walking: it keeps what it holds, or walking,
+        unless another way is quicker by `SWITCH_SHARE` of it and by `SWITCH_M` of walking."""
+        rides, held, speed = p["rides"], w["held"], w["speed"]
+        options: dict[tuple[str, str] | None, float] = {None: p["walk"]}
+        if rides:
+            ride, board, rest = p["ride"], p["board"], list(p["rest"])
+            for _ in rides:
+                for (i, j), hop in p["onward"].items():
+                    rest[i] = min(rest[i], hop + ride[j] + rest[j])
+            options.update((rides[i], board[i] + ride[i] + rest[i]) for i in range(len(rides)) if i not in p["out"])
+        order = {edge: k for k, edge in enumerate(options)}
+        best = min(options, key=lambda e: (options[e], order[e]))
+        if w["choose"] and (held is not None or w["walking"]) and best != held:
+            kept_time = options.get(held, math.inf)
+            if math.isfinite(kept_time) and options[best] + max(SWITCH_M / speed, SWITCH_SHARE * kept_time) >= kept_time:
+                best = held
+        return best
+
+    def _count_choice(self, agent: BaseAgent, chosen: tuple[str, str] | None, other: tuple[str, str] | None) -> None:
+        """Shadow pricing (`shadow`): count one choice by walker class and by what each pricing chose ("walk" or the
+        stair half boarded)."""
+        cls = str(getattr(agent.params, "name", "") or "walker")
+        mine, theirs = "walk" if chosen is None else chosen[0], "walk" if other is None else other[0]
+        self.shadow_choices[cls] += 1
+        if mine != theirs:
+            self.shadow_flips[(cls, mine, theirs)] += 1
 
     def _ride_time(self, name: str, dest: str, speed: float, effort: float, crowding: GlobalPlanner | None = None, crowded: dict[str, tuple[float, float]] | None = None) -> float:
         """Time over a stair from its entry to its partner's: carried at belt speed, climbed at stair speed times the effort on a still one, and the flight's `delay` between two halves side by side.
