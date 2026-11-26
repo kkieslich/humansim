@@ -293,8 +293,8 @@ def test_a_walker_that_cannot_walk_to_the_stair_half_it_chose_chooses_again(mana
     point = mgr._zones._inner(mgr._zones.zones["st_a"])
     plan_group = planner._plan_group
 
-    def no_walked_route_to_the_half(router, group):  # noqa: ANN001, ANN202 - wraps NavMeshPlanner._plan_group
-        plans = plan_group(router, group)
+    def no_walked_route_to_the_half(router, group, base=None):  # noqa: ANN001, ANN202 - wraps NavMeshPlanner._plan_group
+        plans = plan_group(router, group, base)
         if not planner._pricing:
             for aid, _, target in group:
                 if math.dist((target.x, target.y), (point.x, point.y)) < 1e-2:
@@ -328,8 +328,8 @@ def _fail_legs_to(mgr: AgentManager, half: str, where: Callable[[float, float], 
     point = mgr._zones._inner(mgr._zones.zones[half])
     plan_group = planner._plan_group
 
-    def failing(router, group):  # noqa: ANN001, ANN202 - wraps NavMeshPlanner._plan_group
-        plans = plan_group(router, group)
+    def failing(router, group, base=None):  # noqa: ANN001, ANN202 - wraps NavMeshPlanner._plan_group
+        plans = plan_group(router, group, base)
         if not planner._pricing:
             for aid, pos, target in group:
                 if math.dist((target.x, target.y), (point.x, point.y)) < 1e-2 and where(pos.x, pos.y):
