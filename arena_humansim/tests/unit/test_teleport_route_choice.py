@@ -342,7 +342,7 @@ def test_one_steer_prices_every_walker_as_alone_in_four_batches(agent_factory: C
     assert len(calls) <= 4 and sum(calls) > len(walkers)
 
 
-def _crowd_steers(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner) -> tuple[list[tuple], int]:
+def _crowd_steers(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, pricing: str = "paths") -> tuple[list[tuple], int]:
     """Five steers of a 60-walker crowd in both rooms and the corridor, half of it heading for each room, in a jam
     round A's stair mouth: every command, transfer, walk memo and choice time after each, and the legs planned."""
     rng = np.random.default_rng(3)
@@ -360,7 +360,7 @@ def _crowd_steers(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlann
     paths = planner.paths
     planner.paths = lambda asked: legs.append(len(asked)) or paths(asked)  # type: ignore[method-assign]
     tz = _zones(_stairs())
-    tz.pricing = "paths"  # the floors cut planned paths only
+    tz.pricing = pricing  # the floors cut planned paths only
     seen = []
     for step in range(5):
         for walker in walkers:
@@ -466,7 +466,6 @@ def test_lane_shifts_of_many_routes_at_once_are_those_one_by_one(side: str) -> N
     assert any(not np.array_equal(b, p) for b, p in zip(many, polylines, strict=True))
 
 
-
 @pytest.mark.parametrize("pricing", ["tree", "paths"])
 def test_both_pricings_take_the_stair_over_a_long_detour_and_walk_to_a_target_close_by(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, pricing: str) -> None:
     tz = _zones(_stairs())
@@ -540,3 +539,15 @@ def test_without_the_shadow_nothing_is_priced_twice(agent_factory: Callable[...,
     tz.steer([walker], _go([walker], IN_B), now=0.0)
     assert len(priced.legs) > once
     assert not tz.shadow_flips
+
+
+def test_tree_pricing_steers_the_same_crowd_the_same_way_every_time(agent_factory: Callable[..., BaseAgent]) -> None:
+    """Two fresh planners steering the same crowd five times with tree pricing take byte-identical choices, choice
+    times and walk memos: the trees depend only on the walls, the goal and the crowd."""
+    runs = []
+    for _ in range(2):
+        planner = NavMeshPlanner(inflation_radius=0.38, comfort_radius=0.6)
+        planner.set_walls(WALLS)
+        runs.append(_crowd_steers(agent_factory, planner, pricing="tree")[0])
+    assert runs[0] == runs[1]
+    assert any(choice for _, choice, *_ in runs[0])
