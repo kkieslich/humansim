@@ -273,6 +273,14 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         """Walking cost of a planned path [m]: its length, weighted by congestion where the planner weighs it."""
         return float(sum(math.hypot(b.x - a.x, b.y - a.y) for a, b in zip(path, path[1:], strict=False)))
 
+    def path_costs(self, paths: Sequence[Sequence[Pose2D]]) -> list[float]:
+        """`path_cost` of each path."""
+        return [self.path_cost(path) for path in paths]
+
+    def leg_floors(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
+        """A floor under the `path_cost` of the path `paths` plans for each leg, 0 where the planner knows none."""
+        return [0.0] * len(legs)
+
     def set_robots(self, robots: Robots) -> None:
         """The robots the walkers of the next `compute` share the floor with (id: x, y, body radius). Only a robot that
         stands still for `ROBOT_STILL_S` counts for routes, and only for the walkers it blocks (`_note_blockers`)."""

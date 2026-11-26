@@ -874,6 +874,44 @@ class NavMeshPlanner(GlobalPlanner):
         samples = np.column_stack([np.interp(at, along, pts[:, 0]), np.interp(at, along, pts[:, 1])])
         return float(length * np.mean(self._weidmann(self._crowd.query_ball_point(samples, CONGESTION_RADIUS, return_length=True))))
 
+    def path_costs(self, paths: Sequence[Sequence[Pose2D]]) -> list[float]:
+        """`path_cost` of each path, the crowd around the sample points of all of them counted in one query."""
+        lengths = [GlobalPlanner.path_cost(self, path) for path in paths]
+        if self._slowdown is None or self._crowd is None:
+            return lengths
+        weighed, chunks = [], []
+        for k, (path, length) in enumerate(zip(paths, lengths, strict=True)):
+            if len(path) < 2 or length <= 0.0:
+                continue
+            pts = np.array([(p.x, p.y) for p in path], dtype=np.float64)
+            along = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+            at = np.arange(PATH_COST_STEP / 2.0, along[-1], PATH_COST_STEP)
+            if not len(at):
+                at = np.array([along[-1] / 2.0])
+            weighed.append(k)
+            chunks.append(np.column_stack([np.interp(at, along, pts[:, 0]), np.interp(at, along, pts[:, 1])]))
+        if not chunks:
+            return lengths
+        slow = self._weidmann(self._crowd.query_ball_point(np.vstack(chunks), CONGESTION_RADIUS, return_length=True))
+        bounds = np.cumsum([0] + [len(chunk) for chunk in chunks])
+        out = list(lengths)
+        for k, a, b in zip(weighed, bounds[:-1].tolist(), bounds[1:].tolist(), strict=True):
+            out[k] = float(lengths[k] * np.mean(slow[a:b]))
+        return out
+
+    def leg_floors(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
+        """The straight distance between the two points each leg's priced path (`paths`) runs between: its first point
+        is the snapped start, its last the target snapped once more (`_plan_group`). No path is shorter, and the
+        congestion weights of `path_cost` are at least 1."""
+        if not self._has_map():
+            return [math.hypot(b.x - a.x, b.y - a.y) for a, b in legs]
+        ends = self.snap_terminals([pose for leg in legs for pose in leg])
+        out = []
+        for k in range(len(legs)):
+            a, b = ends[2 * k], self.snap_terminal(ends[2 * k + 1])
+            out.append(math.hypot(b.x - a.x, b.y - a.y))
+        return out
+
     def _set_slowdown(self, slowdown: np.ndarray | None) -> None:
         self._slowdown = slowdown
         for router in (self._router, *self._routers.values()):
@@ -887,17 +925,28 @@ class NavMeshPlanner(GlobalPlanner):
         to opposite sides of a passage instead of meeting head-on on one line. A corner moves as far as its walkers'
         bodies keep `LANE_WALL_GAP` from the walls (their clearance without the margin): the full offset, half of it,
         or not at all. The ends stay. A body-radius route (`_escape`) keeps no lane."""
-        if self._lane_side == "none" or self._lane_offset <= 0.0 or len(polyline) < 3 or router.r < self._inflation_radius - 1e-9:
-            return polyline
+        return self._lanes_many(router, [polyline])[0]
+
+    def _lanes_many(self, router: Router, polylines: Sequence[np.ndarray]) -> list[np.ndarray]:
+        """`_lanes` of each polyline, the walls looked up for the corners and the shifted routes of all of them at once."""
+        out = list(polylines)
+        if self._lane_side == "none" or self._lane_offset <= 0.0 or router.r < self._inflation_radius - 1e-9:
+            return out
+        todo = [k for k, polyline in enumerate(polylines) if len(polyline) >= 3]
+        if not todo:
+            return out
         body = max(router.r - self._margin, MIN_BODY_RADIUS) + LANE_WALL_GAP
         sign = 1.0 if self._lane_side == "right" else -1.0
-        d = np.diff(polyline, axis=0)
-        d /= np.maximum(np.hypot(d[:, 0], d[:, 1]), 1e-9)[:, None]
-        normals = sign * np.column_stack([d[:, 1], -d[:, 0]])
-        n = normals[:-1] + normals[1:]
-        length = np.hypot(n[:, 0], n[:, 1])
-        n = np.where(length[:, None] > 1e-6, n / np.maximum(length, 1e-9)[:, None], normals[:-1])
-        inner = polyline[1:-1]
+        shifts = []
+        for k in todo:
+            d = np.diff(polylines[k], axis=0)
+            d /= np.maximum(np.hypot(d[:, 0], d[:, 1]), 1e-9)[:, None]
+            normals = sign * np.column_stack([d[:, 1], -d[:, 0]])
+            n = normals[:-1] + normals[1:]
+            length = np.hypot(n[:, 0], n[:, 1])
+            shifts.append(np.where(length[:, None] > 1e-6, n / np.maximum(length, 1e-9)[:, None], normals[:-1]))
+        inner = np.vstack([polylines[k][1:-1] for k in todo])
+        n = np.vstack(shifts)
         moved = inner.copy()
         settled = np.zeros(len(inner), dtype=bool)
         for share in (1.0, 0.5):
@@ -905,14 +954,25 @@ class NavMeshPlanner(GlobalPlanner):
             fits = ~settled & (router.clearance(cand) >= body)
             moved[fits] = cand[fits]
             settled |= fits
-        if not settled.any():
-            return polyline
-        out = polyline.copy()
-        out[1:-1] = moved
-        if router._clear_many([out])[0] >= body - VERIFY_EPS:
-            return out
-        out[1:-1] = inner + (moved - inner) * 0.5
-        return out if router._clear_many([out])[0] >= body - VERIFY_EPS else polyline
+        bounds = np.cumsum([0] + [len(polylines[k]) - 2 for k in todo]).tolist()
+        shifted = []
+        for k, a, b in zip(todo, bounds[:-1], bounds[1:], strict=True):
+            if settled[a:b].any():
+                full = polylines[k].copy()
+                full[1:-1] = moved[a:b]
+                shifted.append((k, full, a, b))
+        halves = []
+        for (k, full, a, b), clear in zip(shifted, router._clear_many([full for _, full, _, _ in shifted]) if shifted else [], strict=True):
+            if clear >= body - VERIFY_EPS:
+                out[k] = full
+                continue
+            half = polylines[k].copy()
+            half[1:-1] = inner[a:b] + (moved[a:b] - inner[a:b]) * 0.5
+            halves.append((k, half))
+        for (k, half), clear in zip(halves, router._clear_many([half for _, half in halves]) if halves else [], strict=True):
+            if clear >= body - VERIFY_EPS:
+                out[k] = half
+        return out
 
     def forget_agents(self) -> None:
         super().forget_agents()
@@ -1270,13 +1330,16 @@ class NavMeshPlanner(GlobalPlanner):
         starts = np.array([start for _, _, _, start in entries])
         framed = self._inside(starts)
         beyond = (framed != starts).any(axis=1) | (self._inside(goal) != goal).any()
-        direct = beyond & router.line_of_sight(starts, np.repeat(goal[None], len(starts), 0))
+        # the sight line is looked for only where it is used: a start or the goal outside the mesh frame
+        direct = np.zeros(len(starts), dtype=bool)
+        if beyond.any():
+            direct[beyond] = router.line_of_sight(starts[beyond], np.repeat(goal[None], int(beyond.sum()), 0))
         # priced routes (`paths`) only need their length: their funnels are not checked against the walls
         routes = router.plan_many(framed[~direct], self._inside(goal), verify=not self._pricing)
         polylines: list[np.ndarray | None] = [None] * len(entries)
-        for i, route in zip(np.nonzero(~direct)[0], routes, strict=True):
-            if route is not None:
-                polylines[i] = self._lanes(router, self._rejoin(router, starts[i], goal, route[0]) if beyond[i] else route[0])
+        found = [(int(i), self._rejoin(router, starts[i], goal, route[0]) if beyond[i] else route[0]) for i, route in zip(np.nonzero(~direct)[0], routes, strict=True) if route is not None]
+        for (i, _), polyline in zip(found, self._lanes_many(router, [polyline for _, polyline in found]), strict=True):
+            polylines[i] = polyline
         for i in np.nonzero(direct)[0]:
             polylines[i] = np.array([starts[i], goal])
 

@@ -77,6 +77,7 @@ class Router:
         `congestion_interval` on every router) only weighs the arcs again."""
         mesh = self.mesh
         E = len(mesh.ea)
+        reweigh = self._topology is not None
         if self._topology is None:
             self._open = ~mesh.e_con & (mesh.e_len >= 2 * self.r - 1e-9)
             self._open[self._blocked] = False
@@ -100,6 +101,13 @@ class Router:
         if self._slow is not None:
             c = c * 0.5 * (self._slow[a] + self._slow[b])
         cst = np.concatenate([c, c])[order]
+        if reweigh:
+            # a congestion update: only the arcs whose weight changed (those near walkers) are written into the A* rows
+            changed = np.flatnonzero(cst != self._data)
+            for i, j, w in zip(src[changed].tolist(), rank[changed].tolist(), cst[changed].tolist(), strict=True):
+                self._cst[i][j] = w
+            self._data = cst
+            return
         nc = np.zeros((E, 4))
         nc[src, rank] = cst
         self._data = cst
