@@ -282,3 +282,39 @@ def test_crowds_crossing_a_two_way_stair_without_a_flight_both_ways_get_through(
             if (aid < 100 and x > 20.0) or (aid > 100 and x < 10.0):
                 over.add(aid)
     assert len([a for a in over if a < 100]) >= 10 and len([a for a in over if a > 100]) >= 10
+
+
+def test_a_walker_that_cannot_walk_to_the_stair_half_it_chose_chooses_again(manager_factory: Callable[..., AgentManager]) -> None:
+    """The stair choice prices legs without checking their funnels against the walls; where the walker's own route to
+    the half it chose then fails, that half is struck off for it, the leg is on record and it takes the corridor."""
+    mgr = _manager(manager_factory, "unroutable_leg", True, _pair()[:1])
+    planner = mgr._global_planner
+    point = mgr._zones._inner(mgr._zones.zones["st_a"])
+    plan_group = planner._plan_group
+
+    def no_walked_route_to_the_half(router, group):  # noqa: ANN001, ANN202 - wraps NavMeshPlanner._plan_group
+        plans = plan_group(router, group)
+        if not planner._pricing:
+            for aid, _, target in group:
+                if math.dist((target.x, target.y), (point.x, point.y)) < 1e-2:
+                    plans.pop(aid, None)
+        return plans
+
+    planner._plan_group = no_walked_route_to_the_half
+    noted: list[tuple] = []
+    note = planner._note_unroutable
+
+    def record(agent_id, pos, target):  # noqa: ANN001, ANN202 - wraps GlobalPlanner._note_unroutable
+        noted.append((agent_id, round(target.x, 3), round(target.y, 3)))
+        note(agent_id, pos, target)
+
+    planner._note_unroutable = record
+    went_round = False
+    for _ in range(1600):
+        mgr.tick()
+        went_round |= _pos(mgr, 1)[1] > 15.0
+        if went_round:
+            break
+    assert (1, round(point.x, 3), round(point.y, 3)) in noted
+    assert "st_a" in mgr._zones._unwalkable[1][1]
+    assert went_round

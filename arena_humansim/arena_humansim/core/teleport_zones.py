@@ -212,6 +212,9 @@ class TeleportZones:
         self.transfers: dict[int, Transfer] = {}
         self.riders: set[int] = set()
         self._banned: dict[int, tuple[tuple[float, float], list[str]]] = {}
+        #: per walker, for its goal: the stair halves and cabins it could not walk to (`_strike_unroutable`), left out of
+        #: its choice until its goal changes
+        self._unwalkable: dict[int, tuple[tuple[float, float], set[str]]] = {}
         self._held: set[int] = set()
         self._walks: dict[int, tuple[tuple[float, float], frozenset[str]]] = {}
         self._joined: dict[str, str] = {}
@@ -288,6 +291,7 @@ class TeleportZones:
     def clear_transfers(self) -> None:
         self.transfers.clear()
         self._banned.clear()
+        self._unwalkable.clear()
         self._walks.clear()
         self.riders.clear()
         self._held.clear()
@@ -301,6 +305,7 @@ class TeleportZones:
     def forget(self, aid: int) -> None:
         self.transfers.pop(aid, None)
         self._banned.pop(aid, None)
+        self._unwalkable.pop(aid, None)
         self._walks.pop(aid, None)
         self._held.discard(aid)
         self.through.pop(aid, None)
@@ -340,6 +345,7 @@ class TeleportZones:
         blocked: dict[tuple[str, ...], set[str]] = {}
         order = {agent.state.agent_id: k for k, agent in enumerate(agents)}
         for planner, group in groups.items():
+            self._strike_unroutable(planner)
             graph = self._graph(planner)
             comps = planner.components([agent.state.pose for agent, _ in group] + [cmd.target_pose for _, cmd in group])
             plans = planner.get_cached_paths() if self._joined else {}
@@ -389,6 +395,11 @@ class TeleportZones:
         climbs = agent.params.climbs
         if climbs not in blocked:
             blocked[climbs] = self._blocked(climbs)
+        unwalkable = self._unwalkable.get(aid)
+        if unwalkable is not None and unwalkable[0] != goal:
+            unwalkable = None
+            del self._unwalkable[aid]
+        closed = blocked[climbs] if unwalkable is None else blocked[climbs] | unwalkable[1]
         if transfer is not None and self._joined.get(transfer.zone) == transfer.destination:
             zone = self.zones[transfer.zone]
             on = zone.contains(*near) or self.zones[transfer.destination].contains(*near)
@@ -404,18 +415,18 @@ class TeleportZones:
         if transfer is None or again or (transfer.phase == Phase.WALK and not transfer.ride and not self._aboard(transfer, *near)):
             start, end = comps[k], comps[len(group) + k]
             keep = None if transfer is None else (transfer.zone, transfer.destination)
-            edge = self._route(graph, start, end, blocked[climbs] | set(() if banned is None else banned[1]), near, keep)
+            edge = self._route(graph, start, end, closed | set(() if banned is None else banned[1]), near, keep)
             if edge is None and banned is not None and len(banned[1]) > 1:
                 self._banned[aid] = (goal, banned[1][-1:])
-                edge = self._route(graph, start, end, blocked[climbs] | set(banned[1][-1:]), near, keep)
+                edge = self._route(graph, start, end, closed | set(banned[1][-1:]), near, keep)
             if edge is None and banned is not None:
                 del self._banned[aid]
-                edge = self._route(graph, start, end, blocked[climbs], near, keep)
+                edge = self._route(graph, start, end, closed, near, keep)
             ride = False
             walkable = bool({graph.area.get(c, c) for c in start} & {graph.area.get(c, c) for c in end})
             if (edge is None and walkable) or (edge is not None and edge[0] in self._joined):
                 held = (transfer.zone, transfer.destination) if again and transfer is not None else None
-                timed = yield (agent, cmd.target_pose, goal, blocked[climbs] | set(self._banned[aid][1] if aid in self._banned else ()), paced_at, held)
+                timed = yield (agent, cmd.target_pose, goal, closed | set(self._banned[aid][1] if aid in self._banned else ()), paced_at, held)
                 if timed is not None:
                     edge, ride = timed, True
             if edge is None:
@@ -435,6 +446,24 @@ class TeleportZones:
                 self.through[aid] = z.point(z.length + self.zones[transfer.destination].length + THROUGH_CLEAR, z.across(*near))
             return
         out[aid] = attrs.evolve(cmd, target_pose=z.wait if transfer.phase in (Phase.WALK, Phase.WAIT) else z.slots[transfer.slot])
+
+    def _strike_unroutable(self, planner: GlobalPlanner) -> None:
+        """A walker whose route to the stair half or cabin it chose failed (`GlobalPlanner.unroutable`): that choice is
+        struck off for it while its goal stays (`_unwalkable`), and it chooses again. The stair choice
+        prices legs without checking their funnels against the walls, so it can choose a half whose entry the walker
+        cannot walk to; without this the walker would walk to the nearest point it can reach, for good."""
+        unroutable = getattr(planner, "unroutable", None)  # a planner stand-in without it reports none
+        for aid, target, _ in unroutable() if callable(unroutable) else ():
+            transfer = self.transfers.get(aid)
+            if transfer is None or transfer.aboard:
+                continue
+            zone = self.zones[transfer.zone]
+            point = self._inner(zone, transfer.side) if zone.kind else zone.wait if transfer.phase in (Phase.WALK, Phase.WAIT) else zone.slots[transfer.slot]
+            if math.hypot(point.x - target[0], point.y - target[1]) > 1e-2:
+                continue
+            del self.transfers[aid]
+            self._unwalkable.setdefault(aid, (transfer.goal, set()))[1].add(transfer.zone)
+            planner._logger.warning(f"unroutable leg: agent {aid} cannot walk to {transfer.zone}; struck off for it, choosing again")
 
     def _inner(self, zone: Zone, across: float = 0.0) -> Pose2D:
         """Where a stair half is walked to: its lane point on the hold line, on a pair joined in place a point short of the seam `across` meters off its center line."""
