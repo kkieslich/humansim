@@ -5,7 +5,12 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import Delaunay, cKDTree  # pyright: ignore[reportAttributeAccessIssue]
 
-TOL = 1e-5  # point merge and intersection tolerance [m]
+TOL = 1e-5  # length and degeneracy tolerance [m]
+#: Input geometry finer than this is noise: points closer are one point, a segment whose ends both lie this close to
+#: another's line runs along it, and one that stops this short of another meets it [m]. Kept apart, two such features
+#: (two footprints that share an edge, sent as float32: their edges 1e-5 m apart) force splits down to `MIN_LEN` along
+#: all their length, thousands of slivers that make the mesh several times slower to build and to measure
+SNAP = 1e-3
 MIN_LEN = 2e-3  # sub-edges shorter than this are never split
 SHELL_UNIT = 1e-3  # concentric shell unit for splits next to an input vertex
 PIECE = 1.0  # candidate-pair piece length for the intersection pass
@@ -26,7 +31,7 @@ def _expand(start: np.ndarray, count: np.ndarray) -> np.ndarray:
 
 
 def split_segments(segs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Split at crossings, T-junctions and collinear overlaps. Returns points (M,2), unique sub-edges (K,2)."""
+    """Split at crossings, T-junctions and collinear overlaps, all within `SNAP`. Returns points (M,2), unique sub-edges (K,2)."""
     P, Q = segs[:, :2], segs[:, 2:]
     keep = np.hypot(*(Q - P).T) > TOL
     P, Q = P[keep], Q[keep]
@@ -49,16 +54,16 @@ def split_segments(segs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     par = np.abs(den) <= TOL * np.minimum(L[i], L[k])
     sid, st = [np.arange(n), np.arange(n)], [np.zeros(n), np.ones(n)]
 
-    npar = ~par
+    # collinear: both ends of one segment lie within SNAP of the other's line (parallel ones within SNAP of each other)
+    col = (np.maximum(np.abs(_cross(w, r)), np.abs(_cross(w + s, r))) / L[i] <= SNAP) | (np.maximum(np.abs(_cross(w, s)), np.abs(_cross(w - r, s))) / L[k] <= SNAP)
     with np.errstate(divide="ignore", invalid="ignore"):
         t = _cross(w, s) / den
         u = _cross(w, r) / den
-    ti, tk = TOL / L[i], TOL / L[k]
-    hit = npar & (t >= -ti) & (t <= 1 + ti) & (u >= -tk) & (u <= 1 + tk)
+    ti, tk = SNAP / L[i], SNAP / L[k]
+    hit = ~par & ~col & (t >= -ti) & (t <= 1 + ti) & (u >= -tk) & (u <= 1 + tk)
     sid += [i[hit], k[hit]]
     st += [np.clip(t[hit], 0, 1), np.clip(u[hit], 0, 1)]
 
-    col = par & (np.abs(_cross(w, r)) / L[i] <= TOL)
     ic, kc, wc, rc, sc = i[col], k[col], w[col], r[col], s[col]
     for seg, num in ((ic, (wc * rc).sum(1)), (ic, ((wc + sc) * rc).sum(1)), (kc, (-wc * sc).sum(1)), (kc, ((rc - wc) * sc).sum(1))):
         tt = num / L[seg] ** 2
@@ -69,7 +74,7 @@ def split_segments(segs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     sid = np.concatenate(sid)
     st = np.concatenate(st)
     X = P[sid] + st[:, None] * D[sid]
-    near = cKDTree(X).query_pairs(TOL, output_type="ndarray")
+    near = cKDTree(X).query_pairs(SNAP, output_type="ndarray")
     g = csr_matrix((np.ones(len(near)), (near[:, 0], near[:, 1])), shape=(len(X), len(X)))
     _, lab = connected_components(g, directed=False)
     _, first = np.unique(lab, return_index=True)
@@ -352,7 +357,7 @@ class Mesh:
         db, b = vertices.query(B)
         key = np.minimum(a, b) * len(self.P) + np.maximum(a, b)
         e = np.minimum(np.searchsorted(self._edge_key, key), len(self._edge_key) - 1)
-        found = (da <= TOL) & (db <= TOL) & (self._edge_key[e] == key) & ~self.e_con[e]
+        found = (da <= SNAP) & (db <= SNAP) & (self._edge_key[e] == key) & ~self.e_con[e]
         return np.where(found, e, -1)
 
     def _widths(self) -> None:
