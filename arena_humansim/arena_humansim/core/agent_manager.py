@@ -1030,6 +1030,14 @@ class AgentManager(TimeNode):
         if callable(set_side):
             set_side(str(self.get_parameter("global_planner.lane_side").value))
 
+    def _give_areas(self, planners: Sequence[object] | None = None) -> None:
+        """The stair and escalator halves to each planner that keeps them (`NavMeshPlanner.set_areas`)."""
+        areas = {name: (z.kind, z.footprint) for name, z in self._zones.zones.items() if z.kind}
+        for planner in self._wall_aware if planners is None else planners:
+            set_areas = getattr(planner, "set_areas", None)
+            if callable(set_areas):
+                set_areas(areas)
+
     def _attach_late(self, planner: LocalPlanner | GlobalPlanner) -> None:
         """Wire a planner created after __init__ into the pool and the walls."""
         agents = [self._agents[aid] for aid in self._pool_agent_ids if aid in self._agents]
@@ -1038,6 +1046,7 @@ class AgentManager(TimeNode):
         segments = self._walls_of(planner, self._all_wall_segments())
         if segments:
             planner.set_walls(segments)
+        self._give_areas([planner])
         self._set_side(planner)
 
     def _resolve_policy_idx(self, name: str) -> int:
@@ -3681,6 +3690,7 @@ class AgentManager(TimeNode):
         self._zones.set_zones(zones, [z.open for z in request.zones])
         if self._zones.gates != gates:
             self._refresh_planners()
+        self._give_areas()
         response.success = True
         response.message = f"Set {len(zones)} teleport zone(s)"
         self._logger.debug(response.message)

@@ -174,7 +174,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         ends = dict(zip(legs, self.snap_terminals([navigate[aid] for aid in legs]), strict=True))
         starts = [agent_positions[aid] for aid in straight] + [waypoints[-2] if len(waypoints := self._path_cache[aid][1]) > 1 else agent_positions[aid] for aid in moved]
         lines = np.array([((a.x, a.y), (ends[aid].x, ends[aid].y)) for aid, a in zip(legs, starts, strict=True)], dtype=np.float64).reshape(-1, 2, 2)
-        clear = dict(zip(legs, self._sees(lines[:, 0], lines[:, 1]).tolist() if legs else [], strict=True))
+        clear = dict(zip(legs, self._sees_legs(legs, lines[:, 0], lines[:, 1]).tolist() if legs else [], strict=True))
         line_of = dict(zip(straight, lines, strict=False))
 
         for agent_id, target in navigate.items():
@@ -208,7 +208,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
 
         if requests:
             plans = self._plan([(agent_id, agent_pos, target) for agent_id, (agent_pos, target) in requests.items()])
-            detours = [(agent_id, agent_pos, reachable) for agent_id, (agent_pos, target) in requests.items() if plans[agent_id] is None and (reachable := self._nearest_reachable(agent_pos, target)) is not None]
+            detours = [(agent_id, agent_pos, reachable) for agent_id, (agent_pos, target) in requests.items() if plans[agent_id] is None and (reachable := self._nearest_reachable(agent_pos, target, agent_id)) is not None]
             reach = {agent_id: reachable for agent_id, _, reachable in detours}
             for agent_id, (agent_pos, target) in requests.items():
                 if plans[agent_id] is None:
@@ -350,6 +350,10 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
                 if math.hypot(pos.x - x, pos.y - y) - r - radius <= BLOCK_NEAR:
                     self._blockers.setdefault(aid, {})[rid] = (x, y, r)
 
+    def _sees_legs(self, agent_ids: list[int], starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+        """Whether each agent's straight leg from its start to its end is clear (`_sees`, the same walls for all)."""
+        return self._sees(starts, ends)
+
     def _sees(self, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
         """Whether each straight leg is walkable as a whole path."""
         if self._wall_grid is None or self._wall_grid[0] is not self._wall_segments:
@@ -430,7 +434,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def snap_terminals(self, poses: Sequence[Pose2D]) -> list[Pose2D]:
         return [self.snap_terminal(p) for p in poses]
 
-    def _nearest_reachable(self, start: Pose2D, target: Pose2D) -> Pose2D | None:
+    def _nearest_reachable(self, start: Pose2D, target: Pose2D, agent_id: int | None = None) -> Pose2D | None:
         """Point closest to an unreachable target that start can still reach, None to walk straight at the target."""
         return None
 

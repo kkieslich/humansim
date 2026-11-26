@@ -166,6 +166,27 @@ class Way:
         return float(leg[0] / length), float(leg[1] / length)
 
 
+def _inside_polygon(points: tuple[tuple[float, float], ...], x: float, y: float) -> bool:
+    """Whether (x, y) lies inside the polygon `points` (even-odd rule)."""
+    inside = False
+    for (x0, y0), (x1, y1) in zip(points, points[1:] + points[:1], strict=True):
+        if (y0 > y) != (y1 > y) and x < x0 + (y - y0) * (x1 - x0) / (y1 - y0):
+            inside = not inside
+    return inside
+
+
+@attrs.define
+class NoGo:
+    """The walls an agent class plans with where stair or escalator halves it does not climb are walled off
+    (`NavMeshPlanner.set_areas`): their mesh, its inflation router, the routers that keep wider clearances and the body
+    routers, and the congestion on its edges."""
+
+    mesh: Mesh
+    router: Router
+    routers: dict[float, Router] = attrs.field(factory=dict)
+    body: dict[float, Router] = attrs.field(factory=dict)
+
+
 @attrs.define
 class TurnPassage:
     """One narrow passage that walkers take by turns (`_take_turns`): where it is, a direction along it that says which
@@ -253,6 +274,11 @@ class NavMeshPlanner(GlobalPlanner):
         self._turn_moved: dict[int, tuple[float, float, int]] = {}
         self._turn_held: set[int] = set()
         self._turn_passages: list[TurnPassage] = []
+        #: the stair and escalator halves (name: kind, footprint), per set of halves an agent class does not climb its
+        #: walled-off mesh (`NoGo`), and per agent of the last `compute` that set (empty: it climbs every half)
+        self._areas: dict[str, tuple[str, tuple[tuple[float, float], ...]]] = {}
+        self._nogo: dict[frozenset[str], NoGo] = {}
+        self._class_of: dict[int, frozenset[str]] = {}
         #: per blocked walker: the route `_reroute` last saw or made for it with the robots it goes round, and the side it
         #: goes round each robot by (+1 counter-clockwise, -1 clockwise); routers that also keep off robots standing still
         self._rounded: dict[int, tuple[list[Pose2D], tuple]] = {}
@@ -300,6 +326,7 @@ class NavMeshPlanner(GlobalPlanner):
     def set_walls(self, segments: Segments) -> None:
         self._forget_paths()
         self._snapped.clear()
+        self._nogo.clear()
         self._wall_segments = list(segments)
         segs = np.array(segments, dtype=np.float64).reshape(-1, 4)
         segs = segs[np.hypot(*(segs[:, 2:] - segs[:, :2]).T) > TOL]
@@ -353,9 +380,63 @@ class NavMeshPlanner(GlobalPlanner):
             r = min(r, self._mesh.reach / 2.0)
         return round(max(r, self._inflation_radius), 6)
 
-    def _router_for(self, clearance: float) -> Router:
+    def set_areas(self, areas: dict[str, tuple[str, Sequence[tuple[float, float]]]]) -> None:
+        """The stair and escalator halves (name: kind, footprint). An agent plans on walls where the halves of the kinds
+        it does not climb (its `climbs`) are walled off, so no route, straight leg or nearest reachable point of a
+        wheelchair user leads into a stair or escalator half. Without them it walked into a half where its goal lay
+        beyond it (the nearest point it could reach was up to the seam) or its route cut a half's corner."""
+        areas = {name: (kind, tuple((float(x), float(y)) for x, y in fp)) for name, (kind, fp) in areas.items() if kind and len(fp) >= 3}
+        if areas != self._areas:
+            self._areas = areas
+            self._nogo.clear()
+            self._forget_paths()
+
+    def _closed_to(self, agent: Any) -> frozenset[str]:
+        """The halves an agent does not climb: those whose kind is not among its `climbs` (none without the attribute),
+        but for one it stands on (the crowd pushed it there): from there it plans its way off."""
+        climbs = getattr(getattr(agent, "params", None), "climbs", None)
+        if climbs is None or not self._areas:
+            return frozenset()
+        x, y = agent.state.pose.x, agent.state.pose.y
+        return frozenset(name for name, (kind, fp) in self._areas.items() if kind not in climbs and not _inside_polygon(fp, x, y))
+
+    def _nogo_for(self, closed: frozenset[str]) -> NoGo:
+        """The walled-off mesh for the halves `closed`, built on first use: the walls and the halves' outlines."""
+        hit = self._nogo.get(closed)
+        if hit is None:
+            segs = np.array(self._wall_segments, dtype=np.float64).reshape(-1, 4)
+            outlines = [(*a, *b) for name in sorted(closed) for fp in [self._areas[name][1]] for a, b in zip(fp, fp[1:] + fp[:1], strict=True)]
+            segs = np.vstack([segs, np.array(outlines, dtype=np.float64).reshape(-1, 4)])
+            segs = segs[np.hypot(*(segs[:, 2:] - segs[:, :2]).T) > TOL]
+            mesh = Mesh.build(segs, 2 * max(self._comfort_radius, self._inflation_radius * 1.05))
+            hit = self._nogo[closed] = NoGo(mesh, Router(mesh, self._inflation_radius, self._comfort_radius))
+            if self._crowd is not None:
+                self._nogo_congestion(hit)
+        return hit
+
+    def _nogo_congestion(self, nogo: NoGo) -> None:
+        """Weigh a walled-off mesh's routers by the crowd of the last congestion update (`_slowdown_at`)."""
+        slowdown = None if self._crowd is None else self._weidmann(self._crowd.query_ball_point(nogo.mesh.e_mid, CONGESTION_RADIUS, return_length=True))
+        for router in (nogo.router, *nogo.routers.values()):
+            router.set_congestion(slowdown)
+
+    def _base(self, closed: frozenset[str]) -> Router:
+        """The inflation router of agents that do not climb the halves `closed`."""
+        assert self._router is not None
+        return self._router if not closed else self._nogo_for(closed).router
+
+    def _router_for(self, clearance: float, closed: frozenset[str] = frozenset()) -> Router:
         """The router that keeps `clearance` from the walls, built on first use."""
         assert self._router is not None and self._mesh is not None
+        if closed:
+            nogo = self._nogo_for(closed)
+            if clearance <= self._inflation_radius + 1e-9:
+                return nogo.router
+            if clearance not in nogo.routers:
+                nogo.routers[clearance] = Router(nogo.mesh, clearance, self._comfort_radius)
+                if self._crowd is not None:
+                    self._nogo_congestion(nogo)
+            return nogo.routers[clearance]
         if clearance <= self._inflation_radius + 1e-9:
             return self._router
         if clearance not in self._routers:
@@ -373,10 +454,15 @@ class NavMeshPlanner(GlobalPlanner):
         r = round(math.ceil(max(agent_radius, MIN_BODY_RADIUS) / CLEARANCE_STEP - 1e-9) * CLEARANCE_STEP, 6)
         return r if r < self._inflation_radius - 1e-9 else None
 
-    def _body_router(self, clearance: float) -> Router:
+    def _body_router(self, clearance: float, closed: frozenset[str] = frozenset()) -> Router:
         """The router that keeps only `clearance`, below the inflation radius, from the walls, built on first use. Its
         routes take plain lengths: they only get a walker back to where its own route starts (`_escape`)."""
         assert self._mesh is not None
+        if closed:
+            nogo = self._nogo_for(closed)
+            if clearance not in nogo.body:
+                nogo.body[clearance] = Router(nogo.mesh, clearance, self._comfort_radius)
+            return nogo.body[clearance]
         if clearance not in self._body_routers:
             router = Router(self._mesh, clearance, self._comfort_radius)
             if len(self._blocked_edges):
@@ -394,6 +480,14 @@ class NavMeshPlanner(GlobalPlanner):
             if self._congestion_tick >= max(1, round(self._congestion_interval / self._dt)):
                 self._congestion_tick = 0
                 self._set_slowdown(self._slowdown_at(np.array([(a.state.pose.x, a.state.pose.y) for a in agents], dtype=np.float64).reshape(-1, 2)))
+                for nogo in self._nogo.values():
+                    self._nogo_congestion(nogo)
+        self._class_of = {}
+        if self._areas:
+            for agent in agents:
+                closed = self._closed_to(agent)
+                if closed:
+                    self._class_of[agent.state.agent_id] = closed
         self._manners = {}
         for agent in agents:
             params = getattr(agent, "params", None)
@@ -1354,12 +1448,25 @@ class NavMeshPlanner(GlobalPlanner):
         assert self._router is not None
         return self._router.line_of_sight(starts, ends)
 
-    def _nearest_reachable(self, start: Pose2D, target: Pose2D) -> Pose2D | None:
+    def _sees_legs(self, agent_ids: list[int], starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+        """`_sees`, and for an agent that does not climb some halves also on its walled-off walls."""
+        clear = self._sees(starts, ends)
+        if self._class_of:
+            by: dict[frozenset[str], list[int]] = {}
+            for k, aid in enumerate(agent_ids):
+                if aid in self._class_of:
+                    by.setdefault(self._class_of[aid], []).append(k)
+            for closed, rows in by.items():
+                clear[rows] &= self._base(closed).line_of_sight(starts[rows], ends[rows])
+        return clear
+
+    def _nearest_reachable(self, start: Pose2D, target: Pose2D, agent_id: int | None = None) -> Pose2D | None:
         assert self._router is not None
-        s = self._router.snap(np.array([start.x, start.y], dtype=np.float64))
+        router = self._router if agent_id is None else self._base(self._class_of.get(agent_id, frozenset()))
+        s = router.snap(np.array([start.x, start.y], dtype=np.float64))
         if s is None:
             return None
-        q = self._router.nearest_reachable(s, np.array([target.x, target.y], dtype=np.float64))
+        q = router.nearest_reachable(s, np.array([target.x, target.y], dtype=np.float64))
         if q is None:
             return None
         return Pose2D(x=float(q[0]), y=float(q[1]), theta=target.theta)
@@ -1415,18 +1522,19 @@ class NavMeshPlanner(GlobalPlanner):
             for group in by_target.values():
                 plans.update(self._plan_group(self._router, group))
             return plans
-        by_goal: dict[tuple[float, float, float], list[tuple[int, Pose2D, Pose2D]]] = {}
+        by_goal: dict[tuple[float, float, float, frozenset[str]], list[tuple[int, Pose2D, Pose2D]]] = {}
         for agent_id, agent_pos, target in requests:
             clearance = self.clearance_for(self._radius_of(agent_id))
-            by_goal.setdefault((target.x, target.y, clearance), []).append((agent_id, agent_pos, target))
-        for (_, _, clearance), group in by_goal.items():
-            router = self._router_for(clearance)
-            found = self._plan_group(router, group)
-            if router is not self._router:
+            by_goal.setdefault((target.x, target.y, clearance, self._class_of.get(agent_id, frozenset())), []).append((agent_id, agent_pos, target))
+        for (_, _, clearance, closed), group in by_goal.items():
+            base = self._base(closed)
+            router = self._router_for(clearance, closed)
+            found = self._plan_group(router, group, base)
+            if router is not base:
                 # no route keeps the margin (a door narrower than the agent's comfort): the bare inflation radius
                 missing = [entry for entry in group if found.get(entry[0]) is None]
                 if missing:
-                    found.update(self._plan_group(self._router, missing))
+                    found.update(self._plan_group(base, missing, base))
             for agent_id, _, target in group:
                 if found.get(agent_id) is not None:
                     self._routed[agent_id] = (round(target.x, 3), round(target.y, 3))
@@ -1448,10 +1556,12 @@ class NavMeshPlanner(GlobalPlanner):
         body = self.body_clearance(self._radius_of(agent_id))
         if body is None or self._routed.get(agent_id) != (round(target.x, 3), round(target.y, 3)):
             return None
+        closed = self._class_of.get(agent_id, frozenset())
+        base = self._base(closed)
         snapped = self.snap_terminal(target)
         goal = np.array([snapped.x, snapped.y], dtype=np.float64)
-        reach = self._router.components(goal[None])[0]
-        router = self._body_router(body)
+        reach = base.components(goal[None])[0]
+        router = self._body_router(body, closed)
         start = router.snap(np.array([agent_pos.x, agent_pos.y], dtype=np.float64))
         end = router.snap(goal)
         route = None if start is None or end is None or not reach else router.plan(start, end, try_line_of_sight=False)
@@ -1463,13 +1573,13 @@ class NavMeshPlanner(GlobalPlanner):
         pts = np.column_stack([np.interp(at, along, line[:, 0]), np.interp(at, along, line[:, 1])])
         if not len(pts):
             return None
-        keeps = self._router.clearance(pts) >= self._router.r - VERIFY_EPS
-        back = next((i for i, comp in enumerate(self._router.components(pts)) if keeps[i] and comp & reach), None)
+        keeps = base.clearance(pts) >= base.r - VERIFY_EPS
+        back = next((i for i, comp in enumerate(base.components(pts)) if keeps[i] and comp & reach), None)
         if back is None:
             return None
         out = Pose2D(x=float(pts[back, 0]), y=float(pts[back, 1]))
         entry = [(agent_id, out, target)]
-        rest = self._plan_group(self._router_for(clearance), entry).get(agent_id) or self._plan_group(self._router, entry).get(agent_id)
+        rest = self._plan_group(self._router_for(clearance, closed), entry, base).get(agent_id) or self._plan_group(base, entry, base).get(agent_id)
         if rest is None:
             return None
         head = [Pose2D(x=float(x), y=float(y)) for x, y in line[1 : int(np.searchsorted(along, at[back]))]]
@@ -1482,8 +1592,10 @@ class NavMeshPlanner(GlobalPlanner):
         need = max(self._radius_of(agent_id), MIN_BODY_RADIUS) + LANE_WALL_GAP
         return bool(router._clear_many([polyline])[0] >= need - 1e-9)
 
-    def _plan_group(self, router: Router, group: list[tuple[int, Pose2D, Pose2D]]) -> dict[int, list[Pose2D] | None]:
-        """Routes for agents with one target, by `router`'s clearance, their inner corners on the lane side."""
+    def _plan_group(self, router: Router, group: list[tuple[int, Pose2D, Pose2D]], base: Router | None = None) -> dict[int, list[Pose2D] | None]:
+        """Routes for agents with one target, by `router`'s clearance, their inner corners on the lane side; `base` is
+        the inflation router of their walls (`self._router` where they climb every half)."""
+        base = self._router if base is None else base
         plans: dict[int, list[Pose2D] | None] = {}
         entries = []
         for agent_id, agent_pos, target in group:
@@ -1494,7 +1606,7 @@ class NavMeshPlanner(GlobalPlanner):
             return plans
         snapped = self.snap_terminal(entries[0][2])
         goal = np.array([snapped.x, snapped.y])
-        if router is not self._router:
+        if router is not base:
             # a target closer to a wall than this clearance: route to the nearest point that keeps it, then step on
             near = router.snap(goal)
             goal = goal if near is None else near

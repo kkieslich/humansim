@@ -241,7 +241,7 @@ class DijkstraPlanner(GlobalPlanner):
         cell = grid_to_world(self._origin, self._resolution, snapped[0], snapped[1])
         return Pose2D(x=cell.x, y=cell.y, theta=pose.theta)
 
-    def _nearest_reachable(self, start: Pose2D, target: Pose2D) -> Pose2D | None:
+    def _nearest_reachable(self, start: Pose2D, target: Pose2D, agent_id: int | None = None) -> Pose2D | None:
         if self._occupancy_grid is None or self._resolution > REACHABLE_MAX_RESOLUTION:
             return None
         if self._free_labels is None:
