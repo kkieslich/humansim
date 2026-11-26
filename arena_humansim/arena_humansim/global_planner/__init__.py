@@ -298,6 +298,14 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         """`path_cost` of each path."""
         return [self.path_cost(path) for path in paths]
 
+    def leg_costs(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
+        """The walking cost of each leg [m] as route choice prices a walk to its target with `zone_route_pricing` "hybrid": here the
+        `path_cost` of its planned path (inf without one); a planner with shortest-path trees answers from those."""
+        paths = self.paths(legs)
+        costs = self.path_costs([path for path in paths if path])
+        found = iter(costs)
+        return [next(found) if path else math.inf for path in paths]
+
     def leg_floors(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
         """A floor under the `path_cost` of the path `paths` plans for each leg, 0 where the planner knows none."""
         return [0.0] * len(legs)
