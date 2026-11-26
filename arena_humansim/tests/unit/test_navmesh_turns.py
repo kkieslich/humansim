@@ -193,18 +193,36 @@ def test_a_walker_the_crowd_pushed_back_keeps_its_place_in_the_order(agent_facto
 
 def test_the_end_that_has_the_passage_yields_once_the_other_end_waited_its_time(agent_factory: Callable[..., BaseAgent]) -> None:
     """Platoons: the end that came first keeps the passage while its walkers come, at most `TURN_YIELD_S` while the
-    other end waits; then the other end gets it."""
+    other end waits (once the walker it got the passage for went in); then the other end gets it."""
     planner = _planner(1.0)
     east = _walker(agent_factory, 1, -7.0)
     planner.compute([east], _go({1: EAST}))
     west = _walker(agent_factory, 2, 8.0)
+    planner.compute([east, west], _go({1: EAST, 2: WEST}))
+    east.state.pose.x = 0.0
+    planner.compute([east, west], _go({1: EAST, 2: WEST}))
+    east.state.pose.x = 9.0
+    follow = _walker(agent_factory, 3, -7.0)
     held = []
     for _ in range(int(TURN_YIELD_S / 0.05) + 3):
-        planner.compute([east, west], _go({1: EAST, 2: WEST}))
-        held.append((_hold(planner, 1) is not None, _hold(planner, 2) is not None))
+        planner.compute([east, west, follow], _go({1: EAST, 2: WEST, 3: EAST}))
+        held.append((_hold(planner, 3) is not None, _hold(planner, 2) is not None))
     assert held[0] == (False, True)
     assert held[-1] == (True, False)
 
+
+def test_the_end_keeps_the_passage_until_the_walker_it_got_it_for_went_in(agent_factory: Callable[..., BaseAgent]) -> None:
+    """A slow walker the passage was given to (a wheelchair user beside the mouth, say) does not lose its turn while
+    the other end waits longer than `TURN_YIELD_S`; only `TURN_STUCK_S` ends that."""
+    planner = _planner(1.0)
+    slow = _walker(agent_factory, 2, 8.0, radius=0.325)
+    planner.compute([slow], _go({2: WEST}))
+    other = _walker(agent_factory, 1, -7.0)
+    held = []
+    for _ in range(int((TURN_YIELD_S + 5.0) / 0.05)):
+        planner.compute([slow, other], _go({2: WEST, 1: EAST}))
+        held.append((_hold(planner, 2) is not None, _hold(planner, 1) is not None))
+    assert all(h == (False, True) for h in held)
 
 def test_the_waiting_walkers_of_one_end_line_up_in_the_order_they_came(agent_factory: Callable[..., BaseAgent]) -> None:
     planner = _planner(1.0)

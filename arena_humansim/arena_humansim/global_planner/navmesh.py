@@ -169,8 +169,9 @@ class Way:
 @attrs.define
 class TurnPassage:
     """One narrow passage that walkers take by turns (`_take_turns`): where it is, a direction along it that says which
-    end is which (+1 along, -1 against), the end that has it (0 none) and since when [tick], and the last call that saw
-    it [tick]."""
+    end is which (+1 along, -1 against), the end that has it (0 none) and since when [tick], the last call that saw it
+    [tick], and the walker that came first at that end when it got the passage (-1 none): the end keeps the passage
+    until this walker went in."""
 
     x: float
     y: float
@@ -179,6 +180,7 @@ class TurnPassage:
     serving: int = 0
     since: int = 0
     seen: int = 0
+    first: int = -1
 
 
 @attrs.define
@@ -876,8 +878,10 @@ class NavMeshPlanner(GlobalPlanner):
 
         The end whose first walker came first gets it, and keeps it while its walkers come; the other end gets it once
         this end has none left before or in the passage, or once its first walker has waited `TURN_YIELD_S` (counted from
-        when this end got the passage). Those of this end already inside come out first."""
-        first: dict[int, int] = {}
+        when this end got the passage) and the walker this end got it for went in (or stood `TURN_STUCK_S`). Those of
+        this end already inside come out first. Without the last condition a slow walker (a wheelchair user waiting
+        beside the mouth while faster walkers of its end go first) can miss every turn of its end."""
+        first: dict[int, tuple[int, int]] = {}
         inside: set[int] = set()
         for aid in contested:
             if aid in stuck or aid in back:
@@ -885,13 +889,19 @@ class NavMeshPlanner(GlobalPlanner):
             if seen[aid][4] == "inside" and seen[aid][0] >= seen[aid][2].start:
                 inside.add(way_of[aid])
             else:
-                first[way_of[aid]] = min(first.get(way_of[aid], tick), claims[aid][2])
+                first[way_of[aid]] = min(first.get(way_of[aid], (tick, aid)), (claims[aid][2], aid))
         if passage.serving not in first and passage.serving not in inside:
             passage.serving = next(iter(inside)) if len(inside) == 1 else min(first, key=lambda d: (first[d], d)) if first else 0
             passage.since = tick
-        elif -passage.serving in first and (tick - max(first[-passage.serving], passage.since)) * self._dt >= TURN_YIELD_S:
+            passage.first = first[passage.serving][1] if passage.serving in first else -1
+        elif (
+            -passage.serving in first
+            and (tick - max(first[-passage.serving][0], passage.since)) * self._dt >= TURN_YIELD_S
+            and not any(aid == passage.first and seen[aid][4] == "near" for aid in contested if aid not in stuck and aid not in back)
+        ):
             passage.serving = -passage.serving
             passage.since = tick
+            passage.first = first[passage.serving][1]
 
     @staticmethod
     def _way_at(way: TurnWay, arc: float) -> tuple[float, float, float, float]:
