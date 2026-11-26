@@ -98,10 +98,12 @@ class PassageCommand:
     hold: tuple[float, float, float, float] | None = None
     back: bool = False
 
+
 #: A walker with no route to its target that can get no nearer to it than this from where it stands is said to stand [m],
 #: and it is warned about once it still stands within that of the same spot with no route to the same target this long
 #: later [s] (a walker carried over a stair seam has no route for a moment and walks on)
 UNROUTABLE_STAND, UNROUTABLE_STAND_S = 0.5, 2.0
+
 
 class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def __init__(self, replan_distance: float = 1.0) -> None:

@@ -390,9 +390,9 @@ class NavMeshPlanner(GlobalPlanner):
         it does not climb (its `climbs`) are walled off, so no route, straight leg or nearest reachable point of a
         wheelchair user leads into a stair or escalator half. Without them it walked into a half where its goal lay
         beyond it (the nearest point it could reach was up to the seam) or its route cut a half's corner."""
-        areas = {name: (kind, tuple((float(x), float(y)) for x, y in fp)) for name, (kind, fp) in areas.items() if kind and len(fp) >= 3}
-        if areas != self._areas:
-            self._areas = areas
+        kept: dict[str, tuple[str, tuple[tuple[float, float], ...]]] = {name: (kind, tuple((float(x), float(y)) for x, y in fp)) for name, (kind, fp) in areas.items() if kind and len(fp) >= 3}
+        if kept != self._areas:
+            self._areas = kept
             self._nogo.clear()
             self._forget_paths()
 
@@ -551,7 +551,7 @@ class NavMeshPlanner(GlobalPlanner):
         """What the last `compute` asks of the locomotion of walkers that keep a lane or take turns in narrow passages."""
         return self._commands
 
-    def _cast(self, origins: np.ndarray, directions: np.ndarray, far: float) -> np.ndarray:
+    def _cast(self, origins: np.ndarray, directions: np.ndarray, far: float | np.ndarray) -> np.ndarray:
         """The distance to the first wall along each ray, `far` where there is none within it."""
         if self._ray_grid is None or self._ray_grid[0] is not self._wall_segments:
             self._ray_grid = (self._wall_segments, WallGrid(self._wall_segments))
@@ -808,14 +808,14 @@ class NavMeshPlanner(GlobalPlanner):
             mine = seen & (sign * along >= cone)
             np.minimum.at(side[:, k], si[mine], dist[mine])
         has = np.isfinite(side)
-        rows, k = np.nonzero(has.any(axis=1)[:, None] & ~has)
+        one = np.logical_or(has[:, 0], has[:, 1])
+        rows, k = np.nonzero(one[:, None] & ~has)
         if len(rows):
             n = normal[rows] * np.where(k == 0, 1.0, -1.0)[:, None]
             c, s = np.cos(TURN_TILT), np.sin(TURN_TILT)
             dirs = np.stack([c[:, None] * n[None, :, 0] - s[:, None] * n[None, :, 1], s[:, None] * n[None, :, 0] + c[:, None] * n[None, :, 1]], axis=-1)
             hits = self._cast(np.tile(spots[rows], (len(TURN_TILT), 1)), dirs.reshape(-1, 2), TURN_FAR).reshape(len(TURN_TILT), -1)
             side[rows, k] = hits.min(axis=0)
-        one = has.any(axis=1)
         width[one] = side[one].sum(axis=1)
         return width
 
@@ -1022,11 +1022,7 @@ class NavMeshPlanner(GlobalPlanner):
             passage.serving = next(iter(inside)) if len(inside) == 1 else min(first, key=lambda d: (first[d], d)) if first else 0
             passage.since = tick
             passage.first = first[passage.serving][1] if passage.serving in first else -1
-        elif (
-            -passage.serving in first
-            and (tick - max(first[-passage.serving][0], passage.since)) * self._dt >= TURN_YIELD_S
-            and not any(aid == passage.first and seen[aid][4] == "near" for aid in contested if aid not in stuck and aid not in back)
-        ):
+        elif -passage.serving in first and (tick - max(first[-passage.serving][0], passage.since)) * self._dt >= TURN_YIELD_S and not any(aid == passage.first and seen[aid][4] == "near" for aid in contested if aid not in stuck and aid not in back):
             passage.serving = -passage.serving
             passage.since = tick
             passage.first = first[passage.serving][1]
