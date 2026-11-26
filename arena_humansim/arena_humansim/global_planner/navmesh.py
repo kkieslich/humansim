@@ -178,8 +178,9 @@ def _inside_polygon(points: tuple[tuple[float, float], ...], x: float, y: float)
 @attrs.define
 class NoGo:
     """The walls an agent class plans with where stair or escalator halves it does not climb are walled off
-    (`NavMeshPlanner.set_areas`): their mesh, its inflation router, the walls it was meshed on and the mesh edges of the
-    walls added since (blocked, as on the main mesh), the routers that keep wider clearances and the body routers."""
+    (`NavMeshPlanner.set_areas`): their mesh, its inflation router, the walls it was meshed on (those of the main mesh)
+    and the mesh edges of the walls added since (blocked, as on the main mesh), the routers that keep wider clearances
+    and the body routers."""
 
     mesh: Mesh
     router: Router
@@ -282,6 +283,11 @@ class NavMeshPlanner(GlobalPlanner):
         self._nogo: dict[frozenset[str], NoGo] = {}
         #: how long each walled-off mesh took to build [ms], for the record
         self.nogo_builds: list[float] = []
+        #: what `prepare` asked for: per stair kinds an agent class climbs (None: every kind), its agents' body radii
+        self._prepared: dict[tuple[str, ...] | None, set[float]] = {}
+        #: the walls the main mesh was meshed on (every walled-off mesh is meshed on them too) and the current walls' keys
+        self._mesh_segs = np.zeros((0, 4), dtype=np.float64)
+        self._keys_now: set[tuple[float, ...]] = set()
         self._class_of: dict[int, frozenset[str]] = {}
         #: per blocked walker: the route `_reroute` last saw or made for it with the robots it goes round, and the side it
         #: goes round each robot by (+1 counter-clockwise, -1 clockwise); routers that also keep off robots standing still
@@ -321,6 +327,7 @@ class NavMeshPlanner(GlobalPlanner):
             self._routed.clear()
             self._forget_paths()
         if (inflation_radius, comfort_radius) == (self._inflation_radius, self._comfort_radius):
+            self._warm()
             return
         self._inflation_radius = inflation_radius
         self._comfort_radius = comfort_radius
@@ -334,6 +341,7 @@ class NavMeshPlanner(GlobalPlanner):
         segs = np.array(segments, dtype=np.float64).reshape(-1, 4)
         segs = segs[np.hypot(*(segs[:, 2:] - segs[:, :2]).T) > TOL]
         keys = _keys(segs)
+        self._keys_now = keys
         if self._block(keys):
             self._block_nogo(keys)
             return
@@ -346,6 +354,7 @@ class NavMeshPlanner(GlobalPlanner):
         self._routed = {}
         self._blocked_edges = np.zeros(0, np.int64)
         self._slowdown = None
+        self._mesh_segs = segs
         if not len(segs):
             return
 
@@ -356,6 +365,7 @@ class NavMeshPlanner(GlobalPlanner):
         self._meshed = keys
         build_ms = (time.perf_counter() - began) * 1e3
         self._logger.info(f"Walls meshed: {len(self._mesh.V)} triangles, {len(self._mesh.P)} vertices, {len(segments)} segment(s), inflation={self._inflation_radius}m, comfort={self._comfort_radius}m, {build_ms:.0f} ms")
+        self._warm()
 
     def _block(self, keys: set[tuple[float, ...]]) -> bool:
         """Block the added walls on the mesh. False when the change needs a new mesh."""
@@ -395,54 +405,110 @@ class NavMeshPlanner(GlobalPlanner):
             self._areas = kept
             self._nogo.clear()
             self._forget_paths()
+            self._warm()
+
+    def prepare(self, climbs: Sequence[str] | None, radii: Sequence[float]) -> None:
+        """Build now the walled-off mesh of the agents that climb the stair kinds `climbs` and the routers their radii
+        plan with (`clearance_for`, `body_clearance`), on the open walls (where they stand on a half) and the walled-off
+        ones. Kept: whenever the walls are meshed again, the halves or the clearances change, all that is built again
+        at once, so no route of an agent finds its mesh or router missing and builds it within a tick (a walled-off
+        mesh took 2.6 s on the walkway world, the crowd behind its clock all that time). Radii, not clearances: a
+        clearance follows the planner's settings, which `configure` may change later."""
+        key = None if climbs is None else tuple(sorted(set(climbs)))
+        self._prepared.setdefault(key, set()).update(round(float(r), 6) for r in radii)
+        self._warm()
+
+    def forget_prepared(self) -> None:
+        self._prepared.clear()
+
+    def _warm(self) -> None:
+        """Build what `prepare` asked for that is not built (nothing without a mesh: the walls bring it), and what every
+        first route of the walls measures on: the ray grid and the free wall ends (25 ms on the walkway world)."""
+        if self._router is None or self._mesh is None:
+            return
+        self._rays()
+        self._free_ends()
+        for climbs, radii in self._prepared.items():
+            closed = self._closed_for(climbs)
+            if closed:
+                self._nogo_for(closed)
+            for clearance in dict.fromkeys(self.clearance_for(r) for r in sorted(radii)):
+                self._router_for(clearance)
+                if closed:
+                    self._router_for(clearance, closed)
+            for body in dict.fromkeys(self.body_clearance(r) for r in sorted(radii)):
+                if body is not None:
+                    self._body_router(body)
+                    if closed:
+                        self._body_router(body, closed)
 
     def _block_nogo(self, keys: set[tuple[float, ...]]) -> None:
         """The walled-off meshes through a change of walls the main mesh took by blocking (doors and other mechanisms
-        that add walls and take them away again): the walls added since each was meshed are blocked on it; one that
-        lost a wall it was meshed on, or cannot block one, is dropped and built again on first use."""
+        that add walls and take them away again). Each is meshed on the walls of the main mesh, so it takes every such
+        change as the main mesh does: the walls added since are blocked on it, in milliseconds, between the same two
+        ticks as on the main mesh. One that cannot block a wall (a half's outline cut the wall's mesh edge) is built
+        again on the current walls at once, with a warning."""
         for closed, nogo in list(self._nogo.items()):
-            if not nogo.meshed <= keys:
+            if not (nogo.meshed <= keys and self._block_on(nogo, keys)):
                 del self._nogo[closed]
-                continue
-            added = np.array(sorted(keys - nogo.meshed), dtype=np.float64).reshape(-1, 4)
-            edges = nogo.mesh.free_edges(added[:, :2], added[:, 2:])
-            if (edges < 0).any():
-                del self._nogo[closed]
-                continue
-            nogo.blocked = edges
-            for router in (nogo.router, *nogo.routers.values(), *nogo.body.values()):
-                router.set_blocked(edges)
+                self._logger.warning(f"the walled-off mesh of {len(closed)} stair or escalator half(s) cannot block the changed walls: built again")
+        self._warm()
+
+    @staticmethod
+    def _block_on(nogo: NoGo, keys: set[tuple[float, ...]]) -> bool:
+        """Block the walls of `keys` it was not meshed on on a walled-off mesh. False where one has no mesh edge."""
+        added = np.array(sorted(keys - nogo.meshed), dtype=np.float64).reshape(-1, 4)
+        edges = nogo.mesh.free_edges(added[:, :2], added[:, 2:])
+        if (edges < 0).any():
+            return False
+        nogo.blocked = edges
+        for router in (nogo.router, *nogo.routers.values(), *nogo.body.values()):
+            router.set_blocked(edges)
+        return True
+
+    def _closed_for(self, climbs: Sequence[str] | None) -> frozenset[str]:
+        """The halves of kinds not among `climbs` (none for None)."""
+        if climbs is None or not self._areas:
+            return frozenset()
+        return frozenset(name for name, (kind, _) in self._areas.items() if kind not in climbs)
 
     def _closed_to(self, agent: object) -> frozenset[str]:
         """The halves an agent does not climb: those whose kind is not among its `climbs` (none without the attribute).
         One that stands on such a half (the crowd pushed it there) plans on the open walls, its way off; so a class has
         one walled-off mesh, not one per half its agents stand on."""
-        climbs = getattr(getattr(agent, "params", None), "climbs", None)
-        if climbs is None or not self._areas:
-            return frozenset()
+        closed = self._closed_for(getattr(getattr(agent, "params", None), "climbs", None))
+        if not closed:
+            return closed
         pose = agent.state.pose  # pyright: ignore[reportAttributeAccessIssue]  # every planned agent has a state
-        closed = frozenset(name for name, (kind, _) in self._areas.items() if kind not in climbs)
         if any(_inside_polygon(self._areas[name][1], pose.x, pose.y) for name in closed):
             return frozenset()
         return closed
 
     def _nogo_for(self, closed: frozenset[str]) -> NoGo:
-        """The walled-off mesh for the halves `closed`, built on first use: the walls and the halves' outlines."""
+        """The walled-off mesh for the halves `closed`, built on first use (`prepare` builds it before): the walls of
+        the main mesh and the halves' outlines, the walls added since blocked on it as on the main mesh. Where one of
+        those has no mesh edge, it is meshed on the current walls instead."""
         hit = self._nogo.get(closed)
         if hit is None:
             began = time.perf_counter()
-            walls = np.array(self._wall_segments, dtype=np.float64).reshape(-1, 4)
-            walls = walls[np.hypot(*(walls[:, 2:] - walls[:, :2]).T) > TOL]
-            outlines = [(*a, *b) for name in sorted(closed) for fp in [self._areas[name][1]] for a, b in zip(fp, fp[1:] + fp[:1], strict=True)]
-            segs = np.vstack([walls, np.array(outlines, dtype=np.float64).reshape(-1, 4)])
-            segs = segs[np.hypot(*(segs[:, 2:] - segs[:, :2]).T) > TOL]
-            mesh = Mesh.build(segs, 2 * max(self._comfort_radius, self._inflation_radius * 1.05))
-            hit = self._nogo[closed] = NoGo(mesh, Router(mesh, self._inflation_radius, self._comfort_radius), meshed=_keys(walls))
+            outlines = np.array([(*a, *b) for name in sorted(closed) for fp in [self._areas[name][1]] for a, b in zip(fp, fp[1:] + fp[:1], strict=True)], dtype=np.float64).reshape(-1, 4)
+            hit = self._nogo_mesh(self._mesh_segs, outlines, set(self._meshed))
+            if not self._block_on(hit, self._keys_now):
+                walls = np.array(self._wall_segments, dtype=np.float64).reshape(-1, 4)
+                walls = walls[np.hypot(*(walls[:, 2:] - walls[:, :2]).T) > TOL]
+                hit = self._nogo_mesh(walls, outlines, _keys(walls))
+            self._nogo[closed] = hit
             self.nogo_builds.append((time.perf_counter() - began) * 1e3)
-            self._logger.info(f"Walls meshed with {len(closed)} stair or escalator half(s) walled off: {len(mesh.V)} triangles, {self.nogo_builds[-1]:.0f} ms")
+            self._logger.info(f"Walls meshed with {len(closed)} stair or escalator half(s) walled off: {len(hit.mesh.V)} triangles, {self.nogo_builds[-1]:.0f} ms")
             if self._crowd is not None:
                 self._nogo_congestion(hit)
         return hit
+
+    def _nogo_mesh(self, walls: np.ndarray, outlines: np.ndarray, meshed: set[tuple[float, ...]]) -> NoGo:
+        segs = np.vstack([walls, outlines])
+        segs = segs[np.hypot(*(segs[:, 2:] - segs[:, :2]).T) > TOL]
+        mesh = Mesh.build(segs, 2 * max(self._comfort_radius, self._inflation_radius * 1.05))
+        return NoGo(mesh, Router(mesh, self._inflation_radius, self._comfort_radius), meshed=meshed)
 
     def _nogo_congestion(self, nogo: NoGo) -> None:
         """Weigh a walled-off mesh's routers by the crowd of the last congestion update (`_slowdown_at`)."""
@@ -553,9 +619,13 @@ class NavMeshPlanner(GlobalPlanner):
 
     def _cast(self, origins: np.ndarray, directions: np.ndarray, far: float | np.ndarray) -> np.ndarray:
         """The distance to the first wall along each ray, `far` where there is none within it."""
+        return cast_rays(self._rays(), origins, directions, far)
+
+    def _rays(self) -> WallGrid:
+        """The grid `_cast` casts on, for the current walls."""
         if self._ray_grid is None or self._ray_grid[0] is not self._wall_segments:
             self._ray_grid = (self._wall_segments, WallGrid(self._wall_segments))
-        return cast_rays(self._ray_grid[1], origins, directions, far)
+        return self._ray_grid[1]
 
     def _shape(self, agent_id: int, router: Router, polyline: np.ndarray) -> np.ndarray:
         """The route of an agent that trails walls (`wall_trailing`) or keeps a lane in corridors (`passage`): laid

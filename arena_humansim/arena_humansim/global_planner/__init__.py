@@ -417,6 +417,15 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         self._waited.clear()
         self._robot_since.clear()
 
+    def prepare(self, climbs: Sequence[str] | None, radii: Sequence[float]) -> None:
+        """Build now what agents that climb the stair kinds `climbs` (None: every kind) with body radii `radii` will plan
+        on, so their first routes find it built; kept for the walls that come later. A planner that builds nothing
+        lazily has nothing to do."""
+        del climbs, radii
+
+    def forget_prepared(self) -> None:
+        """Drop what `prepare` asked for (a new world brings its own agent classes)."""
+
     def configure(self, *, inflation_radius: float, resolution: float, comfort_radius: float, **_: Any) -> None:  # noqa: ANN401
         """Planner settings; a planner ignores the ones it has no use for (the grid planners: clearance margin, lanes)."""
 

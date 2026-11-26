@@ -246,3 +246,100 @@ def test_wheelchair_users_on_different_halves_share_one_walled_off_mesh(agent_fa
         cmd = {aid: HighLevelCommand(agent_id=aid, type=CommandType.NAVIGATE, target_pose=Pose2D(x=119.0, y=46.0), desired_velocity=0.9)}
         planner.compute([chair], cmd)
     assert len(planner.nogo_builds) == 1
+
+
+def test_a_walled_off_mesh_built_while_a_door_is_closed_lasts_when_it_opens(agent_factory: Callable[..., BaseAgent]) -> None:
+    """The walled-off mesh is meshed on the walls of the main mesh, the door blocked on it as on the main mesh: the door
+    opening takes it away by blocking too, between the same two ticks, instead of building the mesh again (2.6 s within
+    a tick on the walkway world)."""
+    planner = _planner()
+    door = _free_edge_near(planner, 119.5, 46.5)
+    walls = [*WALLS, *GATES, *BOX]
+    planner.set_walls([*walls, door])
+    chair = agent_factory(agent_id=1, x=START[0], y=START[1])
+    chair.params = attrs.evolve(chair.params, agent_radius=0.325, climbs=())
+    _go(planner, chair, BEYOND)
+    assert len(planner.nogo_builds) == 1
+    for k in range(5):
+        planner.set_walls(walls if k % 2 == 0 else [*walls, door])
+        points = _go(planner, chair, BEYOND)
+        assert not any(_in_a_half(p.x, p.y) for p in points)
+    assert len(planner.nogo_builds) == 1
+
+
+def _routers(planner: NavMeshPlanner) -> int:
+    return len(planner._routers) + len(planner._body_routers) + sum(1 + len(n.routers) + len(n.body) for n in planner._nogo.values())
+
+
+def test_prepare_builds_the_walled_off_mesh_and_routers_before_the_first_route(agent_factory: Callable[..., BaseAgent]) -> None:
+    planner = _planner()
+    planner.prepare((), [0.325])
+    assert len(planner.nogo_builds) == 1
+    built = _routers(planner)
+    chair = agent_factory(agent_id=1, x=START[0], y=START[1])
+    chair.params = attrs.evolve(chair.params, agent_radius=0.325, climbs=())
+    points = _go(planner, chair, BEYOND)
+    assert not any(_in_a_half(p.x, p.y) for p in points)
+    assert len(planner.nogo_builds) == 1
+    assert _routers(planner) == built
+
+
+def test_prepare_is_idempotent() -> None:
+    """Asked again, it builds nothing; classes that do not climb the same halves (every half here is a stair) share one
+    walled-off mesh."""
+    planner = _planner()
+    for _ in range(3):
+        planner.prepare(("escalator",), [0.3, 0.325])
+        planner.prepare([], [0.325])
+    assert len(planner.nogo_builds) == 1
+    built = _routers(planner)
+    planner.prepare((), [0.325, 0.3])
+    assert _routers(planner) == built
+    assert len(planner.nogo_builds) == 1
+
+
+def test_an_agent_class_that_climbs_every_kind_needs_no_walled_off_mesh() -> None:
+    planner = _planner()
+    planner.prepare(("stairs", "escalator"), [0.25])
+    planner.prepare(None, [0.25])
+    assert planner.nogo_builds == []
+
+
+def test_prepare_before_the_walls_builds_once_the_walls_and_halves_come(agent_factory: Callable[..., BaseAgent]) -> None:
+    planner = NavMeshPlanner(inflation_radius=0.38, comfort_radius=0.6, clearance_margin=0.25, lane_side="left", lane_offset=LANE_OFFSET_M)
+    planner.set_timing(0.05, 8.0)
+    planner.prepare((), [0.325])
+    planner.set_walls([*WALLS, *GATES, *BOX])
+    assert planner.nogo_builds == []
+    planner.set_areas(HALVES)
+    assert len(planner.nogo_builds) == 1
+    chair = agent_factory(agent_id=1, x=START[0], y=START[1])
+    chair.params = attrs.evolve(chair.params, agent_radius=0.325, climbs=())
+    _go(planner, chair, BEYOND)
+    assert len(planner.nogo_builds) == 1
+
+
+def test_walls_meshed_again_at_a_reset_are_warmed_again_at_once(agent_factory: Callable[..., BaseAgent]) -> None:
+    """A change of walls the main mesh cannot block (a wall it was meshed on goes away: the next world) builds the
+    prepared walled-off mesh again within that change, not at the next route."""
+    planner = _planner()
+    planner.prepare((), [0.325])
+    assert len(planner.nogo_builds) == 1
+    planner.set_walls([*WALLS[1:], *GATES, *BOX])
+    assert len(planner.nogo_builds) == 2
+    planner.configure(inflation_radius=0.4, resolution=0.1, comfort_radius=0.6)
+    assert len(planner.nogo_builds) == 3
+    chair = agent_factory(agent_id=1, x=START[0], y=START[1])
+    chair.params = attrs.evolve(chair.params, agent_radius=0.325, climbs=())
+    built = _routers(planner)
+    _go(planner, chair, BEYOND)
+    assert len(planner.nogo_builds) == 3
+    assert _routers(planner) == built
+
+
+def test_forget_prepared_leaves_the_next_world_cold() -> None:
+    planner = _planner()
+    planner.prepare((), [0.325])
+    planner.forget_prepared()
+    planner.set_walls([*WALLS[1:], *GATES, *BOX])
+    assert len(planner.nogo_builds) == 1

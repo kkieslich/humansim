@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 
-from arena_humansim.utils.mesh import MIN_LEN, Mesh, SegIndex, _clip_dist, _expand, _pt_seg, _seg_seg, add_feet, refine_gabriel, split_segments
+from arena_humansim.utils.mesh import MIN_LEN, SNAP, Mesh, SegIndex, _clip_dist, _expand, _pt_seg, _seg_seg, add_feet, refine_gabriel, split_segments
 
 from ._helpers import two_rooms
 
@@ -128,3 +128,46 @@ def test_free_edges_finds_a_door_and_refuses_walls_and_non_edges() -> None:
     assert mesh.free_edges(a, b).tolist() == [-1]
     assert mesh.free_edges(np.array([[3.0, 3.0]]), np.array([[9.0, 3.0]])).tolist() == [-1]
     assert len(mesh.free_edges(np.zeros((0, 2)), np.zeros((0, 2)))) == 0
+
+
+def _dock(x: float, y: float, theta: float) -> list[tuple[float, float, float, float]]:
+    """A 1.2 x 1.0 m dock footprint (a charger of the walkway world) at (x, y), turned by theta."""
+    c, s = math.cos(theta), math.sin(theta)
+    corners = [(x + c * u - s * v, y + s * u + c * v) for u, v in ((0.25, -0.5), (1.45, -0.5), (1.45, 0.5), (0.25, 0.5))]
+    return [(*a, *b) for a, b in zip(corners, corners[1:] + corners[:1], strict=True)]
+
+
+def _room_with_docks(gap: float, f32: bool) -> np.ndarray:
+    """Two chargers side by side in a room, as on the walkway world (x 152.9, theta 3.1264, the second 15 mm along):
+    `gap` is how far apart their shared edges lie; float32 as the walls come over AddWalls (Point32)."""
+    room = [(145.0, 15.0, 160.0, 15.0), (160.0, 15.0, 160.0, 30.0), (160.0, 30.0, 145.0, 30.0), (145.0, 30.0, 145.0, 15.0)]
+    segs = np.array(room + _dock(152.9143, 23.4839, 3.1264) + _dock(152.8991, 22.4839 + gap, 3.1264), dtype=np.float64)
+    return segs.astype(np.float32).astype(np.float64) if f32 else segs
+
+
+def test_footprints_that_share_an_edge_a_hair_apart_mesh_as_when_they_share_it() -> None:
+    """Two docks side by side share an edge; in the walkway world their two copies of it lay 1e-4 m apart, and float32
+    on the way. Kept apart, the two lines forced splits down to MIN_LEN along the whole edge: 3800 triangles more on
+    the walkway world, its mesh four times slower to build. Within SNAP they are one edge, and the mesh is the one of
+    the exactly shared edge."""
+    exact = Mesh.build(_room_with_docks(0.0, f32=False), 1.2)
+    for gap in (1e-4, -1e-4, 2e-5):
+        near = Mesh.build(_room_with_docks(gap, f32=True), 1.2)
+        assert len(near.P) == len(exact.P)
+        assert len(near.V) == len(exact.V)
+        np.testing.assert_allclose(np.sort(near.P, axis=0), np.sort(exact.P, axis=0), atol=2 * SNAP)
+        np.testing.assert_allclose(np.sort(near.arc_w), np.sort(exact.arc_w), atol=2 * SNAP)
+
+
+def test_footprints_further_apart_than_snap_keep_their_gap() -> None:
+    """A real gap (5 mm) stays: the rule merges only what lies within SNAP."""
+    mesh = Mesh.build(_room_with_docks(5e-3, f32=False), 1.2)
+    exact = Mesh.build(_room_with_docks(0.0, f32=False), 1.2)
+    assert len(mesh.P) > len(exact.P)
+
+
+def test_a_wall_that_stops_short_of_another_by_less_than_snap_meets_it() -> None:
+    touching = Mesh.build(_segs((0.0, 0.0, 4.0, 0.0), (2.0, 0.0, 2.0, 2.0), (0.0, 3.0, 4.0, 3.0)), 1.2)
+    short = Mesh.build(_segs((0.0, 0.0, 4.0, 0.0), (2.0, 0.0005, 2.0, 2.0), (0.0, 3.0, 4.0, 3.0)), 1.2)
+    assert len(short.P) == len(touching.P)
+    assert len(short.V) == len(touching.V)
