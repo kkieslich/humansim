@@ -4,7 +4,7 @@ import contextlib
 import enum
 import math
 import operator
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 
 import attrs
 import numpy as np
@@ -469,8 +469,9 @@ class TeleportZones:
         chooses again (where nothing else is left it walks at its goal, and the planner warns once it stands). The stair choice
         prices legs without checking their funnels against the walls, so it can choose a half whose entry the walker
         cannot walk to; without this the walker would walk to the nearest point it can reach, for good."""
-        unroutable = getattr(planner, "unroutable", None)  # a planner stand-in without it reports none
-        for aid, target, (x, y) in unroutable() if callable(unroutable) else ():
+        # a planner stand-in without it reports none
+        unroutable: Callable[[], list[tuple[int, tuple[float, float], tuple[float, float]]]] | None = getattr(planner, "unroutable", None)
+        for aid, target, (x, y) in unroutable() if unroutable is not None else ():
             transfer = self.transfers.get(aid)
             if transfer is None or transfer.aboard:
                 continue
