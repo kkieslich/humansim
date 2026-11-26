@@ -117,6 +117,10 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         self._robot_since: dict[int, tuple[float, float, int]] = {}
         self._blockers: dict[int, Robots] = {}
         self._waited: dict[int, tuple[float, float, int]] = {}
+        #: the legs with no route of the last `compute` (walker, its target rounded to mm, where it stood), and per walker
+        #: the target it was last warned about (one warning per walker and target)
+        self._unroutable: list[tuple[int, tuple[float, float], tuple[float, float]]] = []
+        self._unroutable_told: dict[int, tuple[float, float]] = {}
         self._warmup()
 
     def _warmup(self) -> None:
@@ -135,6 +139,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     ) -> dict[int, Pose2D]:
         agents = list(agents)
         agent_positions: dict[int, Pose2D] = {agent.state.agent_id: agent.state.pose for agent in agents}
+        self._unroutable = []
         self._radii = {agent.state.agent_id: float(getattr(getattr(agent, "params", None), "agent_radius", 0.0) or 0.0) for agent in agents}
         goals: dict[int, Pose2D] = {}
         requests: dict[int, tuple[Pose2D, Pose2D]] = {}
@@ -195,6 +200,9 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
 
         if requests:
             plans = self._plan([(agent_id, agent_pos, target) for agent_id, (agent_pos, target) in requests.items()])
+            for agent_id, (agent_pos, target) in requests.items():
+                if plans[agent_id] is None:
+                    self._note_unroutable(agent_id, agent_pos, target)
             detours = [(agent_id, agent_pos, reachable) for agent_id, (agent_pos, target) in requests.items() if plans[agent_id] is None and (reachable := self._nearest_reachable(agent_pos, target)) is not None]
             if detours:
                 plans.update(self._plan(detours))
@@ -339,6 +347,19 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
 
     def get_cached_goals(self) -> dict[int, Pose2D]:
         return dict(self._cached_results)
+
+    def _note_unroutable(self, agent_id: int, pos: Pose2D, target: Pose2D) -> None:
+        """Keep a leg with no route for `unroutable` and say so in the log, once per walker and target: a walker that
+        then stands (where the nearest point it can reach is where it is) does not stand without a reason on record."""
+        key = (round(target.x, 3), round(target.y, 3))
+        self._unroutable.append((agent_id, key, (pos.x, pos.y)))
+        if self._unroutable_told.get(agent_id) != key:
+            self._unroutable_told[agent_id] = key
+            self._logger.warning(f"unroutable leg: agent {agent_id} at ({pos.x:.2f}, {pos.y:.2f}) has no route to ({target.x:.2f}, {target.y:.2f})")
+
+    def unroutable(self) -> list[tuple[int, tuple[float, float], tuple[float, float]]]:
+        """The legs the last `compute` found no route for: walker, its target rounded to mm, where it stood."""
+        return list(self._unroutable)
 
     def get_cached_paths(self) -> dict[int, list[Pose2D]]:
         return {aid: wps for aid, (_, wps, _, _) in self._path_cache.items()}
