@@ -378,3 +378,20 @@ def test_a_walker_with_every_option_struck_and_no_walk_gets_one_warning(manager_
     assert strikes
     assert len(strikes) <= seconds / CHOICE_INTERVAL + 2
     assert len(planner.stood) == 1 and planner.stood[0][0] == 1
+
+
+def test_without_route_choice_a_struck_half_still_comes_back_by_time(manager_factory: Callable[..., AgentManager]) -> None:
+    """Without route choice the stair is the only way between the rooms; a walker that cannot walk to its half stands,
+    and the half comes back every `CHOICE_INTERVAL` (sim time), not only once it moves."""
+    mgr = _manager(manager_factory, "strike_no_choice", False, _pair()[:1], segments=NO_CORRIDOR)
+    _fail_legs_to(mgr, "st_a", lambda x, y: True)
+    strikes: list[tuple[float, float, float]] = []
+    for _ in range(int(4 * CHOICE_INTERVAL / 0.05)):
+        mgr.tick()
+        entry = mgr._zones._unwalkable.get(1)
+        if entry is not None and "st_a" in entry[1] and (not strikes or entry[1]["st_a"][2] != strikes[-1][2]):
+            strikes.append(entry[1]["st_a"])
+    # once the walker stands, its half is struck again where it stands, a CHOICE_INTERVAL after the last strike
+    by_time = [(a, b) for a, b in zip(strikes, strikes[1:], strict=False) if math.dist(a[:2], b[:2]) <= STRIKE_MOVE_M]
+    assert by_time
+    assert all(b[2] - a[2] >= CHOICE_INTERVAL - 1e-6 for a, b in by_time)

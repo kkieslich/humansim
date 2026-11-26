@@ -300,6 +300,7 @@ class TeleportZones:
         self._banned.clear()
         self._unwalkable.clear()
         self._struck_before.clear()
+        self._now = 0.0
         self._walks.clear()
         self.riders.clear()
         self._held.clear()
@@ -334,7 +335,7 @@ class TeleportZones:
         With `route_choice`, `now` [s] paces each walker's choice between walking and riding (no pacing without it)."""
         self.through = {}
         if now is not None:
-            self._now = now
+            self._now = max(self._now, now)
         if not self.zones:
             return cmds
         out = dict(cmds)
@@ -797,6 +798,7 @@ class TeleportZones:
 
     def hold(self, pool: AgentPool, tick: int, timeout_ticks: int, dt: float, let_out_ticks: int) -> list[tuple[int, float, float, float]]:
         """Advance every cabin rider's phase, slow the waiting ones to desired speed 0, stand the holding ones still and return the due self-teleports, stair crossings included, as id, x, y, heading."""
+        self._now = max(self._now, tick * dt)  # the sim time for the strikes' expiry, with or without route choice
         robots = self._zone_robots(pool)
         alighting = self._alighting(pool) if let_out_ticks > 0 else set()
         teleports: list[tuple[int, float, float, float]] = []
