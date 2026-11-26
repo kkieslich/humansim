@@ -73,6 +73,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.serialization import serialize_message
 from rosgraph_msgs.msg import Clock
 from std_msgs.msg import Header
+from std_msgs.msg import String as StringMsg
 
 from arena_humansim.animation import MotionAnimation
 from arena_humansim.collision import CollisionResolver
@@ -218,6 +219,12 @@ _RECONFIGURABLE_PARAMS = _TUNABLE_PARAMS | {
 
 #: jsonl file the engine writes every input it takes to, with the tick it lands before (debugging run-to-run differences)
 _INPUT_TRACE = os.environ.get("HS_INPUT_TRACE", "")
+
+#: Without lockstep a /clock callback that finds ticks owed runs them for at most this long [wall s]; the rest follow
+#: from a catch-up timer, so services (parameter and health pings) are answered between slices of a long catch-up
+CATCH_UP_SLICE_S = 0.5
+#: The catch-up state (`catch_up` topic) is sent at most this often while ticks are owed [wall s]
+CATCH_UP_REPORT_S = 1.0
 
 _EXTERNAL_TIMEOUT_S = 2.0
 _EXTERNAL_ADOPT_RADIUS = 1.0
@@ -564,6 +571,14 @@ class AgentManager(TimeNode):
         self._tick_phases: dict[str, float] = {}
         self._overrun_count: int = 0
         self._last_overrun_log: float = 0.0
+        #: the catch-up of this clock (since the last reset): the most ticks any /clock covered, its peaks, when it was
+        #: last sent, whether ticks are owed, and the timer (and its barrier force) that runs the rest of a slice
+        self._newest_covered: int = 0
+        self._catch_up_peaks: dict[str, float] = {}
+        self._catch_up_sent = -math.inf
+        self._catch_up_behind = False
+        self._catch_up_timer: rclpy.timer.Timer | None = None
+        self._catch_up_force = False
         self._tick_wall_start: float | None = None
         self._total_tick_compute_s: float = 0.0
         self._high_level_cmds: dict[int, HighLevelCommand] = {}
@@ -586,6 +601,7 @@ class AgentManager(TimeNode):
         )
 
         self._interactions_pub = self.create_publisher(InteractionFrameMsg, "interactions", QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._catch_up_pub = self.create_publisher(StringMsg, "catch_up", _LATCHED_QOS)
 
         self._world_geometry_pub = self.create_publisher(
             WorldGeometryMsg,
@@ -2335,7 +2351,9 @@ class AgentManager(TimeNode):
             self._last_clock_ns = max(self._last_clock_ns, now_ns)
             return
         self._last_clock_ns = now_ns
-        self._run_owed(covered)
+        # a /clock that waited behind a catch-up slice may cover fewer ticks than one already seen: catch up to the newest
+        self._newest_covered = covered if self._tick_count == 0 else max(self._newest_covered, covered)
+        self._run_owed(self._newest_covered)
 
     @property
     def _dt_ns(self) -> int:
@@ -2369,15 +2387,66 @@ class AgentManager(TimeNode):
             self._barrier_wait_since = None
         owed = target - self._tick_count
         if owed <= 0:
+            self._stop_catch_up()
             return
         dt_ns = self._dt_ns
         t0 = time.perf_counter()
-        for _ in range(owed):
+        done = 0
+        while done < owed:
             self._sim_time_ns = self._tick_count * dt_ns
             self.tick()
             self._accumulated_spawned.extend(self._last_spawned_ids)
             self._accumulated_despawned.extend(self._last_despawned_ids)
-        self._check_overrun(time.perf_counter() - t0)
+            done += 1
+            if done < owed and time.perf_counter() - t0 >= CATCH_UP_SLICE_S:
+                break
+        elapsed = time.perf_counter() - t0
+        self._check_overrun(elapsed)
+        self._note_catch_up(owed, done, elapsed)
+        if done == owed:
+            self._stop_catch_up()
+            return
+        # the rest of a long catch-up runs from the catch-up timer, once the executor has served what came in meanwhile
+        self._catch_up_force = force
+        if self._catch_up_timer is None:
+            self._catch_up_timer = self.create_timer(0.0, self._catch_up_callback, clock=RclClock(clock_type=ClockType.STEADY_TIME))
+        elif self._catch_up_timer.is_canceled():
+            self._catch_up_timer.reset()
+
+    def _owed(self) -> int:
+        """Ticks the newest /clock of this clock covers that have not run (the input barrier aside)."""
+        return max(self._newest_covered - self._tick_count, 0) if self._tick_count > 0 and not self._clock_held else 0
+
+    def _catch_up_callback(self) -> None:
+        self._run_owed(self._newest_covered, force=self._catch_up_force)
+
+    def _stop_catch_up(self) -> None:
+        if self._catch_up_timer is not None and not self._catch_up_timer.is_canceled():
+            self._catch_up_timer.cancel()
+
+    def _note_catch_up(self, owed: int, done: int, elapsed: float) -> None:
+        """Keep the peaks of the catch-up and send its state on `catch_up` (a JSON string, latched): while ticks are owed
+        at most every `CATCH_UP_REPORT_S`, at a new peak, and once it caught up again. A crowd that lags its clock is
+        visible in the run's data, never silent."""
+        left = owed - done
+        peaks = self._catch_up_peaks
+        new_peak = owed > 1 and (owed > peaks.get("owed", 0) or elapsed > peaks.get("batch_s", 0.0))
+        if owed > 1:
+            peaks["owed"] = max(peaks.get("owed", 0), owed)
+            peaks["batch_s"] = max(peaks.get("batch_s", 0.0), elapsed)
+            peaks["lag_s"] = max(peaks.get("lag_s", 0.0), (owed - 1) * self._dt)
+            peaks["batches"] = peaks.get("batches", 0) + 1
+        behind = owed > 1
+        now = time.perf_counter()
+        caught_up = self._catch_up_behind and not behind
+        self._catch_up_behind = behind
+        if not caught_up and not (behind and (new_peak or now - self._catch_up_sent >= CATCH_UP_REPORT_S)):
+            return
+        self._catch_up_sent = now
+        clock_ns = self._subsystem_epoch_ns + (self._newest_covered - 1) * self._dt_ns
+        state = {"sim_s": round(self._tick_count * self._dt, 3), "clock_s": round(clock_ns / 1e9, 3), "owed": owed, "ran": done, "left": left, "lag_s": round(left * self._dt, 3), "batch_s": round(elapsed, 3)}
+        state.update({f"peak_{key}": round(value, 3) if isinstance(value, float) else value for key, value in peaks.items()})
+        self._catch_up_pub.publish(StringMsg(data=json.dumps(state)))
 
     def _barrier_watchdog(self) -> None:
         """Run ticks the input barrier has held back longer than `input_barrier_timeout` wall seconds without it."""
@@ -2398,6 +2467,10 @@ class AgentManager(TimeNode):
         self._barrier_ns = -1
         self._barrier_covered = None
         self._barrier_wait_since = None
+        self._newest_covered = 0
+        self._catch_up_peaks = {}
+        self._catch_up_behind = False
+        self._stop_catch_up()
 
     def _start_clock_callback(
         self,
