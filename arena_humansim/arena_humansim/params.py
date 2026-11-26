@@ -66,6 +66,14 @@ ARRIVAL_TAU_BRAKE = Param[float]("arrival_tau_brake", 0.15, "Braking time consta
 ZONE_WAIT_TIMEOUT = Param[float]("zone_wait_timeout", 30.0, "Sim seconds after reaching a teleport zone's wait pose or taking a spot before a rider not yet teleported leaves the zone and is routed again.")
 ZONE_LET_OUT_TIMEOUT = Param[float]("zone_let_out_timeout", 10.0, "Sim seconds of an open zone that a waiting rider leaves to those getting out before it boards anyway (0 = board at once).")
 ZONE_ROUTE_CHOICE = Param[bool]("zone_route_choice", False, "Walkers that climb also ride a stair or escalator half beside its partner where that is quicker than walking, the walks timed on the planner's congestion weights, and choose again every 5-10 s; false: only halves joined in place are timed against walking.")
+ZONE_ROUTE_PRICINGS = ("tree", "paths")
+ZONE_ROUTE_PRICING = Param[str](
+    "zone_route_pricing",
+    "tree",
+    "How route choice times a walk: tree = the congestion-weighted cost on the planner's shortest-path tree to the walk's goal (one lookup per leg); paths = the congestion-weighted length of a planned, funnelled and lane-shifted path per leg (as before, several times the cost).",
+    constraint=Choices(*ZONE_ROUTE_PRICINGS),
+)
+ZONE_ROUTE_PRICING_SHADOW = Param[bool]("zone_route_pricing_shadow", False, "Price every route choice both ways and count the choices the other pricing would have made differently, per walker class and per pair of choices (logged every 60 s of sim time and at the end); the crowd follows zone_route_pricing.")
 PUBLISH_MARKERS = Param[int]("publish_markers", 0, "RViz marker level: 0 = off, 1 = infrastructure, labels and interactions, 2 = full.", constraint=Range(0, 2))
 PROFILE_PHASES = Param[bool]("profile_phases", False, "Time the tick phases.")
 PROFILE_INTERVAL = Param[int]("profile_interval", 0, "Log the tick phase profile every N ticks (0 = never).")
@@ -119,6 +127,8 @@ AGENT_MANAGER_PARAMS = (
     ZONE_WAIT_TIMEOUT,
     ZONE_LET_OUT_TIMEOUT,
     ZONE_ROUTE_CHOICE,
+    ZONE_ROUTE_PRICING,
+    ZONE_ROUTE_PRICING_SHADOW,
     PUBLISH_MARKERS,
     PROFILE_PHASES,
     PROFILE_INTERVAL,
