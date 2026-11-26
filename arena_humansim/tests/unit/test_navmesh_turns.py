@@ -13,7 +13,7 @@ import pytest
 
 from arena_humansim.core.agents.base import BaseAgent
 from arena_humansim.global_planner import LANE_OFFSET_M
-from arena_humansim.global_planner.navmesh import TURN_HOLD, TURN_STUCK_S, NavMeshPlanner
+from arena_humansim.global_planner.navmesh import TURN_HOLD, TURN_STUCK_S, TURN_YIELD_S, Narrow, NavMeshPlanner
 from arena_humansim.utils.types import CommandType, HighLevelCommand, Pose2D
 
 WEST, EAST = (-12.0, 0.0), (12.0, 0.0)
@@ -126,3 +126,137 @@ def test_walkers_away_from_narrow_passages_get_no_commands(agent_factory: Callab
     walkers = [_walker(agent_factory, 1, -8.0), _walker(agent_factory, 2, 8.0)]
     planner.compute(walkers, _go({1: EAST, 2: WEST}))
     assert planner.passage_commands() == {}
+
+
+def _door_planner(width: float) -> NavMeshPlanner:
+    """Two halls of 10 x 10 m on either side of a wall without thickness at x = 0 (as the arena-world walls are lines),
+    with a door `width` wide in its middle."""
+    w = width / 2.0
+    outline = [(-10.0, -5.0), (10.0, -5.0), (10.0, 5.0), (-10.0, 5.0)]
+    walls = [*zip(outline, outline[1:] + outline[:1], strict=True), ((0.0, -5.0), (0.0, -w)), ((0.0, w), (0.0, 5.0))]
+    planner = NavMeshPlanner(inflation_radius=0.38, comfort_radius=0.6, clearance_margin=0.25, lane_side="left", lane_offset=LANE_OFFSET_M)
+    planner.set_walls(walls)
+    planner.set_timing(0.05, 8.0)
+    return planner
+
+
+@pytest.mark.parametrize(("start", "goal"), [((-6.0, 0.0), (6.0, 0.0)), ((6.0, 0.0), (-6.0, 0.0)), ((-6.0, -2.0), (6.0, 2.5))])
+def test_a_door_in_a_wall_without_thickness_is_a_narrow_stretch(start: tuple[float, float], goal: tuple[float, float]) -> None:
+    """No chord through a point beside such a door ends on walls at both ends; its jambs make it as narrow as it is."""
+    planner = _door_planner(1.2)
+    path = planner.paths([(Pose2D(x=start[0], y=start[1]), Pose2D(x=goal[0], y=goal[1]))])[0]
+    way = planner._turn_way(path, 2 * 0.325 + 0.8 + 0.1)
+    assert len(way.narrows) == 1
+    narrow, width = way.narrows[0]
+    assert width == pytest.approx(1.2, abs=0.05)
+    mouth = narrow.points[len(narrow.points) // 2]
+    assert abs(mouth[0]) < 0.3 and abs(mouth[1]) < 0.6
+
+
+def test_a_wide_door_and_the_walls_beside_it_are_no_narrow_stretch() -> None:
+    planner = _door_planner(3.0)
+    path = planner.paths([(Pose2D(x=-6.0, y=0.0), Pose2D(x=6.0, y=0.0))])[0]
+    assert planner._turn_way(path, 2 * 0.325 + 0.8 + 0.1).narrows == []
+    along = planner.paths([(Pose2D(x=-6.0, y=4.0), Pose2D(x=-6.0, y=-4.0))])[0]
+    assert planner._turn_way(along, 2 * 0.325 + 0.8 + 0.1).narrows == []
+
+
+@pytest.mark.parametrize(("width", "radius", "waits"), [(1.2, 0.325, True), (1.0, 0.25, True), (1.2, 0.25, False)])
+def test_one_waits_before_a_door_in_a_wall_without_thickness_while_one_comes_through(width: float, radius: float, waits: bool, agent_factory: Callable[..., BaseAgent]) -> None:
+    """A wheelchair user (0.65 m) and an adult do not pass in a 1.2 m door, two adults do not in a 1.0 m one."""
+    planner = _door_planner(width)
+    inside = _walker(agent_factory, 1, -0.1, radius=radius)
+    coming = _walker(agent_factory, 2, 3.0)
+    planner.compute([inside, coming], _go({1: (6.0, 0.0), 2: (-6.0, 0.0)}))
+    assert _hold(planner, 1) is None
+    hold = _hold(planner, 2)
+    assert (hold is not None) is waits
+    if waits:
+        assert hold is not None and hold[0] > 0.5
+
+
+def test_a_walker_the_crowd_pushed_back_keeps_its_place_in_the_order(agent_factory: Callable[..., BaseAgent]) -> None:
+    planner = _planner(1.0)
+    early = _walker(agent_factory, 2, 8.0)
+    planner.compute([early], _go({2: WEST}))
+    stamp = planner._turn_claims[2][2]
+    early.state.pose.x, early.state.pose.y = 12.0, 3.0  # pushed back beyond LINE_UP: its route still leads through the passage
+    later = _walker(agent_factory, 5, -8.0)
+    for _ in range(5):
+        planner.compute([early, later], _go({2: WEST, 5: EAST}))
+    assert planner._turn_claims[2][2] == stamp and 2 not in planner._turn_held
+    early.state.pose.x, early.state.pose.y = 8.0, 0.0
+    planner.compute([early, later], _go({2: WEST, 5: EAST}))
+    assert _hold(planner, 2) is None
+    assert _hold(planner, 5) is not None
+
+
+def test_the_end_that_has_the_passage_yields_once_the_other_end_waited_its_time(agent_factory: Callable[..., BaseAgent]) -> None:
+    """Platoons: the end that came first keeps the passage while its walkers come, at most `TURN_YIELD_S` while the
+    other end waits (once the walker it got the passage for went in); then the other end gets it."""
+    planner = _planner(1.0)
+    east = _walker(agent_factory, 1, -7.0)
+    planner.compute([east], _go({1: EAST}))
+    west = _walker(agent_factory, 2, 8.0)
+    planner.compute([east, west], _go({1: EAST, 2: WEST}))
+    east.state.pose.x = 0.0
+    planner.compute([east, west], _go({1: EAST, 2: WEST}))
+    east.state.pose.x = 9.0
+    follow = _walker(agent_factory, 3, -7.0)
+    held = []
+    for _ in range(int(TURN_YIELD_S / 0.05) + 3):
+        planner.compute([east, west, follow], _go({1: EAST, 2: WEST, 3: EAST}))
+        held.append((_hold(planner, 3) is not None, _hold(planner, 2) is not None))
+    assert held[0] == (False, True)
+    assert held[-1] == (True, False)
+
+
+def test_the_end_keeps_the_passage_until_the_walker_it_got_it_for_went_in(agent_factory: Callable[..., BaseAgent]) -> None:
+    """A slow walker the passage was given to (a wheelchair user beside the mouth, say) does not lose its turn while
+    the other end waits longer than `TURN_YIELD_S`; only `TURN_STUCK_S` ends that."""
+    planner = _planner(1.0)
+    slow = _walker(agent_factory, 2, 8.0, radius=0.325)
+    planner.compute([slow], _go({2: WEST}))
+    other = _walker(agent_factory, 1, -7.0)
+    held = []
+    for _ in range(int((TURN_YIELD_S + 5.0) / 0.05)):
+        planner.compute([slow, other], _go({2: WEST, 1: EAST}))
+        held.append((_hold(planner, 2) is not None, _hold(planner, 1) is not None))
+    assert all(h == (False, True) for h in held)
+
+def test_the_waiting_walkers_of_one_end_line_up_in_the_order_they_came(agent_factory: Callable[..., BaseAgent]) -> None:
+    planner = _planner(1.0)
+    inside = _walker(agent_factory, 1, 0.0)
+    far = _walker(agent_factory, 3, 9.0)
+    planner.compute([inside, far], _go({1: EAST, 3: WEST}))
+    near = _walker(agent_factory, 4, 6.5)
+    planner.compute([inside, far, near], _go({1: EAST, 3: WEST, 4: WEST}))
+    spot_far, spot_near = _hold(planner, 3), _hold(planner, 4)
+    assert spot_far is not None and spot_near is not None
+    assert spot_far[0] < spot_near[0]  # the one that came first stands nearer the mouth (x = 5)
+
+
+def test_one_of_the_waiting_end_pushed_to_the_mouth_rolls_back(agent_factory: Callable[..., BaseAgent]) -> None:
+    """The crowd pushed a walker of the end that does not have the passage past its hold line, not yet into the
+    stretch: it rolls back behind the line and keeps no one of the other end waiting."""
+    planner = _planner(1.0)
+    first = _walker(agent_factory, 1, -7.0)
+    planner.compute([first], _go({1: EAST}))
+    pushed = _walker(agent_factory, 2, 5.3)
+    planner.compute([first, pushed], _go({1: EAST, 2: WEST}))
+    assert _hold(planner, 1) is None
+    command = planner.passage_commands()[2]
+    assert command.back is True
+    assert command.hold is not None and command.hold[0] > 5.3
+
+
+def test_a_passage_no_call_saw_for_a_second_is_forgotten_with_its_end() -> None:
+    planner = _planner(1.0)
+    narrow = Narrow(0.0, 1.0, -TURN_HOLD, np.array([[0.0, 0.0], [1.0, 0.0]]), np.array([[1.0, 0.0], [1.0, 0.0]]))
+    seen = {1: (0.0, 0.25, narrow, 1.0, "near")}
+    first = planner._turn_passage([1], seen, 0)
+    first.serving = -1
+    assert planner._turn_passage([1], seen, int(0.5 / 0.05)) is first
+    later = planner._turn_passage([1], seen, int(0.5 / 0.05) + int(1.5 / 0.05))
+    assert later is not first
+    assert later.serving == 0
