@@ -1519,15 +1519,15 @@ class AgentManager(TimeNode):
 
     def create_service(self, srv_type: Any, srv_name: str, callback: Callable[..., Any], **kwargs: Any) -> rclpy.service.Service:  # noqa: ANN401
         """With HS_INPUT_TRACE set, every request a service takes is noted with the tick it lands before."""
-        if _INPUT_TRACE and srv_name != "get_profile":
-            inner = callback
+        if not _INPUT_TRACE or srv_name == "get_profile":
+            return super().create_service(srv_type, srv_name, callback, **kwargs)
 
-            def callback(request: Any, response: Any) -> Any:  # noqa: ANN401
-                detail = {key: getattr(request, key) for key in ("agent_id", "stimulus", "intensity") if isinstance(getattr(request, key, None), int | float | str)}
-                self._trace_input(srv_name, serialize_message(request), **detail)
-                return inner(request, response)
+        def traced(request: Any, response: Any) -> Any:  # noqa: ANN401
+            detail = {key: getattr(request, key) for key in ("agent_id", "stimulus", "intensity") if isinstance(getattr(request, key, None), int | float | str)}
+            self._trace_input(srv_name, serialize_message(request), **detail)
+            return callback(request, response)
 
-        return super().create_service(srv_type, srv_name, callback, **kwargs)
+        return super().create_service(srv_type, srv_name, traced, **kwargs)
 
     def _trace_input(self, name: str, payload: bytes, **extra: object) -> None:
         trace = getattr(self, "_input_trace_file", None)
