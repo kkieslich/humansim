@@ -157,3 +157,23 @@ def test_components_snap_a_point_in_the_band_and_drop_one_off_the_mesh() -> None
     near, inside, off = _router(two_rooms(2.0)).components(np.array([[3.0, 0.1], [3.0, 3.0], [50.0, 50.0]]))
     assert near & inside
     assert off == frozenset()
+
+
+def test_a_congestion_update_weighs_the_arcs_as_a_full_rebuild_does() -> None:
+    """Only the arcs whose weight changed are written on an update; the A* rows and the tree weights are those a router
+    built from scratch with the same congestion has, update after update, back to plain lengths too."""
+    router = _router(two_rooms(2.0))
+    rng = np.random.default_rng(2)
+    E = len(router.mesh.ea)
+    for slow in (np.maximum(1.0, rng.normal(1.5, 0.6, E)), np.where(rng.random(E) < 0.1, 3.0, 1.0), None, np.ones(E)):
+        router.set_congestion(slow)
+        fresh = _router(two_rooms(2.0))
+        fresh._slow = None if slow is None else np.maximum(np.asarray(slow, dtype=np.float64), 1.0)
+        fresh._topology = None
+        fresh._graph()
+        assert router._cst == fresh._cst
+        assert router._data.tobytes() == fresh._data.tobytes()
+        start, goal = np.array([2.0, 1.0]), np.array([10.0, 5.0])
+        a, b = router.plan(start, goal), fresh.plan(start, goal)
+        assert (a is None) == (b is None)
+        assert a is None or b is None or a[0].tobytes() == b[0].tobytes()

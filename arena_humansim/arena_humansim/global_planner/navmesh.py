@@ -1330,7 +1330,10 @@ class NavMeshPlanner(GlobalPlanner):
         starts = np.array([start for _, _, _, start in entries])
         framed = self._inside(starts)
         beyond = (framed != starts).any(axis=1) | (self._inside(goal) != goal).any()
-        direct = beyond & router.line_of_sight(starts, np.repeat(goal[None], len(starts), 0))
+        # the sight line is looked for only where it is used: a start or the goal outside the mesh frame
+        direct = np.zeros(len(starts), dtype=bool)
+        if beyond.any():
+            direct[beyond] = router.line_of_sight(starts[beyond], np.repeat(goal[None], int(beyond.sum()), 0))
         # priced routes (`paths`) only need their length: their funnels are not checked against the walls
         routes = router.plan_many(framed[~direct], self._inside(goal), verify=not self._pricing)
         polylines: list[np.ndarray | None] = [None] * len(entries)
