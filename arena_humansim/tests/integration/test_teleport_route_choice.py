@@ -304,9 +304,9 @@ def test_a_walker_that_cannot_walk_to_the_stair_half_it_chose_chooses_again(mana
     noted: list[tuple] = []
     note = planner._note_unroutable
 
-    def record(agent_id, pos, target):  # noqa: ANN001, ANN202 - wraps GlobalPlanner._note_unroutable
+    def record(agent_id, pos, target, reachable):  # noqa: ANN001, ANN202 - wraps GlobalPlanner._note_unroutable
         noted.append((agent_id, round(target.x, 3), round(target.y, 3)))
-        note(agent_id, pos, target)
+        note(agent_id, pos, target, reachable)
 
     planner._note_unroutable = record
     went_round = False

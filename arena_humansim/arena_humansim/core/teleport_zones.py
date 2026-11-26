@@ -463,7 +463,7 @@ class TeleportZones:
                 continue
             del self.transfers[aid]
             self._unwalkable.setdefault(aid, (transfer.goal, set()))[1].add(transfer.zone)
-            planner._logger.warning(f"unroutable leg: agent {aid} cannot walk to {transfer.zone}; struck off for it, choosing again")
+            planner._logger.info(f"unroutable leg: agent {aid} cannot walk to {transfer.zone}; struck off for it, choosing again")
 
     def _inner(self, zone: Zone, across: float = 0.0) -> Pose2D:
         """Where a stair half is walked to: its lane point on the hold line, on a pair joined in place a point short of the seam `across` meters off its center line."""

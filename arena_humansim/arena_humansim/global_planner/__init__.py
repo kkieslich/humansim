@@ -98,6 +98,8 @@ class PassageCommand:
     hold: tuple[float, float, float, float] | None = None
     back: bool = False
 
+#: A walker with no route to its target that can get no nearer to it than this from where it stands is said to stand [m]
+UNROUTABLE_STAND = 0.5
 
 class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def __init__(self, replan_distance: float = 1.0) -> None:
@@ -200,10 +202,11 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
 
         if requests:
             plans = self._plan([(agent_id, agent_pos, target) for agent_id, (agent_pos, target) in requests.items()])
+            detours = [(agent_id, agent_pos, reachable) for agent_id, (agent_pos, target) in requests.items() if plans[agent_id] is None and (reachable := self._nearest_reachable(agent_pos, target)) is not None]
+            reach = {agent_id: reachable for agent_id, _, reachable in detours}
             for agent_id, (agent_pos, target) in requests.items():
                 if plans[agent_id] is None:
-                    self._note_unroutable(agent_id, agent_pos, target)
-            detours = [(agent_id, agent_pos, reachable) for agent_id, (agent_pos, target) in requests.items() if plans[agent_id] is None and (reachable := self._nearest_reachable(agent_pos, target)) is not None]
+                    self._note_unroutable(agent_id, agent_pos, target, reach.get(agent_id))
             if detours:
                 plans.update(self._plan(detours))
 
@@ -348,14 +351,18 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
     def get_cached_goals(self) -> dict[int, Pose2D]:
         return dict(self._cached_results)
 
-    def _note_unroutable(self, agent_id: int, pos: Pose2D, target: Pose2D) -> None:
-        """Keep a leg with no route for `unroutable` and say so in the log, once per walker and target: a walker that
-        then stands (where the nearest point it can reach is where it is) does not stand without a reason on record."""
+    def _note_unroutable(self, agent_id: int, pos: Pose2D, target: Pose2D, reachable: Pose2D | None) -> None:
+        """Keep a leg with no route for `unroutable`. Where the walker can get no nearer to its target than
+        `UNROUTABLE_STAND` from where it is (it would stand there), say so in the log, once per walker and target, so it
+        does not stand without a reason on record; a leg it walks part of (towards `reachable`) only at debug level."""
         key = (round(target.x, 3), round(target.y, 3))
         self._unroutable.append((agent_id, key, (pos.x, pos.y)))
-        if self._unroutable_told.get(agent_id) != key:
+        stands = reachable is None or math.hypot(reachable.x - pos.x, reachable.y - pos.y) < UNROUTABLE_STAND
+        if stands and self._unroutable_told.get(agent_id) != key:
             self._unroutable_told[agent_id] = key
-            self._logger.warning(f"unroutable leg: agent {agent_id} at ({pos.x:.2f}, {pos.y:.2f}) has no route to ({target.x:.2f}, {target.y:.2f})")
+            self._logger.warning(f"unroutable leg: agent {agent_id} at ({pos.x:.2f}, {pos.y:.2f}) has no route to ({target.x:.2f}, {target.y:.2f}) and stands")
+        elif not stands:
+            self._logger.debug(f"unroutable leg: agent {agent_id} at ({pos.x:.2f}, {pos.y:.2f}) has no route to ({target.x:.2f}, {target.y:.2f}); walks to ({reachable.x:.2f}, {reachable.y:.2f})")
 
     def unroutable(self) -> list[tuple[int, tuple[float, float], tuple[float, float]]]:
         """The legs the last `compute` found no route for: walker, its target rounded to mm, where it stood."""
