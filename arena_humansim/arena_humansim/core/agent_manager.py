@@ -225,6 +225,10 @@ _INPUT_TRACE = os.environ.get("HS_INPUT_TRACE", "")
 CATCH_UP_SLICE_S = 0.5
 #: The catch-up state (`catch_up` topic) is sent at most this often while ticks are owed [wall s]
 CATCH_UP_REPORT_S = 1.0
+#: An agent type's radii are prepared for (`_prepare_for`) over its mean +- this many standard deviations (within its
+#: clip), at points this far apart [m]: finer than the planners' clearance step (0.05 m), so every step its agents'
+#: clearances round to is among them
+PREPARE_RADIUS_SIGMAS, PREPARE_RADIUS_STEP = 4.0, 0.025
 
 _EXTERNAL_TIMEOUT_S = 2.0
 _EXTERNAL_ADOPT_RADIUS = 1.0
@@ -443,6 +447,9 @@ class AgentManager(TimeNode):
             self._perception_cache[default_name] = perception_cls(occluder=self._occluder)
         else:
             self._perception_cache[default_name] = perception_cls()
+        #: per agent type and spawn radius (0: drawn from the type) what `_prepare_for` built: the stair kinds its agents
+        #: climb (None: all), their radii, their local planner and global planner (None: the defaults)
+        self._prepared_types: dict[tuple[str, float], tuple[tuple[str, ...] | None, tuple[float, ...], str | None, str | None]] = {}
         self._global_planner = GlobalPlanner.create(
             self._module_selections["global_planner"],
         )
@@ -987,6 +994,8 @@ class AgentManager(TimeNode):
         agents = list(self._agents.values())
         n = self._pool.n
         used = {int(i) for i in self._pool.policy_idx[:n]} | {e.saved_policy_idx for e in self._external_entities.values()} | {self._default_policy_idx}
+        # the planners of the agent types prepared for (`_prepare_for`) stay: their agents come from the sources
+        used |= {self._policy_name_to_idx[lp] for _, _, lp, _ in self._prepared_types.values() if lp in self._policy_name_to_idx}
         keep = [i for i, p in enumerate(self._policies) if i in used or any(a.local_planner is p for a in agents)]
         dropped: list[LocalPlanner | GlobalPlanner] = [p for i, p in enumerate(self._policies) if i not in keep]
         remap = np.full(len(self._policies) + 1, -1, dtype=self._pool.policy_idx.dtype)
@@ -1002,7 +1011,8 @@ class AgentManager(TimeNode):
         self._meta_dirty = True
 
         global_planners = list(self._module_pool["global_planner"].values())
-        dropped += [p for p in global_planners if p is not self._global_planner and not any(a.global_planner is p for a in agents)]
+        prepared = {self._module_pool["global_planner"].get(gp) for _, _, _, gp in self._prepared_types.values() if gp}
+        dropped += [p for p in global_planners if p is not self._global_planner and p not in prepared and not any(a.global_planner is p for a in agents)]
 
         for planner in dropped:
             self._pool.unregister_extension(planner)
@@ -1048,6 +1058,35 @@ class AgentManager(TimeNode):
             planner.set_walls(segments)
         self._give_areas([planner])
         self._set_side(planner)
+        if isinstance(planner, GlobalPlanner):
+            for climbs, radii, _, _ in self._prepared_types.values():
+                planner.prepare(climbs, radii)
+
+    def _prepare_for(self, type_name: str, radius: float) -> None:
+        """Build, before the clock runs, what agents of this type spawned with this radius (0: drawn from the type) plan
+        with: their local planner and, on their global planner, the walled-off mesh of the stair kinds they do not
+        climb and the routers of their clearances (`GlobalPlanner.prepare`). Called where a source is added or agents
+        are spawned on request, so the first route of such an agent (a wheelchair user's: the walled-off mesh) builds
+        nothing within a tick. Once per type and radius; a type not known yet is tried again at the next call."""
+        key = (type_name or "adult", round(float(radius), 6))
+        if key in self._prepared_types:
+            return
+        agent_type = resolve_agent_type_name(key[0], self._agent_types)
+        if agent_type is None:
+            return
+        if key[1] > 0.0:
+            radii: tuple[float, ...] = (key[1],)
+        else:
+            dist = agent_type.agent_radius
+            low = max(dist.clip_low, dist.mean - PREPARE_RADIUS_SIGMAS * dist.std)
+            high = max(low, min(dist.clip_high, dist.mean + PREPARE_RADIUS_SIGMAS * dist.std))
+            radii = tuple(dict.fromkeys([*np.arange(low, high, PREPARE_RADIUS_STEP).round(6).tolist(), round(high, 6)]))
+        self._prepared_types[key] = (tuple(agent_type.climbs), radii, agent_type.local_planner, agent_type.global_planner)
+        if agent_type.local_planner and not self._force_local_planner:
+            self._resolve_policy_idx(agent_type.local_planner)
+        planner = self._module_pool["global_planner"].get(agent_type.global_planner or self._module_selections["global_planner"])
+        if planner is not None:
+            planner.prepare(tuple(agent_type.climbs), radii)
 
     def _resolve_policy_idx(self, name: str) -> int:
         if not name:
@@ -1217,6 +1256,8 @@ class AgentManager(TimeNode):
 
             if a.spawn_tick > 0:
                 pending.append((int(a.spawn_tick), msg))
+                if int(a.kind) != int(AgentKind.ROBOT):
+                    self._prepare_for(msg.agent_type, msg.radius)
             else:
                 immediate.agents.append(msg)  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -1309,6 +1350,7 @@ class AgentManager(TimeNode):
                 ),
             )
             self._spawn_scheduler.add_source(src)
+            self._prepare_for(src.agent.agent_type, src.agent.agent_radius)
 
     def _build_base_agent(
         self,
@@ -3102,6 +3144,8 @@ class AgentManager(TimeNode):
                 if callable(apply):
                     apply(policy_params)
 
+            if kind != KIND_ROBOT:
+                self._prepare_for(agent_msg.agent_type, agent_msg.radius)
             agent = self._build_base_agent(aid, agent_msg, waypoints)
             if policy_name and not self._force_local_planner:
                 self._pinned[aid] = attrs.evolve(self._pinned[aid], policy=True)
@@ -3253,8 +3297,11 @@ class AgentManager(TimeNode):
         self._lane_sources.clear()
         self._zones.clear_transfers()
         self._zones.set_zones([], [])
+        self._prepared_types.clear()
         for subsystem in self._wall_aware:
             subsystem.set_walls([])
+            if isinstance(subsystem, GlobalPlanner):
+                subsystem.forget_prepared()
         self._world_knowledge.clear()
         self._reseed()
         self._forget_agents()
@@ -3489,6 +3536,7 @@ class AgentManager(TimeNode):
         if src.lane_config is not None:
             self._lane_sources[src.name] = src
         self._narrow_goal_corners()
+        self._prepare_for(src.agent.agent_type, src.agent.agent_radius)
         if src.lane is not None:
             response.track_spacing = src.lane.settings.track_spacing
             response.arrival_radius = src.lane.settings.arrival_radius
