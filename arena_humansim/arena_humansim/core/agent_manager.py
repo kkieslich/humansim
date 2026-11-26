@@ -119,7 +119,7 @@ from arena_humansim.core.world_knowledge import FormationSpec, WorldKnowledge, W
 from arena_humansim.global_planner import LANE_SIDES, GlobalPlanner, PassageCommand
 from arena_humansim.local_planner import LocalPlanner
 from arena_humansim.occlusion import Occluder
-from arena_humansim.params import AGENT_MANAGER_PARAMS, GESTURE_ENABLED, MODE_MASTER, MODE_SUBSYSTEM
+from arena_humansim.params import AGENT_MANAGER_PARAMS, GESTURE_ENABLED, MODE_MASTER, MODE_SUBSYSTEM, ZONE_ROUTE_PRICINGS
 from arena_humansim.perception import Perception
 from arena_humansim.utils import RNG
 from arena_humansim.utils.event_bus import EventBus
@@ -189,6 +189,8 @@ _TUNABLE_PARAMS = frozenset(
         "zone_wait_timeout",
         "zone_let_out_timeout",
         "zone_route_choice",
+        "zone_route_pricing",
+        "zone_route_pricing_shadow",
         "profile_phases",
         "profile_interval",
     }
@@ -225,6 +227,8 @@ _INPUT_TRACE = os.environ.get("HS_INPUT_TRACE", "")
 CATCH_UP_SLICE_S = 0.5
 #: The catch-up state (`catch_up` topic) is sent at most this often while ticks are owed [wall s]
 CATCH_UP_REPORT_S = 1.0
+#: The shadow pricing's counts (`zone_route_pricing_shadow`) are logged this often [sim s], and before a reset
+SHADOW_LOG_S = 60.0
 
 _EXTERNAL_TIMEOUT_S = 2.0
 _EXTERNAL_ADOPT_RADIUS = 1.0
@@ -540,6 +544,9 @@ class AgentManager(TimeNode):
         self._lane_sources: dict[str, SourceConfig] = {}
         self._zones = TeleportZones()
         self._zones.route_choice = self._zone_route_choice
+        self._zones.pricing, self._zones.shadow = self._zone_route_pricing, self._zone_route_pricing_shadow
+        #: sim time [s] the shadow pricing's counts were last logged
+        self._shadow_logged = 0.0
         self._prone: set[int] = set()
         self._parked_from: dict[int, tuple[float, float, float]] = {}
         self._rising: dict[int, tuple[float, float, float, int]] = {}
@@ -853,8 +860,11 @@ class AgentManager(TimeNode):
         self._zone_wait_ticks = max(1, int(round(self._float_param("zone_wait_timeout") / self._dt)))
         self._zone_let_out_ticks = max(0, int(round(self._float_param("zone_let_out_timeout") / self._dt)))
         self._zone_route_choice = bool(self.get_parameter("zone_route_choice").value)
+        self._zone_route_pricing = str(self.get_parameter("zone_route_pricing").value)
+        self._zone_route_pricing_shadow = bool(self.get_parameter("zone_route_pricing_shadow").value)
         if hasattr(self, "_zones"):
             self._zones.route_choice = self._zone_route_choice
+            self._zones.pricing, self._zones.shadow = self._zone_route_pricing, self._zone_route_pricing_shadow
         self._profile_phases = self.get_parameter("profile_phases").value
         self._profile_interval = self._int_param("profile_interval")
 
@@ -870,6 +880,8 @@ class AgentManager(TimeNode):
         for name, registry in (("local_planner", LocalPlanner), ("global_planner", GlobalPlanner)):
             if name in incoming and incoming[name] not in registry.list_available():
                 return SetParametersResult(successful=False, reason=f"{name}: unknown module {incoming[name]!r}, available: {', '.join(registry.list_available())}")
+        if "zone_route_pricing" in incoming and incoming["zone_route_pricing"] not in ZONE_ROUTE_PRICINGS:
+            return SetParametersResult(successful=False, reason=f"zone_route_pricing must be one of {', '.join(ZONE_ROUTE_PRICINGS)}, not {incoming['zone_route_pricing']!r}")
         if "global_planner.lane_side" in incoming and incoming["global_planner.lane_side"] not in LANE_SIDES:
             return SetParametersResult(successful=False, reason=f"global_planner.lane_side must be one of {', '.join(LANE_SIDES)}, not {incoming['global_planner.lane_side']!r}")
         return SetParametersResult(successful=True)
@@ -1545,6 +1557,16 @@ class AgentManager(TimeNode):
         record = {"tick": getattr(self, "_tick_count", 0), "clock_ns": getattr(self, "_last_clock_ns", -1), "input": name, "digest": hashlib.blake2b(payload, digest_size=6).hexdigest(), **extra}
         trace.write(json.dumps(record) + "\n")
 
+    def _log_shadow(self) -> None:
+        """The shadow pricing's counts so far (`zone_route_pricing_shadow`), as one JSON line: choices per walker class,
+        and the choices the other pricing would have made differently, per class and pair (this pricing's, the other's)."""
+        self._shadow_logged = self._tick_count * self._dt
+        flips: dict[str, dict[str, int]] = {}
+        for (cls, mine, theirs), n in sorted(self._zones.shadow_flips.items()):
+            flips.setdefault(cls, {})[f"{mine}>{theirs}"] = n
+        record = {"sim_s": round(self._shadow_logged, 1), "pricing": self._zones.pricing, "choices": dict(sorted(self._zones.shadow_choices.items())), "flips": flips}
+        self._logger.info(f"route pricing shadow: {json.dumps(record)}")
+
     def _phase_end(self, name: str, t0: float):
         self._tick_phases[name] = (time.perf_counter() - t0) * 1000.0
 
@@ -1717,6 +1739,8 @@ class AgentManager(TimeNode):
                     needs_subgoal_ids.add(int(pool.agent_ids[i]))
             subgoal_agents = [a for a in agents if a.state.agent_id in needs_subgoal_ids]
             steered = self._zones.steer(subgoal_agents, self._high_level_cmds, now=self._tick_count * self._dt)
+            if self._zones.shadow and self._tick_count * self._dt - self._shadow_logged >= SHADOW_LOG_S:
+                self._log_shadow()
             robots = self._robot_bodies(pool)
             for planner, group in _group_by(subgoal_agents, key=lambda a: a.global_planner):
                 planner.set_robots(robots)
@@ -3172,6 +3196,9 @@ class AgentManager(TimeNode):
             self._force_agent_meta()
             self._mark_roster_dirty()
             self._high_level_cmds.clear()
+            if self._zones.shadow and self._zones.shadow_choices:
+                self._log_shadow()
+            self._shadow_logged = 0.0
             self._zones.clear_transfers()
             self._behavior_trees.clear()
             self._agent_name_to_id.clear()
@@ -3251,6 +3278,9 @@ class AgentManager(TimeNode):
         self._walls_rev += 1
         self._obstacles.clear()
         self._lane_sources.clear()
+        if self._zones.shadow and self._zones.shadow_choices:
+            self._log_shadow()
+        self._shadow_logged = 0.0
         self._zones.clear_transfers()
         self._zones.set_zones([], [])
         for subsystem in self._wall_aware:
@@ -3861,6 +3891,8 @@ class AgentManager(TimeNode):
             self._timer.cancel()
         if self._profile_phases:
             self._flush_profile()
+        if self._zones.shadow and self._zones.shadow_choices:
+            self._log_shadow()
         self._log_final_rtf()
         if self._sim_logger is not None:
             self._sim_logger.close()

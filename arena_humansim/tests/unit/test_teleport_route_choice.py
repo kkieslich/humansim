@@ -177,6 +177,8 @@ class _Timed:
     costs: dict[tuple[float, float], float]
     between: dict[tuple[tuple[float, float], tuple[float, float]], float] = attrs.Factory(dict)
     legs: list[tuple[Pose2D, Pose2D]] = attrs.Factory(list)
+    #: tree costs per goal [m] where they differ from the path costs (`leg_costs`)
+    tree: dict[tuple[float, float], float] = attrs.Factory(dict)
 
     def components(self, poses: Sequence[Pose2D]) -> list[frozenset[int]]:
         return [frozenset({0}) for _ in poses]
@@ -190,6 +192,10 @@ class _Timed:
 
     def leg_floors(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
         return [0.0] * len(legs)
+
+    def leg_costs(self, legs: Sequence[tuple[Pose2D, Pose2D]]) -> list[float]:
+        self.legs.extend(legs)
+        return [self.tree.get((round(goal.x, 2), round(goal.y, 2)), self.path_cost([start, goal])) for start, goal in legs]
 
     def path_cost(self, path: Sequence[Pose2D]) -> float:
         start, goal = (round(path[0].x, 2), round(path[0].y, 2)), (round(path[-1].x, 2), round(path[-1].y, 2))
@@ -308,19 +314,22 @@ def test_a_jam_weighs_the_path_cost(planner: NavMeshPlanner) -> None:
     assert planner.path_cost(path) > 12.0
 
 
-def test_one_steer_prices_every_walker_as_alone_in_four_batches(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(("pricing", "method"), [("hybrid", "paths"), ("paths", "paths")])
+def test_one_steer_prices_every_walker_as_alone_in_four_batches(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, monkeypatch: pytest.MonkeyPatch, pricing: str, method: str) -> None:
     spots = [(5.0, 2.0 + 0.5 * k) for k in range(12)] + [(25.0, 2.0 + 0.5 * k) for k in range(12)]
     walkers = [_walker(agent_factory, planner, aid, x, y) for aid, (x, y) in enumerate(spots, start=1)]
     cmds = {**_go(walkers[:12], IN_B), **_go(walkers[12:], IN_A)}
     alone = {}
     for walker in walkers:
         tz = _zones(_stairs())
+        tz.pricing = pricing
         aid = walker.state.agent_id
         alone[aid] = (tz.steer([walker], {aid: cmds[aid]}, now=0.0)[aid].target_pose, tz.transfers.get(aid))
     calls = []
-    paths = planner.paths
-    monkeypatch.setattr(planner, "paths", lambda legs: calls.append(len(legs)) or paths(legs))
+    priced = getattr(planner, method)
+    monkeypatch.setattr(planner, method, lambda legs: calls.append(len(legs)) or priced(legs))
     together = _zones(_stairs())
+    together.pricing = pricing
     out = together.steer(walkers, cmds, now=0.0)
     for walker in walkers:
         aid = walker.state.agent_id
@@ -333,7 +342,7 @@ def test_one_steer_prices_every_walker_as_alone_in_four_batches(agent_factory: C
     assert len(calls) <= 4 and sum(calls) > len(walkers)
 
 
-def _crowd_steers(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner) -> tuple[list[tuple], int]:
+def _crowd_steers(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, pricing: str = "paths") -> tuple[list[tuple], int]:
     """Five steers of a 60-walker crowd in both rooms and the corridor, half of it heading for each room, in a jam
     round A's stair mouth: every command, transfer, walk memo and choice time after each, and the legs planned."""
     rng = np.random.default_rng(3)
@@ -351,6 +360,7 @@ def _crowd_steers(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlann
     paths = planner.paths
     planner.paths = lambda asked: legs.append(len(asked)) or paths(asked)  # type: ignore[method-assign]
     tz = _zones(_stairs())
+    tz.pricing = pricing  # the floors cut planned paths only
     seen = []
     for step in range(5):
         for walker in walkers:
@@ -454,3 +464,118 @@ def test_lane_shifts_of_many_routes_at_once_are_those_one_by_one(side: str) -> N
         alone = _lanes_one_by_one(planner, router, polyline)
         assert batched.tobytes() == alone.tobytes()
     assert any(not np.array_equal(b, p) for b, p in zip(many, polylines, strict=True))
+
+
+@pytest.mark.parametrize("pricing", ["hybrid", "paths"])
+def test_both_pricings_take_the_stair_over_a_long_detour_and_walk_to_a_target_close_by(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, pricing: str) -> None:
+    tz = _zones(_stairs())
+    tz.pricing = pricing
+    far, near = _walker(agent_factory, planner, 1, 5.0, 5.0), _walker(agent_factory, planner, 2, 5.0, 5.0)
+    tz.steer([far, near], {**_go([far], IN_B), **_go([near], Pose2D(x=8.0, y=8.0))}, now=0.0)
+    assert (tz.transfers[1].zone, tz.transfers[1].ride) == ("st_a", True)
+    assert 2 not in tz.transfers
+
+
+def test_tree_costs_lie_between_the_straight_line_and_a_third_over_the_planned_path(planner: NavMeshPlanner) -> None:
+    """Tree costs run through edge midpoints: never below the straight line between the ends, the straight line where
+    it keeps the radius, and some 10-30 % above the funnelled path where the way bends (more in a jam, weighed at mesh edges)."""
+    rng = np.random.default_rng(4)
+    legs = [(Pose2D(x=float(rng.uniform(1.0, 9.0)), y=float(rng.uniform(1.0, 9.0))), IN_B if k % 2 else Pose2D(x=float(rng.uniform(1.0, 9.0)), y=float(rng.uniform(1.0, 9.0)))) for k in range(30)]
+    for crowd in (False, True):
+        if crowd:
+            xs, ys = np.meshgrid(np.linspace(3.0, 7.0, 10), np.linspace(19.5, 21.5, 4))
+            planner._set_slowdown(planner._slowdown_at(np.column_stack([xs.ravel(), ys.ravel()])))
+        tree = planner.leg_costs(legs)
+        paths = planner.paths(legs)
+        costs = planner.path_costs([path for path in paths if path])
+        assert len(costs) == len(legs)
+        ratios = []
+        for (a, b), t, c in zip(legs, tree, costs, strict=True):
+            assert t >= math.hypot(b.x - a.x, b.y - a.y) - 1e-6
+            ratios.append(t / c)
+        # here 1.00 for the legs within a room (their straight line), 1.12-1.26 for those round the corridor, up to
+        # ~1.5 with the jam in it: the tree weighs the crowd at mesh edges, path_cost at points along the path
+        assert 0.95 <= min(ratios) and max(ratios) <= (1.6 if crowd else 1.3)
+        assert sum(r <= 1.0 + 1e-9 for r in ratios) >= 10
+    assert planner.leg_costs([(Pose2D(x=5.0, y=5.0), Pose2D(x=15.0, y=5.0))]) == [math.inf], "a goal inside the walls is out of reach"
+
+
+def test_tree_pricing_answers_legs_from_one_tree_per_goal_kept_apart_from_the_planners(planner: NavMeshPlanner) -> None:
+    router = planner._router
+    assert router is not None
+    planner.leg_costs([(Pose2D(x=1.0 + k, y=2.0), IN_B) for k in range(8)])
+    assert len(router._cost_trees) == 1 and not router._trees
+    planner._set_slowdown(planner._slowdown_at(np.array([[5.0, 5.0]])))
+    assert not router._cost_trees, "a congestion update drops the trees"
+
+
+def test_the_shadow_counts_every_choice_and_the_ones_the_other_pricing_makes_differently(agent_factory: Callable[..., BaseAgent]) -> None:
+    """Planned paths make the stair quicker (100 m walk), the tree makes the walk 20 m: the crowd follows its
+    pricing, and the shadow counts the choice the other pricing would have made, by walker class."""
+    for pricing, chosen, other in (("hybrid", "walk", "st_a"), ("paths", "st_a", "walk")):
+        priced = _priced(100.0)
+        priced.tree[(25.0, 5.0)] = 20.0
+        tz = _zones(_stairs())
+        tz.pricing, tz.shadow = pricing, True
+        walker = _walker(agent_factory, priced, 1, 5.0, 5.0)
+        tz.steer([walker], _go([walker], IN_B), now=0.0)
+        assert (1 in tz.transfers) == (chosen == "st_a")
+        cls = walker.params.name or "walker"
+        assert tz.shadow_choices == {cls: 1}
+        assert tz.shadow_flips == {(cls, chosen, other): 1}
+    tz.clear_transfers()
+    assert not tz.shadow_choices and not tz.shadow_flips
+
+
+def test_without_the_shadow_nothing_is_priced_twice(agent_factory: Callable[..., BaseAgent]) -> None:
+    priced = _priced(100.0)
+    tz = _zones(_stairs())
+    walker = _walker(agent_factory, priced, 1, 5.0, 5.0)
+    tz.steer([walker], _go([walker], IN_B), now=0.0)
+    once = len(priced.legs)
+    tz.shadow = True
+    tz.forget(1)
+    priced.legs.clear()
+    tz.steer([walker], _go([walker], IN_B), now=0.0)
+    assert len(priced.legs) > once
+    assert not tz.shadow_flips
+
+
+def test_hybrid_pricing_steers_the_same_crowd_the_same_way_every_time(agent_factory: Callable[..., BaseAgent]) -> None:
+    """Two fresh planners steering the same crowd five times with hybrid pricing take byte-identical choices, choice
+    times and walk memos: the trees depend only on the walls, the goal and the crowd."""
+    runs = []
+    for _ in range(2):
+        planner = NavMeshPlanner(inflation_radius=0.38, comfort_radius=0.6)
+        planner.set_walls(WALLS)
+        runs.append(_crowd_steers(agent_factory, planner, pricing="hybrid")[0])
+    assert runs[0] == runs[1]
+    assert any(choice for _, choice, *_ in runs[0])
+
+
+def test_hybrid_pricing_takes_only_the_walks_to_the_targets_from_the_tree(agent_factory: Callable[..., BaseAgent], planner: NavMeshPlanner, monkeypatch: pytest.MonkeyPatch) -> None:
+    walkers = [_walker(agent_factory, planner, aid, 5.0, 2.0 + 0.5 * aid) for aid in range(1, 9)]
+    asked: dict[str, list[tuple[Pose2D, Pose2D]]] = {"leg_costs": [], "paths": []}
+    for method in asked:
+        inner = getattr(planner, method)
+        monkeypatch.setattr(planner, method, lambda legs, inner=inner, method=method: asked[method].extend(legs) or inner(legs))
+    tz = _zones(_stairs())
+    tz.pricing = "hybrid"
+    tz.steer(walkers, _go(walkers, IN_B), now=0.0)
+    walks = {((w.state.pose.x, w.state.pose.y), (IN_B.x, IN_B.y)) for w in walkers}
+    assert {((a.x, a.y), (b.x, b.y)) for a, b in asked["leg_costs"]} == walks
+    assert asked["paths"] and not walks & {((a.x, a.y), (b.x, b.y)) for a, b in asked["paths"]}
+    assert all(tz.transfers[w.state.agent_id].zone == "st_a" for w in walkers)
+
+
+def test_hybrid_ranks_the_stair_halves_on_planned_paths_whatever_the_tree_says(agent_factory: Callable[..., BaseAgent]) -> None:
+    """The tree prices the way to st_a's mouth at 1000 m: hybrid pricing never asks it, the stair still wins, and the
+    shadow sees no choice the exact pricing would make differently."""
+    priced = _priced(100.0)
+    priced.tree[(10.0, 5.0)] = 1000.0
+    tz = _zones(_stairs())
+    tz.pricing, tz.shadow = "hybrid", True
+    walker = _walker(agent_factory, priced, 1, 5.0, 5.0)
+    tz.steer([walker], _go([walker], IN_B), now=0.0)
+    assert tz.transfers[1].zone == "st_a"
+    assert not tz.shadow_flips and sum(tz.shadow_choices.values()) == 1
