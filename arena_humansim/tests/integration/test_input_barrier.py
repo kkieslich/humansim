@@ -206,9 +206,14 @@ def test_a_missing_acknowledgement_runs_the_ticks_after_the_timeout(manager_fact
     assert mgr._tick_count == 1
     assert mgr._barrier_wait_since is not None
     mgr._barrier_wait_since -= 1.0
+    published: list[int] = []
+    mgr._barrier_timeouts_pub = type("Pub", (), {"publish": lambda self, msg: published.append(msg.data)})()
     mgr._barrier_watchdog()
     assert mgr._tick_count == 3
     assert mgr._barrier_timeouts == 1
+    assert published == [1], "the count goes out on input_barrier_timeouts"
+    mgr._remove_agents_callback(RemoveAgents.Request(), RemoveAgents.Response())
+    assert mgr._barrier_timeouts == 0 and published == [1, 0], "a new crowd starts from 0"
 
 
 def test_a_remove_all_drops_the_old_crowds_robot_poses(manager_factory: Callable[..., AgentManager], minimal_scenario: ScenarioConfig) -> None:
