@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 import numpy as np
 from arena_humansim.core.agent_manager import AgentManager
+from arena_humansim.core.teleport_zones import CHOICE_INTERVAL, STRIKE_MOVE_M
 from arena_humansim.utils.scenario import AgentConfig, ModuleConfig, ScenarioConfig, SimulationParams, WallConfig
 from arena_humansim.utils.types import Pose2D
 from arena_humansim_msgs.msg import TeleportZone
@@ -70,8 +71,8 @@ def _half(name: str, destination: str, entry: tuple[float, float, float], hold: 
     return z
 
 
-def _manager(manager_factory: Callable[..., AgentManager], name: str, choice: bool, agents: list[AgentConfig]) -> AgentManager:
-    walls = [WallConfig(name=f"w{i}", start=Pose2D(x=a[0], y=a[1]), end=Pose2D(x=b[0], y=b[1])) for i, (a, b) in enumerate(SEGMENTS)]
+def _manager(manager_factory: Callable[..., AgentManager], name: str, choice: bool, agents: list[AgentConfig], segments: list | None = None) -> AgentManager:
+    walls = [WallConfig(name=f"w{i}", start=Pose2D(x=a[0], y=a[1]), end=Pose2D(x=b[0], y=b[1])) for i, (a, b) in enumerate(SEGMENTS if segments is None else segments)]
     scenario = ScenarioConfig(name=name, simulation=SimulationParams(seed=5, dt=0.05), modules=ModuleConfig(global_planner="navmesh"), walls=walls, agents=agents)
     mgr = manager_factory(scenario, node_name=f"test_{name}", extra_params=[Parameter("zone_route_choice", Parameter.Type.BOOL, choice)])
     zones = [_half("st_a", "st_b", (10.0, 5.0, 0.0), (13.55, 5.0), (10.0, 4.0, 14.0, 6.0)), _half("st_b", "st_a", (20.0, 5.0, math.pi), (16.45, 5.0), (16.0, 4.0, 20.0, 6.0))]
@@ -282,3 +283,115 @@ def test_crowds_crossing_a_two_way_stair_without_a_flight_both_ways_get_through(
             if (aid < 100 and x > 20.0) or (aid > 100 and x < 10.0):
                 over.add(aid)
     assert len([a for a in over if a < 100]) >= 10 and len([a for a in over if a > 100]) >= 10
+
+
+def test_a_walker_that_cannot_walk_to_the_stair_half_it_chose_chooses_again(manager_factory: Callable[..., AgentManager]) -> None:
+    """The stair choice prices legs without checking their funnels against the walls; where the walker's own route to
+    the half it chose then fails, that half is struck off for it, the leg is on record and it takes the corridor."""
+    mgr = _manager(manager_factory, "unroutable_leg", True, _pair()[:1])
+    planner = mgr._global_planner
+    point = mgr._zones._inner(mgr._zones.zones["st_a"])
+    plan_group = planner._plan_group
+
+    def no_walked_route_to_the_half(router, group):  # noqa: ANN001, ANN202 - wraps NavMeshPlanner._plan_group
+        plans = plan_group(router, group)
+        if not planner._pricing:
+            for aid, _, target in group:
+                if math.dist((target.x, target.y), (point.x, point.y)) < 1e-2:
+                    plans.pop(aid, None)
+        return plans
+
+    planner._plan_group = no_walked_route_to_the_half
+    noted: list[tuple] = []
+    note = planner._note_unroutable
+
+    def record(agent_id, pos, target, reachable):  # noqa: ANN001, ANN202 - wraps GlobalPlanner._note_unroutable
+        noted.append((agent_id, round(target.x, 3), round(target.y, 3)))
+        note(agent_id, pos, target, reachable)
+
+    planner._note_unroutable = record
+    went_round = struck = False
+    for _ in range(1600):
+        mgr.tick()
+        struck |= "st_a" in mgr._zones._unwalkable.get(1, ((), {}))[1]
+        went_round |= _pos(mgr, 1)[1] > 15.0
+        if went_round:
+            break
+    assert (1, round(point.x, 3), round(point.y, 3)) in noted
+    assert struck
+    assert went_round
+
+
+def _fail_legs_to(mgr: AgentManager, half: str, where: Callable[[float, float], bool]) -> None:
+    """Make the walked (verified) route to `half` fail from where `where` holds; the priced one stays."""
+    planner = mgr._global_planner
+    point = mgr._zones._inner(mgr._zones.zones[half])
+    plan_group = planner._plan_group
+
+    def failing(router, group):  # noqa: ANN001, ANN202 - wraps NavMeshPlanner._plan_group
+        plans = plan_group(router, group)
+        if not planner._pricing:
+            for aid, pos, target in group:
+                if math.dist((target.x, target.y), (point.x, point.y)) < 1e-2 and where(pos.x, pos.y):
+                    plans.pop(aid, None)
+        return plans
+
+    planner._plan_group = failing
+
+
+def test_a_struck_stair_half_comes_back_once_the_walker_moved_away(manager_factory: Callable[..., AgentManager]) -> None:
+    """Whether a leg can be walked depends on where the walker comes from: a half struck off where the leg failed comes
+    back once the walker has moved `STRIKE_MOVE_M` from there, before `CHOICE_INTERVAL` passed."""
+    mgr = _manager(manager_factory, "strike_moves", True, _pair()[:1])
+    _fail_legs_to(mgr, "st_a", lambda x, y: y < 6.0)
+    struck_at = None
+    back = False
+    for n in range(1200):
+        mgr.tick()
+        entry = mgr._zones._unwalkable.get(1)
+        if struck_at is None and entry is not None and "st_a" in entry[1]:
+            struck_at = (n, entry[1]["st_a"][:2])
+        if struck_at is not None and math.dist(_pos(mgr, 1), struck_at[1]) > STRIKE_MOVE_M + 0.3:
+            back = entry is None or "st_a" not in entry[1]
+            assert (n - struck_at[0]) * 0.05 < CHOICE_INTERVAL
+            break
+    assert struck_at is not None
+    assert back
+
+
+def test_a_walker_with_every_option_struck_and_no_walk_gets_one_warning(manager_factory: Callable[..., AgentManager]) -> None:
+    """Rooms joined by the stair alone, whose half the walker cannot walk to: it stands, the planner warns once that it
+    stands, and the half is tried again only once it moved `STRIKE_MOVE_M` or `CHOICE_INTERVAL` passed (not every tick)."""
+    mgr = _manager(manager_factory, "strike_all", True, _pair()[:1], segments=NO_CORRIDOR)
+    _fail_legs_to(mgr, "st_a", lambda x, y: True)
+    planner = mgr._global_planner
+    strikes = []
+    last = None
+    seconds = 4 * CHOICE_INTERVAL
+    for n in range(int(seconds / 0.05)):
+        mgr.tick()
+        entry = mgr._zones._unwalkable.get(1)
+        since = None if entry is None or "st_a" not in entry[1] else entry[1]["st_a"][2]
+        if since is not None and since != last:
+            strikes.append(since)
+            last = since
+    assert strikes
+    assert len(strikes) <= seconds / CHOICE_INTERVAL + 2
+    assert len(planner.stood) == 1 and planner.stood[0][0] == 1
+
+
+def test_without_route_choice_a_struck_half_still_comes_back_by_time(manager_factory: Callable[..., AgentManager]) -> None:
+    """Without route choice the stair is the only way between the rooms; a walker that cannot walk to its half stands,
+    and the half comes back every `CHOICE_INTERVAL` (sim time), not only once it moves."""
+    mgr = _manager(manager_factory, "strike_no_choice", False, _pair()[:1], segments=NO_CORRIDOR)
+    _fail_legs_to(mgr, "st_a", lambda x, y: True)
+    strikes: list[tuple[float, float, float]] = []
+    for _ in range(int(4 * CHOICE_INTERVAL / 0.05)):
+        mgr.tick()
+        entry = mgr._zones._unwalkable.get(1)
+        if entry is not None and "st_a" in entry[1] and (not strikes or entry[1]["st_a"][2] != strikes[-1][2]):
+            strikes.append(entry[1]["st_a"])
+    # once the walker stands, its half is struck again where it stands, a CHOICE_INTERVAL after the last strike
+    by_time = [(a, b) for a, b in zip(strikes, strikes[1:], strict=False) if math.dist(a[:2], b[:2]) <= STRIKE_MOVE_M]
+    assert by_time
+    assert all(b[2] - a[2] >= CHOICE_INTERVAL - 1e-6 for a, b in by_time)

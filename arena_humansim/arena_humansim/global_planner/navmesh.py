@@ -1475,6 +1475,13 @@ class NavMeshPlanner(GlobalPlanner):
         head = [Pose2D(x=float(x), y=float(y)) for x, y in line[1 : int(np.searchsorted(along, at[back]))]]
         return [Pose2D(x=agent_pos.x, y=agent_pos.y), *head, *rest]
 
+    def _fits(self, router: Router, agent_id: int, polyline: np.ndarray) -> bool:
+        """Whether an agent's body (its radius, at least `MIN_BODY_RADIUS`) keeps `LANE_WALL_GAP` from every wall along
+        `polyline`: so a gap it is routed through is at least its body width plus that, on both sides. A wheelchair
+        (0.325 m) needs 0.75 m, an adult of 0.25 m 0.6 m; the inflation radius asks 0.76 m of everyone."""
+        need = max(self._radius_of(agent_id), MIN_BODY_RADIUS) + LANE_WALL_GAP
+        return bool(router._clear_many([polyline])[0] >= need - 1e-9)
+
     def _plan_group(self, router: Router, group: list[tuple[int, Pose2D, Pose2D]]) -> dict[int, list[Pose2D] | None]:
         """Routes for agents with one target, by `router`'s clearance, their inner corners on the lane side."""
         plans: dict[int, list[Pose2D] | None] = {}
@@ -1500,6 +1507,15 @@ class NavMeshPlanner(GlobalPlanner):
             direct[beyond] = router.line_of_sight(starts[beyond], np.repeat(goal[None], int(beyond.sum()), 0))
         # priced routes (`paths`) only need their length: their funnels are not checked against the walls
         routes = router.plan_many(framed[~direct], self._inside(goal), verify=not self._pricing)
+        if not self._pricing and any(route is None for route in routes):
+            # a channel at the radius exists, but its funnel clips a wall corner where the gap is barely wider than two
+            # radii (approached at a slant) and no repair or other channel keeps the radius: the agent walks that
+            # funnel where its own body keeps `LANE_WALL_GAP` from every wall along it (`_fits`), else it has no route
+            lost = [k for k, route in enumerate(routes) if route is None]
+            ids = [entries[i][0] for i in np.nonzero(~direct)[0]]
+            for k, route in zip(lost, router.plan_many(framed[~direct][lost], self._inside(goal), verify=False), strict=True):
+                if route is not None and self._fits(router, ids[k], route[0]):
+                    routes[k] = route
         polylines: list[np.ndarray | None] = [None] * len(entries)
         found = [(int(i), self._rejoin(router, starts[i], goal, route[0]) if beyond[i] else route[0]) for i, route in zip(np.nonzero(~direct)[0], routes, strict=True) if route is not None]
         for (i, _), polyline in zip(found, self._lanes_many(router, [polyline for _, polyline in found]), strict=True):
