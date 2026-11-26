@@ -572,13 +572,15 @@ class AgentManager(TimeNode):
         self._overrun_count: int = 0
         self._last_overrun_log: float = 0.0
         #: the catch-up of this clock (since the last reset): the most ticks any /clock covered, its peaks, when it was
-        #: last sent, whether ticks are owed, and the timer (and its barrier force) that runs the rest of a slice
+        #: last sent, whether ticks are owed, the timer that runs what a slice left, whether it left any (and the end of a
+        #: run forced past the input barrier that it left unfinished)
         self._newest_covered: int = 0
         self._catch_up_peaks: dict[str, float] = {}
         self._catch_up_sent = -math.inf
         self._catch_up_behind = False
         self._catch_up_timer: rclpy.timer.Timer | None = None
-        self._catch_up_force = False
+        self._catch_up_left = False
+        self._forced_covered: int | None = None
         self._tick_wall_start: float | None = None
         self._total_tick_compute_s: float = 0.0
         self._high_level_cmds: dict[int, HighLevelCommand] = {}
@@ -2382,12 +2384,13 @@ class AgentManager(TimeNode):
             if self._barrier_covered is None or self._barrier_wait_since is None or target > self._tick_count:
                 self._barrier_wait_since = time.perf_counter()
             self._barrier_covered = covered
-        else:
+        elif not force or self._barrier_covered is None or self._barrier_covered <= covered:
+            # a forced slice resolves the hold it was forced for, not one a later clock set up between its slices
             self._barrier_covered = None
             self._barrier_wait_since = None
         owed = target - self._tick_count
         if owed <= 0:
-            self._stop_catch_up()
+            self._note_slice_left(covered, force, left=False)
             return
         dt_ns = self._dt_ns
         t0 = time.perf_counter()
@@ -2403,22 +2406,37 @@ class AgentManager(TimeNode):
         elapsed = time.perf_counter() - t0
         self._check_overrun(elapsed)
         self._note_catch_up(owed, done, elapsed)
+        self._note_slice_left(covered, force, left=done < owed)
         if done == owed:
-            self._stop_catch_up()
             return
         # the rest of a long catch-up runs from the catch-up timer, once the executor has served what came in meanwhile
-        self._catch_up_force = force
         if self._catch_up_timer is None:
             self._catch_up_timer = self.create_timer(0.0, self._catch_up_callback, clock=RclClock(clock_type=ClockType.STEADY_TIME))
         elif self._catch_up_timer.is_canceled():
             self._catch_up_timer.reset()
+
+    def _note_slice_left(self, covered: int, force: bool, left: bool) -> None:
+        """What a catch-up left for the catch-up timer. A run forced past the input barrier (its watchdog) keeps its own
+        end: the ticks it was forced to, not those of clocks that came in between its slices, which the barrier holds as
+        it would have after one forced batch; a call the barrier holds meanwhile leaves the forced rest pending."""
+        if force:
+            self._forced_covered = covered if left else None
+        else:
+            self._catch_up_left = left
+        if self._forced_covered is None and not self._catch_up_left:
+            self._stop_catch_up()
 
     def _owed(self) -> int:
         """Ticks the newest /clock of this clock covers that have not run (the input barrier aside)."""
         return max(self._newest_covered - self._tick_count, 0) if self._tick_count > 0 and not self._clock_held else 0
 
     def _catch_up_callback(self) -> None:
-        self._run_owed(self._newest_covered, force=self._catch_up_force)
+        if self._forced_covered is not None:
+            self._run_owed(self._forced_covered, force=True)
+        elif self._catch_up_left:
+            self._run_owed(self._newest_covered)
+        else:
+            self._stop_catch_up()
 
     def _stop_catch_up(self) -> None:
         if self._catch_up_timer is not None and not self._catch_up_timer.is_canceled():
@@ -2470,6 +2488,8 @@ class AgentManager(TimeNode):
         self._newest_covered = 0
         self._catch_up_peaks = {}
         self._catch_up_behind = False
+        self._catch_up_left = False
+        self._forced_covered = None
         self._stop_catch_up()
 
     def _start_clock_callback(

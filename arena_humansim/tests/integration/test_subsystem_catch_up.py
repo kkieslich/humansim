@@ -4,6 +4,7 @@ serves its services between the slices instead of going silent for the whole cat
 from __future__ import annotations
 
 import json
+import time
 
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ import pytest
 pytest.importorskip("rclpy")
 
 import arena_humansim.core.agent_manager as agent_manager
+from rclpy.parameter import Parameter
 from rosgraph_msgs.msg import Clock
 
 from tests.integration._golden import FIXTURES, spawn
@@ -39,9 +41,9 @@ def _destroy_managers():  # noqa: ANN202
         _BUILT.pop().destroy_node()
 
 
-def _crowd(name: str):  # noqa: ANN202 - an AgentManager
+def _crowd(name: str, barrier: bool = False):  # noqa: ANN202 - an AgentManager
     fixture = FIXTURES[0]
-    mgr = build_manager(fixture.scenario(), node_name=name)
+    mgr = build_manager(fixture.scenario(), node_name=name, extra_params=[Parameter("input_barrier", Parameter.Type.BOOL, barrier)])
     _BUILT.append(mgr)
     spawn(mgr, fixture.spawns)
     return mgr
@@ -119,3 +121,28 @@ def test_a_reset_forgets_the_catch_up(monkeypatch: pytest.MonkeyPatch) -> None:
     mgr._hold_clock()
     assert mgr._catch_up_peaks == {}
     assert mgr._catch_up_timer is not None and mgr._catch_up_timer.is_canceled()
+
+
+def _forced(name: str, slice_s: float, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202 - an AgentManager
+    """A crowd whose input barrier held `OWED` ticks until its watchdog forced them, with a later /clock coming in while
+    the forced catch-up runs (between its slices when it is sliced)."""
+    mgr = _crowd(name, barrier=True)
+    monkeypatch.setattr(agent_manager, "CATCH_UP_SLICE_S", slice_s)
+    assert _behind(mgr) == 0, "the barrier holds the clock without a world_state"
+    mgr._barrier_wait_since = time.perf_counter() - 1000.0
+    mgr._barrier_watchdog()
+    dt_ns = int(mgr._dt * NS)
+    mgr._subsystem_timer_callback(_clock(EPOCH_NS + (OWED + 30) * dt_ns))
+    while mgr._catch_up_timer is not None and not mgr._catch_up_timer.is_canceled():
+        mgr._catch_up_callback()
+    return mgr
+
+
+def test_a_forced_catch_up_in_slices_ends_where_the_watchdog_forced_it_as_one_batch_does(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A catch-up the barrier watchdog forced stays forced across its slices up to the ticks it was forced to; the
+    ticks of a clock that came in meanwhile wait for the barrier, as after one forced batch."""
+    whole = _forced("catch_up_forced_whole", 1e9, monkeypatch)
+    sliced = _forced("catch_up_forced_sliced", 0.0, monkeypatch)
+    assert whole._tick_count == sliced._tick_count == OWED + 1
+    assert _state(sliced) == _state(whole)
+    assert sliced._forced_covered is None and sliced._barrier_covered == OWED + 31
