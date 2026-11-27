@@ -14,7 +14,7 @@ from arena_humansim.utils.router import VERIFY_EPS, Router
 from arena_humansim.utils.types import CommandType, HighLevelCommand, Pose2D, Segments
 from arena_humansim.utils.wall_grid import WallGrid, cast_rays
 
-from . import ARRIVE_M, BLOCK_NEAR, LANE_SIDES, STALL_M, GlobalPlanner, PassageCommand, PlanRequest, Robots
+from . import BLOCK_NEAR, LANE_SIDES, STALL_M, GlobalPlanner, PassageCommand, PlanRequest, Robots
 from ._grid import next_waypoint
 from .wall_following import PASSING_GAP, STEP, Shaped, approach, follow_walls, leave, sample, thin, unspike
 
@@ -606,12 +606,6 @@ class NavMeshPlanner(GlobalPlanner):
             self._drive(agents, goals)
         self._take_turns(agents, high_level_commands, goals)
         return goals
-
-    def _arrive(self, agent_id: int) -> float:
-        """`ARRIVE_M` for a walker whose route is laid along walls (`wall_trailing`): its corner points lie as close to
-        the walls as its body allows, where the wall push may hold it short of them."""
-        manner = self._manners.get(agent_id)
-        return ARRIVE_M if manner is not None and manner[0].active else 0.0
 
     def _takes_straight_legs(self, agent_id: int) -> bool:
         if self._blockers.get(agent_id):

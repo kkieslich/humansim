@@ -386,12 +386,20 @@ def test_without_route_choice_a_struck_half_still_comes_back_by_time(manager_fac
     mgr = _manager(manager_factory, "strike_no_choice", False, _pair()[:1], segments=NO_CORRIDOR)
     _fail_legs_to(mgr, "st_a", lambda x, y: True)
     strikes: list[tuple[float, float, float]] = []
-    for _ in range(int(4 * CHOICE_INTERVAL / 0.05)):
+    carried = None
+    for k in range(int(4 * CHOICE_INTERVAL / 0.05)):
         mgr.tick()
         entry = mgr._zones._unwalkable.get(1)
         if entry is not None and "st_a" in entry[1] and (not strikes or entry[1]["st_a"][2] != strikes[-1][2]):
             strikes.append(entry[1]["st_a"])
-    # once the walker stands, its half is struck again where it stands, a CHOICE_INTERVAL after the last strike
+        idx = mgr._pool._id_to_idx.get(1)
+        if carried is None and idx is not None and mgr._pool.pos[idx, 0] > 16.0:
+            carried = (k + 1) * 0.05
+            break
+    # once the walker stands, its half is struck again where it stands, a CHOICE_INTERVAL after the last strike; a walker
+    # that stands past the half's seam when the half comes back is carried over instead, also not before that
     by_time = [(a, b) for a, b in zip(strikes, strikes[1:], strict=False) if math.dist(a[:2], b[:2]) <= STRIKE_MOVE_M]
-    assert by_time
+    assert by_time or carried is not None
     assert all(b[2] - a[2] >= CHOICE_INTERVAL - 1e-6 for a, b in by_time)
+    if carried is not None:
+        assert carried - strikes[-1][2] >= CHOICE_INTERVAL - 0.1

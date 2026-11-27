@@ -484,9 +484,10 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         return idx
 
     def _arrive(self, agent_id: int) -> float:
-        """Within how far of its next waypoint an agent has reached it (`advance_along_path`); 0 = only once it passed
-        it along the leg that leads there."""
-        return 0.0
+        """Within how far of its next waypoint an agent has reached it (`advance_along_path`): `ARRIVE_M` for every
+        walker. Routes round corners and door jambs lie as close to the walls as the body allows, where the wall push may
+        hold a walker short of the point."""
+        return ARRIVE_M
 
     @classmethod
     def register(cls, name: str, label: str | None = None) -> Callable[[Callable[[], type[GlobalPlanner]]], Callable[[], type[GlobalPlanner]]]:
