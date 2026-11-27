@@ -11,6 +11,7 @@ import pytest
 from arena_humansim.core.agents.base import BaseAgent
 from arena_humansim.core.agents.types import SampledParams, SampledPerception
 from arena_humansim.core.pool import AgentPool
+from arena_humansim.core.replay import HEADING_TOL_RAD, POSITION_TOL_M, VELOCITY_TOL_MPS
 from arena_humansim.local_planner.hsfm import HSFMPlanner
 from arena_humansim.local_planner.sfm import SFMPlanner
 from arena_humansim.utils.types import AgentState, Pose2D, Segments
@@ -18,7 +19,8 @@ from arena_humansim.utils.types import AgentState, Pose2D, Segments
 GOLDEN_DIR = Path(__file__).parent / "golden"
 DT = 0.05
 STEPS = 50
-TOL = 1e-12
+# The replay tolerances: last-bit differences between CPU families pass, a behaviour change fails (core/replay.py).
+TOLERANCES = {"pos": POSITION_TOL_M, "vel": VELOCITY_TOL_MPS, "theta": HEADING_TOL_RAD}
 WALLS: Segments = [((-6.0, -1.2), (6.0, -1.2)), ((-6.0, 1.2), (6.0, 1.2))]
 ROWS: tuple[tuple[float, ...], ...] = (
     (-4.0, 0.3, 0.0, 0.8, 0.0, 0.25, 5.0, 0.2),
@@ -91,14 +93,25 @@ def run_trajectory(planner: SFMPlanner, extra_params: dict[str, float] | None = 
 
 def max_abs_diff(got: list[dict[str, Any]], want: list[dict[str, Any]]) -> float:
     assert len(got) == len(want)
-    return max(float(np.max(np.abs(np.asarray(g[key]) - np.asarray(w[key])))) for g, w in zip(got, want, strict=True) for key in ("pos", "vel", "theta"))
+    return max(float(np.max(np.abs(np.asarray(g[key]) - np.asarray(w[key])))) for g, w in zip(got, want, strict=True) for key in TOLERANCES)
+
+
+def assert_matches_golden(got: list[dict[str, Any]], want: list[dict[str, Any]]) -> None:
+    """Step by step, so a divergence is reported at the step it starts, with its size."""
+    assert len(got) == len(want)
+    for step, (g, w) in enumerate(zip(got, want, strict=True)):
+        for key, tol in TOLERANCES.items():
+            g_arr, w_arr = np.asarray(g[key]), np.asarray(w[key])
+            assert g_arr.shape == w_arr.shape, f"step {step}: {key} shape {g_arr.shape} != {w_arr.shape}"
+            err = float(np.max(np.abs(g_arr - w_arr)))
+            assert err <= tol, f"step {step}: {key} off by {err:.3g} (tolerance {tol:g})"
 
 
 @pytest.mark.parametrize("name", sorted(PLANNERS))
 def test_pool_trajectory_matches_golden(name: str) -> None:
     got = run_trajectory(PLANNERS[name]())
     want = json.loads((GOLDEN_DIR / f"{name}_pool.json").read_text())
-    assert max_abs_diff(got, want) <= TOL
+    assert_matches_golden(got, want)
 
 
 if __name__ == "__main__":
