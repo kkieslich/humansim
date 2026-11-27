@@ -8,7 +8,7 @@ from typing import Any, TypedDict
 import attrs
 import numpy as np
 
-from arena_humansim.core.agents.types import Passage, WallTrailing
+from arena_humansim.core.agents.types import KINEMATICS, Passage, WallTrailing
 from arena_humansim.utils.mesh import TOL, Mesh, _pt_seg
 from arena_humansim.utils.router import VERIFY_EPS, Router
 from arena_humansim.utils.types import CommandType, HighLevelCommand, Pose2D, Segments
@@ -16,7 +16,7 @@ from arena_humansim.utils.wall_grid import WallGrid, cast_rays
 
 from . import BLOCK_NEAR, LANE_SIDES, STALL_M, GlobalPlanner, PassageCommand, PlanRequest, Robots
 from ._grid import next_waypoint
-from .wall_following import PASSING_GAP, STEP, Shaped, approach, follow_walls, leave, sample, thin, unspike
+from .wall_following import PASSING_GAP, STEP, Shaped, _legs, approach, follow_walls, leave, sample, thin, unspike
 
 SNAP_CACHE = 4096
 #: Priced legs kept between changes of the map, blocked edges, congestion or lanes (`NavMeshPlanner.paths`)
@@ -68,6 +68,13 @@ PASS_GAP = 0.1
 #: A route is measured for stretches where its walker may have to wait for an oncoming walker as wide as this [m]: the
 #: widest body the shipped types allow (adult radius clip_high 0.40 m; a manual wheelchair is 0.65 m wide)
 WIDEST_BODY = 0.8
+#: A walker that cannot step aside (a wheelchair user: `along_heading` kinematics) keeps to its lane side through a
+#: stretch narrower than `SIDE_WIDTH` [m] but wide enough for it and an adult side by side (its body, `SIDE_ADULT` and
+#: `PASS_GAP`): its body passes `SIDE_GAP` [m] from the jamb on that side, so one coming the other way has the rest. Its
+#: route moves over by `SIDE_RAMP` sideways per metre at most and is on the side `SIDE_LEAD` [m] before and after the
+#: stretch, so it comes in and leaves straight. 1.8 m: "will allow two wheelchair users to pass each other" (Singapore BCA
+#: Code on Accessibility 2019, 4.2.1.2); wider the bodies pass anywhere. The rest are our choices.
+SIDE_WIDTH, SIDE_ADULT, SIDE_GAP, SIDE_RAMP, SIDE_LEAD = 1.8, 0.5, 0.1, 0.5, 1.5
 #: A walker waiting for its turn stops with its body middle this far before the narrow stretch [m]
 TURN_HOLD = 1.0
 #: Routes are measured for narrow stretches at points this far apart [m]; a stretch's width at a point is its narrowest
@@ -262,6 +269,8 @@ class NavMeshPlanner(GlobalPlanner):
         self._crowd = None
         #: per agent of the last `compute`: its wall trailing and passage settings, and half its body length
         self._manners: dict[int, tuple[WallTrailing, Passage, float]] = {}
+        #: the agents of the last `compute` that cannot step aside and keep their lane side through narrow stretches
+        self._sides: set[int] = set()
         self._ways: dict[int, Way] = {}
         self._shapes: dict[int, tuple[int, Shaped]] = {}
         self._claims: dict[int, tuple[float, float, int]] = {}
@@ -598,6 +607,7 @@ class NavMeshPlanner(GlobalPlanner):
             if (trailing is not None and trailing.active) or (passage is not None and passage.active):
                 length = float(getattr(getattr(params, "locomotion", None), "footprint_length", 0.0) or 0.0)
                 self._manners[agent.state.agent_id] = (trailing if trailing is not None else WallTrailing(), passage if passage is not None else Passage(), max(length / 2.0, float(params.agent_radius)))
+        self._sides = {agent.state.agent_id for agent in agents if self._cannot_sidestep(agent)}
         goals = super().compute(agents, high_level_commands)
         if self._blockers or self._rounded:
             self._reroute(agents, goals, high_level_commands)
@@ -664,6 +674,54 @@ class NavMeshPlanner(GlobalPlanner):
         shaped = thin(unspike(shaped, router.clearance, body=body, **unfit), narrow)
         self._shapes[agent_id] = (len(shaped.points), shaped)
         return shaped.points
+
+    @staticmethod
+    def _cannot_sidestep(agent: Any) -> bool:  # noqa: ANN401 - a BaseAgent
+        """Whether the agent moves along its heading only (`along_heading` kinematics): it cannot step aside or back off."""
+        locomotion = getattr(getattr(agent, "params", None), "locomotion", None)
+        return bool(getattr(locomotion, "active", False)) and getattr(locomotion, "kinematics", 0) == KINEMATICS.index("along_heading")
+
+    def _keep_side(self, agent_id: int, router: Router, polyline: np.ndarray) -> np.ndarray:
+        """The route of an agent that cannot step aside, on its lane side through the stretches narrower than
+        `SIDE_WIDTH` that it and an adult fit side by side (`SIDE_GAP` from the jamb on that side), so that one coming the
+        other way can pass. Where the floor does not allow the full move it moves less; without a lane side, as it is."""
+        prefer = {"right": -1.0, "left": 1.0}.get(self._lane_side, 0.0)
+        if prefer == 0.0 or len(polyline) < 2:
+            return polyline
+        radius = max(self._radius_of(agent_id), MIN_BODY_RADIUS)
+        way = self._turn_way([Pose2D(x=float(x), y=float(y)) for x, y in polyline], SIDE_WIDTH)
+        stretches = [(narrow, width) for narrow, width in way.narrows if width >= 2.0 * radius + SIDE_ADULT + PASS_GAP]
+        if not stretches:
+            return polyline
+        points, tangents = sample(polyline, TURN_STEP)
+        at = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(points, axis=0).T))])
+        shift = np.zeros(len(points))
+        for narrow, width in stretches:
+            full = width / 2.0 - radius - SIDE_GAP
+            reach = np.maximum(np.maximum(narrow.start - SIDE_LEAD - at, at - narrow.end - SIDE_LEAD), 0.0)
+            shift = np.maximum(shift, np.maximum(full - SIDE_RAMP * reach, 0.0))
+        shift[0] = shift[-1] = 0.0
+        if not shift.any():
+            return polyline
+        left = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+        body = radius + LANE_WALL_GAP
+        for _ in range(8):
+            moved = points + prefer * shift[:, None] * left
+            tight = router.clearance(moved) < body
+            cut = ~_legs(moved, router.clearance, body)
+            tight |= np.concatenate([[False], cut]) | np.concatenate([cut, [False]])
+            tight &= shift > 0.0
+            if not tight.any():
+                break
+            shift = np.where(tight, 0.5 * shift, shift)
+            shift[shift < 0.02] = 0.0
+        else:
+            return polyline
+        moved = points + prefer * shift[:, None] * left
+        keep = np.ones(len(moved), dtype=bool)
+        a, b = moved[1:-1] - moved[:-2], moved[2:] - moved[1:-1]
+        keep[1:-1] = np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]) > 1e-6 * np.maximum(np.hypot(*a.T) * np.hypot(*b.T), 1e-12)
+        return moved[keep]
 
     def _from_here(self, router: Router, agent_id: int, agent_pos: Pose2D, polyline: np.ndarray) -> np.ndarray:
         """`polyline` starting where the agent stands instead of where the router moved its start off a wall: a walker in
@@ -1741,6 +1799,8 @@ class NavMeshPlanner(GlobalPlanner):
                 continue
             if agent_id in self._manners and not self._pricing:
                 polyline = self._shape(agent_id, router, self._from_here(router, agent_id, agent_pos, polyline))
+            elif agent_id in self._sides and not self._pricing:
+                polyline = self._keep_side(agent_id, router, polyline)
             waypoints = [Pose2D(x=float(x), y=float(y)) for x, y in polyline]
             same = polyline[0, 0] == agent_pos.x and polyline[0, 1] == agent_pos.y
             if same:
