@@ -23,11 +23,37 @@ class AgentStateDivergence:
     detail: str
 
 
+# A replay compares which agents exist exactly and their continuous state within an absolute tolerance. libm and numpy's
+# SIMD kernels differ in the last bits between CPU families, and the crowd feeds those bits back tick after tick: the
+# 300-tick goldens drift by up to ~1e-12 m / rad on another family, and scaling an SFM parameter by 1 to 256 ulp
+# leaves them 2e-14 to 2e-11 off. A relative change of 1e-9 to an SFM parameter already moves them past 1e-9 within
+# 85 to 156 ticks, a change of 1e-6 at the first tick. 1e-9 keeps a margin of ~1000 over the CPU drift and still fails
+# on the first tick a behaviour change shows.
+POSITION_TOL_M = 1e-9
+HEADING_TOL_RAD = 1e-9
+VELOCITY_TOL_MPS = 1e-9
+
+
+@attrs.define
+class StateError:
+    """The largest per-axis pose, heading and velocity error of a replay so far."""
+
+    position_m: float = 0.0
+    heading_rad: float = 0.0
+    velocity_mps: float = 0.0
+
+    def add(self, position_m: float, heading_rad: float, velocity_mps: float) -> None:
+        self.position_m = max(self.position_m, position_m)
+        self.heading_rad = max(self.heading_rad, heading_rad)
+        self.velocity_mps = max(self.velocity_mps, velocity_mps)
+
+
 @attrs.define
 class ReplayResult:
     total_ticks: int
     success: bool = True
     first_divergence: AgentStateDivergence | None = None
+    max_error: StateError = attrs.Factory(StateError)
 
 
 class ReplayManager(Loggable):
@@ -148,6 +174,7 @@ class ReplayManager(Loggable):
         return commands
 
     def replay(self, agent_manager: AgentManager, logger: RcutilsLogger | None = None) -> ReplayResult:
+        """Run the logged ticks on `agent_manager` and stop at the first tick whose state leaves the replay tolerances."""
         result = ReplayResult(total_ticks=len(self._ticks))
 
         for record in self._ticks:
@@ -160,11 +187,7 @@ class ReplayManager(Loggable):
 
             actual_states = {aid: agent.state for aid, agent in agent_manager._agents.items()}
             expected_agents = self.get_agents_at_tick(tick_n)
-            divergence = _compare_agent_states(
-                actual_states,
-                expected_agents,
-                tick_n,
-            )
+            divergence = _compare_agent_states(actual_states, expected_agents, tick_n, result.max_error)
 
             if divergence is not None:
                 result.success = False
@@ -178,14 +201,14 @@ class ReplayManager(Loggable):
         return result
 
 
-_FLOAT_TOL = 1e-12
-
-
 def _compare_agent_states(
     actual: dict[int, AgentState],
     expected: dict[int, AgentState],
     tick: int,
+    max_error: StateError | None = None,
 ) -> AgentStateDivergence | None:
+    """The first agent whose state differs from the logged one: which agents exist must match exactly, pose and velocity
+    within POSITION_TOL_M, HEADING_TOL_RAD and VELOCITY_TOL_MPS. `max_error` collects the largest errors seen."""
     all_ids = set(actual.keys()) | set(expected.keys())
     for aid in sorted(all_ids):
         if aid not in actual:
@@ -195,10 +218,24 @@ def _compare_agent_states(
         a = actual[aid]
         e = expected[aid]
 
-        if abs(a.pose.x - e.pose.x) > _FLOAT_TOL or abs(a.pose.y - e.pose.y) > _FLOAT_TOL or abs(a.pose.theta - e.pose.theta) > _FLOAT_TOL:
-            return AgentStateDivergence(tick=tick, agent_id=aid, detail=f"pose mismatch: actual=({a.pose.x}, {a.pose.y}, {a.pose.theta}) expected=({e.pose.x}, {e.pose.y}, {e.pose.theta})")
+        position = max(abs(a.pose.x - e.pose.x), abs(a.pose.y - e.pose.y))
+        heading = abs(a.pose.theta - e.pose.theta)
+        velocity = max(abs(a.velocity[0] - e.velocity[0]), abs(a.velocity[1] - e.velocity[1]))
+        if max_error is not None:
+            max_error.add(position, heading, velocity)
 
-        if abs(a.velocity[0] - e.velocity[0]) > _FLOAT_TOL or abs(a.velocity[1] - e.velocity[1]) > _FLOAT_TOL:
-            return AgentStateDivergence(tick=tick, agent_id=aid, detail=f"velocity mismatch: actual=({a.velocity[0]}, {a.velocity[1]}) expected=({e.velocity[0]}, {e.velocity[1]})")
+        if not (position <= POSITION_TOL_M and heading <= HEADING_TOL_RAD):
+            return AgentStateDivergence(
+                tick=tick,
+                agent_id=aid,
+                detail=f"pose mismatch: off by {position:.3g} m / {heading:.3g} rad (tolerance {POSITION_TOL_M:g} m / {HEADING_TOL_RAD:g} rad), actual=({a.pose.x}, {a.pose.y}, {a.pose.theta}) expected=({e.pose.x}, {e.pose.y}, {e.pose.theta})",
+            )
+
+        if not velocity <= VELOCITY_TOL_MPS:
+            return AgentStateDivergence(
+                tick=tick,
+                agent_id=aid,
+                detail=f"velocity mismatch: off by {velocity:.3g} m/s (tolerance {VELOCITY_TOL_MPS:g} m/s), actual=({a.velocity[0]}, {a.velocity[1]}) expected=({e.velocity[0]}, {e.velocity[1]})",
+            )
 
     return None

@@ -7,7 +7,7 @@ import pytest
 
 pytest.importorskip("rclpy")
 
-from arena_humansim.core.replay import ReplayManager, _compare_agent_states
+from arena_humansim.core.replay import ReplayManager, StateError, _compare_agent_states
 from arena_humansim.utils.types import AgentState, Pose2D
 
 
@@ -243,6 +243,20 @@ def test_compare_agent_states_identical_returns_none() -> None:
     assert _compare_agent_states(actual, expected, tick=4) is None
 
 
+def test_compare_agent_states_accepts_last_bit_differences() -> None:
+    """A replay on another CPU family drifts in the last bits (CI saw 2e-13 m / 1e-12 rad after 193 ticks)."""
+    actual = {1: _state(1, -1.1925549249988792, -0.49339679083479454, 6.565278789123273, 0.3 + 1e-12, 0.1)}
+    expected = {1: _state(1, -1.1925549249988154, -0.49339679083502924, 6.565278789122241, 0.3, 0.1)}
+    assert _compare_agent_states(actual, expected, tick=193) is None
+
+
+def test_compare_agent_states_tracks_the_largest_error() -> None:
+    errors = StateError()
+    _compare_agent_states({1: _state(1, x=1e-12, theta=3e-12)}, {1: _state(1)}, tick=1, max_error=errors)
+    _compare_agent_states({1: _state(1, y=-2e-12, vy=4e-12)}, {1: _state(1)}, tick=2, max_error=errors)
+    assert (errors.position_m, errors.heading_rad, errors.velocity_mps) == (2e-12, 3e-12, 4e-12)
+
+
 def test_compare_agent_states_detects_missing_from_actual() -> None:
     actual: dict[int, AgentState] = {}
     expected = {1: _state(1)}
@@ -269,6 +283,12 @@ def test_compare_agent_states_detects_pose_divergence() -> None:
     div = _compare_agent_states(actual, expected, tick=2)
     assert div is not None
     assert div.agent_id == 1
+    assert "pose mismatch: off by 0.0001 m" in div.detail
+
+
+def test_compare_agent_states_detects_heading_divergence_just_above_tolerance() -> None:
+    div = _compare_agent_states({1: _state(1, theta=0.5 + 1e-8)}, {1: _state(1, theta=0.5)}, tick=3)
+    assert div is not None
     assert "pose mismatch" in div.detail
 
 

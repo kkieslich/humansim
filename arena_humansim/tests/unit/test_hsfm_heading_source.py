@@ -12,7 +12,7 @@ from arena_humansim.core.pool import KIND_ROBOT, AgentPool
 from arena_humansim.local_planner.hsfm import HSFMPlanner
 from arena_humansim.utils.types import AgentState, BeliefState, Pose2D
 
-from .test_planner_golden import GOLDEN_DIR, TOL, max_abs_diff, run_trajectory
+from .test_planner_golden import GOLDEN_DIR, assert_matches_golden, max_abs_diff, run_trajectory
 
 BLOCKER_X = 2.0
 GOAL_X = 6.0
@@ -22,7 +22,7 @@ DT = 0.05
 
 def test_heading_from_attraction_reproduces_golden() -> None:
     want = json.loads((GOLDEN_DIR / "hsfm_pool.json").read_text())
-    assert max_abs_diff(run_trajectory(HSFMPlanner(), {"heading_source": 0.0}), want) <= TOL
+    assert_matches_golden(run_trajectory(HSFMPlanner(), {"heading_source": 0.0}), want)
     assert max_abs_diff(run_trajectory(HSFMPlanner(), {"heading_source": 1.0}), want) > 1e-3
 
 
