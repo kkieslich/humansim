@@ -23,7 +23,7 @@ _MARGIN = 0.01
 def _resolve(kernel: Callable[..., None], segments: list, pos: np.ndarray, vel: np.ndarray, radius: np.ndarray, offset: np.ndarray, theta: np.ndarray) -> np.ndarray:
     grid = WallGrid(segments)
     corrected = np.empty(pos.shape[0], dtype=np.bool_)
-    kernel(pos, vel, radius, grid.segments, grid.cell_start, grid.cell_walls, grid.wall_cx0, grid.wall_cy0, grid.origin_x, grid.origin_y, grid.cell, grid.nx, grid.ny, _MARGIN, offset, theta, corrected)
+    kernel(pos, vel, radius, grid.segments, grid.cell_start, grid.cell_walls, grid.wall_cx0, grid.wall_cy0, grid.origin_x, grid.origin_y, grid.cell, grid.nx, grid.ny, _MARGIN, offset, theta, pos, theta, False, corrected)
     return corrected
 
 

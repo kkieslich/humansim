@@ -57,6 +57,10 @@ class AgentPool:
         self.vel = np.zeros((capacity, 2), dtype=np.float64)
         self.prev_vel = np.zeros((capacity, 2), dtype=np.float64)
         self.theta = np.zeros(capacity, dtype=np.float64)
+        # the pose each row had when this tick's step began (`begin_step`): collision keeps a walker on the side of every wall it came from
+        self.step_start_pos = np.zeros((capacity, 2), dtype=np.float64)
+        self.step_start_theta = np.zeros(capacity, dtype=np.float64)
+        self.has_step_start: bool = False
         self.desired_vel = np.zeros(capacity, dtype=np.float64)
 
         self.agent_radius = np.zeros(capacity, dtype=np.float64)
@@ -133,6 +137,8 @@ class AgentPool:
         self.pos[i, 0] = agent.state.pose.x
         self.pos[i, 1] = agent.state.pose.y
         self.theta[i] = agent.state.pose.theta
+        self.step_start_pos[i] = self.pos[i]
+        self.step_start_theta[i] = self.theta[i]
         self.vel[i, 0] = agent.state.velocity[0]
         self.vel[i, 1] = agent.state.velocity[1]
         self.agent_radius[i] = agent.params.agent_radius
@@ -190,6 +196,7 @@ class AgentPool:
             for arr in (
                 self.agent_ids,
                 self.theta,
+                self.step_start_theta,
                 self.desired_vel,
                 self.agent_radius,
                 self.max_velocity,
@@ -219,7 +226,7 @@ class AgentPool:
                 self.animation_state,
             ):
                 arr[idx] = arr[last]
-            for arr in (self.pos, self.vel, self.prev_vel, self.goal_pos, self.terminal_pos):
+            for arr in (self.pos, self.step_start_pos, self.vel, self.prev_vel, self.goal_pos, self.terminal_pos):
                 arr[idx] = arr[last]
             for ext in self._extensions:
                 ext.on_pool_swap(idx, last)
@@ -230,6 +237,7 @@ class AgentPool:
 
     def reset(self) -> None:
         self.n = 0
+        self.has_step_start = False
         self._id_to_idx.clear()
         for ext in self._extensions:
             ext.on_pool_reset()
@@ -271,6 +279,13 @@ class AgentPool:
             self.goal_theta[idx] = theta
             self.has_goal_theta[idx] = True
 
+    def begin_step(self) -> None:
+        """Note every row's pose before the integration moves it: the step collision checks against the walls."""
+        n = self.n
+        self.step_start_pos[:n] = self.pos[:n]
+        self.step_start_theta[:n] = self.theta[:n]
+        self.has_step_start = True
+
     def store_prev_vel(self) -> None:
         n = self.n
         self.prev_vel[:n] = self.vel[:n]
@@ -308,6 +323,8 @@ class AgentPool:
         self.vel = _resize_2d(self.vel)
         self.prev_vel = _resize_2d(self.prev_vel)
         self.theta = _resize_1d(self.theta)
+        self.step_start_pos = _resize_2d(self.step_start_pos)
+        self.step_start_theta = _resize_1d(self.step_start_theta)
         self.desired_vel = _resize_1d(self.desired_vel)
         self.agent_radius = _resize_1d(self.agent_radius)
         self.max_velocity = _resize_1d(self.max_velocity)

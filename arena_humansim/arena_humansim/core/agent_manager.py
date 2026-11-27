@@ -1927,6 +1927,7 @@ class AgentManager(TimeNode):
         self._phase_end("animation", t0)
 
         t0 = time.perf_counter()
+        pool.begin_step()
         self._integrate_state_vectorized(pool)
         self._phase_end("integrate", t0)
 
