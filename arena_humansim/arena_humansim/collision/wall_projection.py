@@ -13,6 +13,10 @@ from arena_humansim.utils.wall_grid import WallGrid, query_walls
 
 _QUERY_CAPACITY = 64
 _CONTACT_PASSES = 3
+#: A point closer than this to a wall's line is on neither side of it [m]
+_SIDE_EPS = 1e-6
+#: Side corrections per call before a walker that still crosses a wall goes back to its step's start pose
+_SIDE_PASSES = 4
 
 
 @njit(cache=True)
@@ -28,6 +32,166 @@ def _contact(segments: np.ndarray, w: int, x: float, y: float) -> tuple[float, f
     dist = math.sqrt(dx * dx + dy * dy)
     safe_dist = dist if dist > 1e-9 else 1e-9
     return dist, dx / safe_dist, dy / safe_dist
+
+
+@njit(cache=True)
+def _first_crossing(
+    segments: np.ndarray,
+    cell_start: np.ndarray,
+    cell_walls: np.ndarray,
+    wall_cx0: np.ndarray,
+    wall_cy0: np.ndarray,
+    origin_x: float,
+    origin_y: float,
+    cell: float,
+    nx: int,
+    ny: int,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    buf: np.ndarray,
+) -> tuple[float, float, float, float, np.ndarray]:
+    """The first wall the step from (ax, ay) to (bx, by) crosses: its chord parameter (2.0 for none), its unit normal
+    towards the side the step starts on, and how far the step's end lies on that side of the wall's line (< _SIDE_EPS).
+    A step that starts within _SIDE_EPS of a wall's line has no side of it to keep."""
+    best_t = 2.0
+    best_nx = 0.0
+    best_ny = 0.0
+    best_db = 0.0
+    if ax == bx and ay == by:
+        return best_t, best_nx, best_ny, best_db, buf
+    mx = 0.5 * (ax + bx)
+    my = 0.5 * (ay + by)
+    reach = 0.5 * math.sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay)) + 2.0 * _SIDE_EPS
+    k = query_walls(cell_start, cell_walls, wall_cx0, wall_cy0, origin_x, origin_y, cell, nx, ny, mx, my, reach, buf)
+    if k > buf.shape[0]:
+        buf = np.empty(k, dtype=np.int64)
+        k = query_walls(cell_start, cell_walls, wall_cx0, wall_cy0, origin_x, origin_y, cell, nx, ny, mx, my, reach, buf)
+    for c in range(k):
+        w = buf[c]
+        cx = segments[w, 0]
+        cy = segments[w, 1]
+        sx = segments[w, 2] - cx
+        sy = segments[w, 3] - cy
+        length = math.sqrt(sx * sx + sy * sy)
+        if length < 1e-12:
+            continue
+        ux = -sy / length
+        uy = sx / length
+        da = (ax - cx) * ux + (ay - cy) * uy
+        if abs(da) <= _SIDE_EPS:
+            continue
+        if da < 0.0:
+            ux = -ux
+            uy = -uy
+            da = -da
+        db = (bx - cx) * ux + (by - cy) * uy
+        if db >= _SIDE_EPS:
+            continue
+        t = da / (da - db) if db < 0.0 else 1.0
+        qx = ax + t * (bx - ax)
+        qy = ay + t * (by - ay)
+        u = ((qx - cx) * sx + (qy - cy) * sy) / (length * length)
+        pad = _SIDE_EPS / length
+        if u < -pad or u > 1.0 + pad:
+            continue
+        if t < best_t:
+            best_t = t
+            best_nx = ux
+            best_ny = uy
+            best_db = db
+    return best_t, best_nx, best_ny, best_db, buf
+
+
+@njit(cache=True)
+def _keep_side(
+    i: int,
+    pos: np.ndarray,
+    vel: np.ndarray,
+    theta: np.ndarray,
+    offset: np.ndarray,
+    start_pos: np.ndarray,
+    start_theta: np.ndarray,
+    segments: np.ndarray,
+    cell_start: np.ndarray,
+    cell_walls: np.ndarray,
+    wall_cx0: np.ndarray,
+    wall_cy0: np.ndarray,
+    origin_x: float,
+    origin_y: float,
+    cell: float,
+    nx: int,
+    ny: int,
+    buf: np.ndarray,
+) -> tuple[bool, np.ndarray]:
+    """Keep row i on the side of every wall its step started on: each disk center (one, or a capsule's two ends) moves
+    from its start-of-step place to its place now, and where that step crosses a wall the agent goes back along the
+    wall's normal to just short of the wall's line, its velocity into the wall dropped; contact projection then pushes it
+    out on that side. One still crossing after _SIDE_PASSES corrections goes back to its start-of-step pose."""
+    moved = False
+    ends = 2 if offset[i] > 0.0 else 1
+    s0x = start_pos[i, 0]
+    s0y = start_pos[i, 1]
+    o0x = offset[i] * math.cos(start_theta[i]) if ends == 2 else 0.0
+    o0y = offset[i] * math.sin(start_theta[i]) if ends == 2 else 0.0
+    for _ in range(_SIDE_PASSES):
+        ox = offset[i] * math.cos(theta[i]) if ends == 2 else 0.0
+        oy = offset[i] * math.sin(theta[i]) if ends == 2 else 0.0
+        best_t = 2.0
+        best_nx = 0.0
+        best_ny = 0.0
+        best_db = 0.0
+        for end in range(ends):
+            sign = 2.0 * end - 1.0 if ends == 2 else 0.0
+            t, ux, uy, db, buf = _first_crossing(
+                segments,
+                cell_start,
+                cell_walls,
+                wall_cx0,
+                wall_cy0,
+                origin_x,
+                origin_y,
+                cell,
+                nx,
+                ny,
+                s0x + sign * o0x,
+                s0y + sign * o0y,
+                pos[i, 0] + sign * ox,
+                pos[i, 1] + sign * oy,
+                buf,
+            )
+            if t < best_t:
+                best_t = t
+                best_nx = ux
+                best_ny = uy
+                best_db = db
+        if best_t > 1.0:
+            return moved, buf
+        moved = True
+        shift = 2.0 * _SIDE_EPS - best_db
+        pos[i, 0] += shift * best_nx
+        pos[i, 1] += shift * best_ny
+        into = vel[i, 0] * best_nx + vel[i, 1] * best_ny
+        if into < 0.0:
+            vel[i, 0] -= into * best_nx
+            vel[i, 1] -= into * best_ny
+    still = False
+    ox = offset[i] * math.cos(theta[i]) if ends == 2 else 0.0
+    oy = offset[i] * math.sin(theta[i]) if ends == 2 else 0.0
+    for end in range(ends):
+        sign = 2.0 * end - 1.0 if ends == 2 else 0.0
+        t, _, _, _, buf = _first_crossing(
+            segments, cell_start, cell_walls, wall_cx0, wall_cy0, origin_x, origin_y, cell, nx, ny,
+            s0x + sign * o0x, s0y + sign * o0y, pos[i, 0] + sign * ox, pos[i, 1] + sign * oy, buf,
+        )
+        if t <= 1.0:
+            still = True
+    if still:
+        pos[i, 0] = s0x
+        pos[i, 1] = s0y
+        theta[i] = start_theta[i]
+    return moved, buf
 
 
 @njit(cache=True, parallel=True)
@@ -48,16 +212,23 @@ def _resolve_kernel(
     margin: float,
     offset: np.ndarray,
     theta: np.ndarray,
+    start_pos: np.ndarray,
+    start_theta: np.ndarray,
+    sweep: bool,
     corrected: np.ndarray,
 ) -> None:
     for i in prange(pos.shape[0]):
         corrected[i] = False
         threshold = radius[i] + margin
         buf = np.empty(_QUERY_CAPACITY, dtype=np.int64)
+        if sweep:
+            moved, buf = _keep_side(i, pos, vel, theta, offset, start_pos, start_theta, segments, cell_start, cell_walls, wall_cx0, wall_cy0, origin_x, origin_y, cell, nx, ny, buf)
+            if moved:
+                corrected[i] = True
         if offset[i] > 0.0:
-            ox = offset[i] * math.cos(theta[i])
-            oy = offset[i] * math.sin(theta[i])
             for _ in range(3):
+                ox = offset[i] * math.cos(theta[i])
+                oy = offset[i] * math.sin(theta[i])
                 x = pos[i, 0]
                 y = pos[i, 1]
                 vx = vel[i, 0]
@@ -106,6 +277,8 @@ def _resolve_kernel(
                 pos[i, 1] = y + cy
                 vel[i, 0] = vx
                 vel[i, 1] = vy
+                if sweep:
+                    _, buf = _keep_side(i, pos, vel, theta, offset, start_pos, start_theta, segments, cell_start, cell_walls, wall_cx0, wall_cy0, origin_x, origin_y, cell, nx, ny, buf)
             continue
         for _ in range(3):
             x = pos[i, 0]
@@ -142,6 +315,8 @@ def _resolve_kernel(
                         vy -= proj * uy
             vel[i, 0] = vx
             vel[i, 1] = vy
+            if sweep:
+                _, buf = _keep_side(i, pos, vel, theta, offset, start_pos, start_theta, segments, cell_start, cell_walls, wall_cx0, wall_cy0, origin_x, origin_y, cell, nx, ny, buf)
 
 
 @njit(cache=True)
@@ -213,9 +388,24 @@ def _separate_kernel(pos: np.ndarray, vel: np.ndarray, radius: np.ndarray, movab
                 vel[j, 1] += 0.5 * rv * ny
 
 
-def _resolve_grid(grid: WallGrid, pos: np.ndarray, vel: np.ndarray, radius: np.ndarray, margin: float, offset: np.ndarray, theta: np.ndarray) -> np.ndarray:
+def _resolve_grid(
+    grid: WallGrid,
+    pos: np.ndarray,
+    vel: np.ndarray,
+    radius: np.ndarray,
+    margin: float,
+    offset: np.ndarray,
+    theta: np.ndarray,
+    start_pos: np.ndarray | None = None,
+    start_theta: np.ndarray | None = None,
+) -> np.ndarray:
+    """Wall contact of every row; with a start-of-step pose per row (`start_pos`, `start_theta`) no row ends its step across a wall."""
     corrected = np.empty(pos.shape[0], dtype=np.bool_)
-    _resolve_kernel(pos, vel, radius, grid.segments, grid.cell_start, grid.cell_walls, grid.wall_cx0, grid.wall_cy0, grid.origin_x, grid.origin_y, grid.cell, grid.nx, grid.ny, margin, offset, theta, corrected)
+    sweep = start_pos is not None and start_theta is not None
+    if not sweep:
+        start_pos = pos
+        start_theta = theta
+    _resolve_kernel(pos, vel, radius, grid.segments, grid.cell_start, grid.cell_walls, grid.wall_cx0, grid.wall_cy0, grid.origin_x, grid.origin_y, grid.cell, grid.nx, grid.ny, margin, offset, theta, start_pos, start_theta, sweep, corrected)
     return corrected
 
 
@@ -233,6 +423,7 @@ class WallProjectionResolver(CollisionResolver):
             vel = np.array([[-1.0, -1.0]], dtype=np.float64)
             radius = np.array([0.3], dtype=np.float64)
             _resolve_grid(grid, pos, vel, radius, self._margin, np.full(1, offset), np.zeros(1))
+            _resolve_grid(grid, pos, vel, radius, self._margin, np.full(1, offset), np.zeros(1), np.array([[0.1, 0.5]]), np.zeros(1))
             _separate_kernel(np.zeros((2, 2)), np.zeros((2, 2)), np.full(2, 0.3), np.ones(2, dtype=np.bool_), pairs, np.full(2, offset), np.zeros(2))
 
     def set_walls(self, segments: Segments) -> None:
@@ -270,7 +461,8 @@ class WallProjectionResolver(CollisionResolver):
         if n == 0 or self._grid.segments.shape[0] == 0:
             return set()
 
-        corrected = _resolve_grid(self._grid, pool.pos[:n], pool.vel[:n], pool.agent_radius[:n], self._margin, pool.axial_offset[:n], pool.theta[:n])
+        start_pos, start_theta = (pool.step_start_pos[:n], pool.step_start_theta[:n]) if pool.has_step_start else (None, None)
+        corrected = _resolve_grid(self._grid, pool.pos[:n], pool.vel[:n], pool.agent_radius[:n], self._margin, pool.axial_offset[:n], pool.theta[:n], start_pos, start_theta)
 
         if not corrected.any():
             return set()
