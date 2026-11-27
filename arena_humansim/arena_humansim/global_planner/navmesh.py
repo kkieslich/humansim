@@ -16,7 +16,7 @@ from arena_humansim.utils.wall_grid import WallGrid, cast_rays
 
 from . import BLOCK_NEAR, LANE_SIDES, STALL_M, GlobalPlanner, PassageCommand, PlanRequest, Robots
 from ._grid import next_waypoint
-from .wall_following import PASSING_GAP, STEP, Shaped, approach, follow_walls, leave, sample, thin
+from .wall_following import PASSING_GAP, STEP, Shaped, approach, follow_walls, leave, sample, thin, unspike
 
 SNAP_CACHE = 4096
 #: Priced legs kept between changes of the map, blocked edges, congestion or lanes (`NavMeshPlanner.paths`)
@@ -660,7 +660,8 @@ class NavMeshPlanner(GlobalPlanner):
             if passage.takes_turns:
                 beside = lane + radius + PASSING_GAP if lanes else 0.0
                 shaped = approach(shaped, shaped.width < narrow, router.clearance, length=LINE_UP, lateral=beside, prefer=prefer, waits=True, **fit)
-        shaped = thin(shaped, narrow)
+        unfit = {"axial": 0.0, "ends": 0.0} if trailing.active else {"axial": max(half - radius, 0.0), "ends": radius}
+        shaped = thin(unspike(shaped, router.clearance, body=body, **unfit), narrow)
         self._shapes[agent_id] = (len(shaped.points), shaped)
         return shaped.points
 
@@ -1376,7 +1377,7 @@ class NavMeshPlanner(GlobalPlanner):
             if route is None:
                 self._rounded[aid] = (waypoints, key)
                 continue
-            idx = self.advance_along_path(pos, route, 0)
+            idx = self.advance_along_path(pos, route, 0, self._arrive(aid))
             self._path_cache[aid] = (goal_key, route, np.array([(w.x, w.y) for w in route], dtype=np.float64).reshape(-1, 2), idx)
             goals[aid] = next_waypoint(route, idx)
             self._rounded[aid] = (route, key)

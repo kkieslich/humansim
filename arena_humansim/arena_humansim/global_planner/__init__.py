@@ -29,6 +29,12 @@ PlanRequest = tuple[int, Pose2D, Pose2D]
 DIRECT_RANGE = 3.0
 #: An agent that moves less than this in `stall_time` seconds has stalled [m]
 STALL_M = 0.3
+#: A walker that comes within this of its next waypoint has reached it and heads for the one after [m]. The social-force
+#: wall push keeps a body's middle about 0.07 m (one wall) to 0.14 m (two walls meeting) further from the walls than its
+#: radius (strength 3.0, range 0.1 against a pull of 1.5 m/s2), so a waypoint laid closer than that, as at a corner, can
+#: not be reached; only passing it along the next leg counted before, and such a walker stood until its stall re-plan.
+#: About twice the two-wall gap, so the crowd's own sway does not hold a walker short of it. No source, our choice.
+ARRIVE_M = 0.3
 #: A robot that moves less than `ROBOT_STILL_M` [m] in `ROBOT_STILL_S` [s] stands still (parked, docked, waiting, jammed):
 #: a walker it blocks may plan round it. A moving robot is never on a walker's map; local forces handle it.
 ROBOT_STILL_S, ROBOT_STILL_M = 3.0, 0.15
@@ -194,14 +200,14 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
                     cached_goal, waypoints, points, idx = self._path_cache[agent_id]
                     waypoints = [*waypoints[:-1], end]
                     points = np.vstack([points[:-1], (end.x, end.y)])
-                idx = self.advance_along_path(agent_pos, waypoints, idx)
+                idx = self.advance_along_path(agent_pos, waypoints, idx, self._arrive(agent_id))
                 self._path_cache[agent_id] = ((round(target.x, 3), round(target.y, 3)), waypoints, points, idx)
                 goals[agent_id] = next_waypoint(waypoints, idx)
                 continue
 
             if agent_id in unchanged:
                 cached_goal, waypoints, points, idx = self._path_cache[agent_id]
-                idx = self.advance_along_path(agent_pos, waypoints, idx)
+                idx = self.advance_along_path(agent_pos, waypoints, idx, self._arrive(agent_id))
                 self._path_cache[agent_id] = (cached_goal, waypoints, points, idx)
                 goals[agent_id] = next_waypoint(waypoints, idx)
                 continue
@@ -228,7 +234,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
                     continue
 
                 goal_key = (round(target.x, 3), round(target.y, 3))
-                idx = self.advance_along_path(agent_pos, waypoints, 0)
+                idx = self.advance_along_path(agent_pos, waypoints, 0, self._arrive(agent_id))
                 self._path_cache[agent_id] = (goal_key, waypoints, np.array([(w.x, w.y) for w in waypoints], dtype=np.float64).reshape(-1, 2), idx)
                 goals[agent_id] = next_waypoint(waypoints, idx)
 
@@ -252,7 +258,7 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         ends = np.empty_like(starts)
         for k, aid in enumerate(ids):
             _, waypoints, _, idx = self._path_cache[aid]
-            wp = next_waypoint(waypoints, self.advance_along_path(positions[aid], waypoints, idx))
+            wp = next_waypoint(waypoints, self.advance_along_path(positions[aid], waypoints, idx, self._arrive(aid)))
             ends[k] = (wp.x, wp.y)
         if self._wall_grid is None or self._wall_grid[0] is not self._wall_segments:
             self._wall_grid = (self._wall_segments, WallGrid(self._wall_segments))
@@ -461,18 +467,27 @@ class GlobalPlanner(PoolAware, WallAware, Loggable, ABC):
         agent_pos: Pose2D,
         waypoints: Sequence[Pose2D],
         current_idx: int,
+        arrive: float = 0.0,
     ) -> int:
+        """The index of the waypoint the agent last passed: it passed the next one once it is beyond it along the leg
+        that leads there, or, with `arrive`, once it is within `arrive` of it (never the route's last point, the target)."""
         idx = current_idx
         while idx < len(waypoints) - 1:
             wp = waypoints[idx]
             nxt = waypoints[idx + 1]
             dx, dy = nxt.x - wp.x, nxt.y - wp.y
             tx, ty = agent_pos.x - wp.x, agent_pos.y - wp.y
-            if dx * tx + dy * ty >= dx * dx + dy * dy:
+            if dx * tx + dy * ty >= dx * dx + dy * dy or (arrive > 0.0 and idx + 1 < len(waypoints) - 1 and math.hypot(agent_pos.x - nxt.x, agent_pos.y - nxt.y) <= arrive):
                 idx += 1
             else:
                 break
         return idx
+
+    def _arrive(self, agent_id: int) -> float:
+        """Within how far of its next waypoint an agent has reached it (`advance_along_path`): `ARRIVE_M` for every
+        walker. Routes round corners and door jambs lie as close to the walls as the body allows, where the wall push may
+        hold a walker short of the point."""
+        return ARRIVE_M
 
     @classmethod
     def register(cls, name: str, label: str | None = None) -> Callable[[Callable[[], type[GlobalPlanner]]], Callable[[], type[GlobalPlanner]]]:

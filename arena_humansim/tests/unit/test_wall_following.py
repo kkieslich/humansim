@@ -8,7 +8,7 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 
-from arena_humansim.global_planner.wall_following import PASSING_GAP, approach, follow_walls, leave, sample, thin
+from arena_humansim.global_planner.wall_following import PASSING_GAP, Shaped, approach, follow_walls, leave, sample, thin, unspike
 from arena_humansim.utils.wall_grid import WallGrid, cast_rays
 
 Segment = tuple[tuple[float, float], tuple[float, float]]
@@ -232,3 +232,31 @@ def test_thin_keeps_the_points_where_something_changes() -> None:
     assert less.points[-1].tolist() == shaped.points[-1].tolist()
     assert sample(less.points, 0.05)[0][:, 1].max() == pytest.approx(shaped.points[:, 1].max())
     assert less.follows.any() and not less.follows.all()
+
+
+def _shaped(points: list[tuple[float, float]]) -> Shaped:
+    p = np.array(points, dtype=np.float64)
+    n = len(p)
+    return Shaped(p, np.ones(n, dtype=bool), np.ones(n), np.full(n, np.inf), np.zeros(n, dtype=bool), p.copy())
+
+
+def test_unspike_drops_a_point_the_route_turns_back_from_where_the_straight_leg_is_clear() -> None:
+    _, clearance = _world(CORRIDOR)
+    spiked = _shaped([(1.0, 2.0), (5.0, 2.0), (5.6, 2.3), (5.2, 1.6), (9.0, 2.0)])
+    out = unspike(spiked, clearance, body=BODY)
+    assert [tuple(q) for q in out.points.round(2)] == [(1.0, 2.0), (5.0, 2.0), (5.2, 1.6), (9.0, 2.0)]
+    assert len(out.follows) == len(out.points) == len(out.line)
+
+
+def test_unspike_keeps_a_turn_back_whose_short_cut_would_cross_a_wall() -> None:
+    walls: list[Segment] = [*CORRIDOR, ((4.0, 1.0), (4.0, 3.0))]
+    _, clearance = _world(walls)
+    round_wall = _shaped([(3.0, 1.5), (4.0, 3.6), (5.0, 1.5)])
+    assert len(unspike(round_wall, clearance, body=BODY).points) == 3
+
+
+def test_an_outer_corner_point_keeps_more_than_the_body_clearance_from_the_walls() -> None:
+    walls: list[Segment] = [((0.0, 0.0), (22.0, 0.0)), ((22.0, 0.0), (22.0, 20.0))]
+    _, clearance = _world(walls)
+    points = _trail(walls, np.array([(2.0, 2.0), (20.0, 2.0), (20.0, 18.0)]), prefer=-1.0)
+    assert clearance(points).min() >= BODY - 1e-6

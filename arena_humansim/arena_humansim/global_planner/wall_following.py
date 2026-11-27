@@ -28,6 +28,14 @@ PASSING_GAP = 0.15
 ENTRY_RAMP = 0.7
 #: The leg onto an approach line leaves the route at most this far before the line [m]
 JOIN_REACH = 10.0
+#: A corner point added where the route turns away from its wall keeps this much more than the body's clearance from
+#: the walls [m]: where walls meet, the social-force wall push holds a body's middle up to about 0.14 m further out than
+#: its radius (two walls, strength 3.0, range 0.1, pull 1.5 m/s2), and the body clearance already holds 0.05 of that. A
+#: corner point closer than that is one the walker cannot reach. No source beyond that.
+CORNER_MARGIN = 0.10
+#: A route point where the route turns back on itself by more than this [rad] (120 degrees) is a hairpin: a spike into a
+#: corner that the walker would have to turn round on the spot
+HAIRPIN = 2.0 * math.pi / 3.0
 
 Cast = Callable[[np.ndarray, np.ndarray, float], np.ndarray]
 Clearance = Callable[[np.ndarray], np.ndarray]
@@ -320,7 +328,7 @@ def _corners(moved: np.ndarray, line: np.ndarray, tangents: np.ndarray, states: 
         if not (0.0 < u <= 2.0 * far and 0.0 < v <= 2.0 * far):
             continue
         corner = moved[i] + u * a
-        if clearance(corner[None])[0] >= body:
+        if clearance(corner[None])[0] >= body + CORNER_MARGIN:
             pts.append(corner)
             on.append(corner)
             follows.append(True)
@@ -496,6 +504,31 @@ def leave(shaped: Shaped, stretch: np.ndarray, clearance: Clearance, *, body: fl
             shaped = attrs.evolve(shaped, points=np.vstack([points[:tail], line[tail:b], points[b:]]))
         shaped, stretch = _splice(shaped, b, block, join, float(shaped.side[last]), np.zeros(count, dtype=bool), stretch)
     return shaped
+
+
+def unspike(shaped: Shaped, clearance: Clearance, *, body: float, axial: float = 0.0, ends: float = 0.0) -> Shaped:
+    """`shaped` without its hairpins: a point where the route turns back on itself by more than `HAIRPIN` is dropped
+    where the straight leg between its neighbours keeps the body clear of the walls (`_legs`), so the route turns the
+    corner instead of running into it and back. Its ends stay."""
+    p = shaped.points
+    keep = np.ones(len(p), dtype=bool)
+    if len(p) < 3:
+        return shaped
+    changed = True
+    while changed:
+        changed = False
+        idx = np.flatnonzero(keep)
+        for k in range(1, len(idx) - 1):
+            i, j, m = idx[k - 1], idx[k], idx[k + 1]
+            a, b = p[j] - p[i], p[m] - p[j]
+            na, nb = float(np.hypot(a[0], a[1])), float(np.hypot(b[0], b[1]))
+            if na < 1e-9 or nb < 1e-9 or float(a @ b) / (na * nb) >= math.cos(HAIRPIN):
+                continue
+            if _legs(np.vstack([p[i], p[m]]), clearance, body, axial, ends).all():
+                keep[j] = False
+                changed = True
+                break
+    return shaped if keep.all() else shaped.keep(keep)
 
 
 def thin(shaped: Shaped, narrow: float = 0.0) -> Shaped:
