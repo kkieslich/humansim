@@ -85,6 +85,17 @@ def test_advance_along_path_progresses_through_waypoints() -> None:
     assert at_end == len(waypoints) - 1
 
 
+def test_advance_along_path_reaches_a_waypoint_within_arrive_but_never_skips_the_target() -> None:
+    """A corner point the wall push keeps a walker 0.1 m short of counts as reached within `arrive`; the target is
+    reached only by getting there."""
+    waypoints = _poses(np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [2.0, 1.0]]))
+    short = Pose2D(x=0.9, y=-0.05)
+    assert GlobalPlanner.advance_along_path(short, waypoints, 0) == 0
+    assert GlobalPlanner.advance_along_path(short, waypoints, 0, arrive=0.3) == 1
+    near_target = Pose2D(x=1.85, y=1.0)
+    assert GlobalPlanner.advance_along_path(near_target, waypoints, 2, arrive=0.3) == 2
+
+
 def test_advance_along_path_respects_current_idx() -> None:
     waypoints = _poses(np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]))
     idx = GlobalPlanner.advance_along_path(Pose2D(x=0.5, y=0.0), waypoints, 1)
