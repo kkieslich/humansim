@@ -618,7 +618,7 @@ def test_queue_rotation_keeps_the_service_provider() -> None:
 def _fountain() -> WorldKnowledge:
     wk = WorldKnowledge()
     line = FormationSpec(type="line", params={"base_step": 0.8, "front_offset": 0.8}, anchor_kind=AnchorKind.OBJECT)
-    wk.add_object(WorldObject(object_id="fountain", type="fountain", pose=Pose2D(x=4.0, y=0.0, theta=3.14159), capacity=2, formation=line))
+    wk.add_object(WorldObject(object_id="fountain", type="fountain", pose=Pose2D(x=4.0, y=0.0, theta=3.14159), capacity=1, formation=line))
     return wk
 
 

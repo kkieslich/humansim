@@ -195,6 +195,7 @@ class InteractionState:
     object_id: str | None = None
     outcome: int = 0  # InteractionOutcome.FORMING
     member_durations: dict[int, float] = attrs.Factory(dict)
+    member_holds: dict[int, float] = attrs.Factory(dict)  # seconds held per member, multi-point objects only
 
     @property
     def provider(self) -> int | None:

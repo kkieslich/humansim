@@ -12,6 +12,9 @@ __all__ = ["AnchorKind", "FormationSpec", "WorldKnowledge", "WorldObject"]
 
 @attrs.define
 class WorldObject:
+    """An object walkers use. ``capacity`` is how many use it at once (`use_points`; a seated object's seats instead).
+    Needs-driven route choice passes the object over while its queue is at least its capacity, never for <= 0."""
+
     object_id: str
     type: str
     pose: Pose2D = attrs.Factory(Pose2D)
@@ -22,6 +25,12 @@ class WorldObject:
     seats: list[Pose2D] = attrs.Factory(list)
     seat_approach: list[float] = attrs.Factory(list)
     seat_conflicts: list[frozenset[int]] = attrs.Factory(list)
+
+    @property
+    def use_points(self) -> int:
+        """Walkers one interaction on the object serves at once: its capacity, 1 for a seated object (one interaction
+        per seat) and for a capacity below 2."""
+        return self.capacity if self.capacity > 1 and not self.seats else 1
 
 
 class WorldKnowledge(Loggable):

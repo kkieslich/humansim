@@ -30,7 +30,8 @@ def _approach_pose_for(obj: WorldObject, world: WorldKnowledge) -> Pose2D:
     params = spec.params or {}
     front_offset = float(params.get("front_offset", 0.0))
     base_step = float(params.get("base_step", 1.0))
-    slot_index = world.participants_count_for_object(obj.object_id) + world.queue_length_for_object(obj.object_id)
+    # the first free use point is in the front row, else the end of the waiting line one step behind the row
+    slot_index = max(0, world.participants_count_for_object(obj.object_id) + world.queue_length_for_object(obj.object_id) - obj.use_points + 1)
     offset = front_offset + slot_index * base_step
     back = obj.pose.theta + math.pi
     return Pose2D(
