@@ -30,6 +30,23 @@ _TWO_PI = 2.0 * math.pi
 _HARMONIC_K = np.arange(1, MAX_HARMONICS + 1, dtype=np.float64)
 
 
+def body_heading_target(pool: AgentPool, rows: np.ndarray, vel_theta: np.ndarray) -> np.ndarray:
+    """Heading a body turns to when its heading follows its velocity: the velocity's direction, except for a long body
+    (capsule, `axial_offset` > 0) whose velocity points backwards of the bearing to its goal. Such a body is being pushed
+    back (crowd ahead, contacts), it does not turn round to face the push: it keeps facing the bearing to its goal. A
+    turned 1.1 m body blocks a stream across 0.65 m + 0.45 m * |sin(angle)| and pokes its ends into its neighbours; in
+    a dense two-way crowd such turned bodies lock (log jam). Round bodies are unaffected (their heading only steers)."""
+    target = np.asarray(vel_theta, dtype=np.float64).copy()
+    capsule = (pool.axial_offset[rows] > 0.0) & pool.has_goal[rows]
+    if not capsule.any():
+        return target
+    goal = pool.goal_pos[rows] - pool.pos[rows]
+    bearing = np.arctan2(goal[:, 1], goal[:, 0])
+    pushed = capsule & (np.cos(target - bearing) < 0.0) & (np.hypot(goal[:, 0], goal[:, 1]) > GOAL_NEAR_M)
+    target[pushed] = bearing[pushed]
+    return target
+
+
 class LocomotionExtension(PoolAware):
     """Gait phase, speed and sway profiles, kinematics modes and stall recovery for the pool's active rows."""
 
@@ -263,7 +280,7 @@ class LocomotionExtension(PoolAware):
             v = pool.vel[t_rows]
             speed = np.hypot(v[:, 0], v[:, 1])
             moving = speed > 1e-9
-            target = np.arctan2(v[:, 1], v[:, 0])
+            target = body_heading_target(pool, t_rows, np.arctan2(v[:, 1], v[:, 0]))
             cur = pool.theta[t_rows]
             delta = np.arctan2(np.sin(target - cur), np.cos(target - cur))
             max_d = np.maximum(pool.pivot_angular_velocity[t_rows], speed / np.maximum(pool.min_turning_radius[t_rows], 1e-9)) * dt

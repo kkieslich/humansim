@@ -106,7 +106,7 @@ from arena_humansim.core.despawn_monitor import DespawnMonitor
 from arena_humansim.core.formation.clearance import Clearance
 from arena_humansim.core.interaction_kinds import InteractionType, MembershipRole
 from arena_humansim.core.interaction_manager import InteractionEdge, InteractionManager, InteractionRow, check_gesture_mode
-from arena_humansim.core.locomotion import LocomotionExtension
+from arena_humansim.core.locomotion import LocomotionExtension, body_heading_target
 from arena_humansim.core.logger import SimulationLogger
 from arena_humansim.core.pool import KIND_ROBOT, AgentPool, PoolAware
 from arena_humansim.core.recorder import BagRecorder, default_record_dir
@@ -2145,7 +2145,7 @@ class AgentManager(TimeNode):
         goal_theta = pool.goal_theta[:n]
         has_goal_theta = pool.has_goal_theta[:n]
         # an explicit heading goal wins over velocity heading, formation speeds rarely settle below min_speed_for_heading
-        target_theta = np.where(has_goal_theta, goal_theta, vel_theta)
+        target_theta = np.where(has_goal_theta, goal_theta, body_heading_target(pool, np.arange(n), vel_theta))
         rotating = (moving & ~provides_heading & ~heading_owned & ~has_goal_theta) | has_goal_theta
         delta = np.arctan2(
             np.sin(target_theta - theta),
