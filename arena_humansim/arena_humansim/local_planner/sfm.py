@@ -35,6 +35,9 @@ _DEFAULT_CLASS_GAINS: dict[tuple[str, str], tuple[float, float]] = {
 }
 
 _WALL_CUTOFF_RANGES = 28.0
+#: neighbours whose body surface is farther than this from one's own get no occlusion test (their push is below
+#: 2.1 * exp(-2 / 0.3) ~ 0.003 m/s^2 at the default range)
+_OCCLUSION_MAX_GAP = 2.0
 _WALL_QUERY_CAPACITY = 64
 
 
@@ -153,6 +156,86 @@ def _wall_forces_kernel(
             out[i, 1] = fy
 
 
+@njit(cache=True)
+def _segment_gap(ax: float, ay: float, bx: float, by: float, cx: float, cy: float, dx: float, dy: float) -> float:
+    """Distance between the segments a-b and c-d."""
+    ux = bx - ax
+    uy = by - ay
+    vx = dx - cx
+    vy = dy - cy
+    wx = ax - cx
+    wy = ay - cy
+    a = ux * ux + uy * uy
+    b = ux * vx + uy * vy
+    c = vx * vx + vy * vy
+    d = ux * wx + uy * wy
+    e = vx * wx + vy * wy
+    den = a * c - b * b
+    s = 0.0
+    t = 0.0
+    if a <= 1e-12 and c <= 1e-12:
+        s = 0.0
+        t = 0.0
+    elif a <= 1e-12:
+        t = min(max(e / c, 0.0), 1.0)
+    elif c <= 1e-12:
+        s = min(max(-d / a, 0.0), 1.0)
+    else:
+        s = min(max((b * e - c * d) / den, 0.0), 1.0) if den > 1e-12 else 0.0
+        t = (b * s + e) / c
+        if t < 0.0:
+            t = 0.0
+            s = min(max(-d / a, 0.0), 1.0)
+        elif t > 1.0:
+            t = 1.0
+            s = min(max((b - d) / a, 0.0), 1.0)
+    px = ax + s * ux - cx - t * vx
+    py = ay + s * uy - cy - t * vy
+    return math.sqrt(px * px + py * py)
+
+
+@njit(cache=True)
+def _occluded_kernel(pos: np.ndarray, theta: np.ndarray, offsets: np.ndarray, radius: np.ndarray, indptr: np.ndarray, indices: np.ndarray, out: np.ndarray) -> None:
+    """out[q] is True when observer i cannot see neighbour j = indices[q] (i's row of the CSR): the sight line from i's
+    centre to the nearest point of j's body axis passes through the body of another neighbour k of i that is nearer
+    (capsule bodies as their axis segment widened by the radius, round bodies as a disc)."""
+    n = indptr.shape[0] - 1
+    for i in range(n):
+        lo = indptr[i]
+        hi = indptr[i + 1]
+        ex = pos[i, 0]
+        ey = pos[i, 1]
+        for q in range(lo, hi):
+            out[q] = False
+            j = indices[q]
+            ujx = offsets[j] * math.cos(theta[j])
+            ujy = offsets[j] * math.sin(theta[j])
+            # nearest point of j's axis to i's centre
+            ax = pos[j, 0] - ujx
+            ay = pos[j, 1] - ujy
+            L = 4.0 * offsets[j] * offsets[j]
+            t = 0.0
+            if L > 1e-12:
+                t = min(max(((ex - ax) * 2.0 * ujx + (ey - ay) * 2.0 * ujy) / L, 0.0), 1.0)
+            tx = ax + 2.0 * ujx * t
+            ty = ay + 2.0 * ujy * t
+            sight = math.hypot(tx - ex, ty - ey)
+            if sight - radius[j] - radius[i] > _OCCLUSION_MAX_GAP:
+                continue
+            for p in range(lo, hi):
+                if p == q:
+                    continue
+                k = indices[p]
+                ukx = offsets[k] * math.cos(theta[k])
+                uky = offsets[k] * math.sin(theta[k])
+                # k must be nearer than j along the sight line
+                if math.hypot(pos[k, 0] - ex, pos[k, 1] - ey) - offsets[k] >= sight:
+                    continue
+                if _segment_gap(ex, ey, tx, ty, pos[k, 0] - ukx, pos[k, 1] - uky, pos[k, 0] + ukx, pos[k, 1] + uky) < radius[k]:
+                    out[q] = True
+                    break
+
+
 def _closest_disk_diff(pos: np.ndarray, theta: np.ndarray, offsets: np.ndarray, pair_obs: np.ndarray, pair_nbr: np.ndarray) -> np.ndarray:
     axis = offsets[:, None] * np.stack((np.cos(theta), np.sin(theta)), axis=1)
     obs_centers = np.stack((pos[pair_obs] + axis[pair_obs], pos[pair_obs] - axis[pair_obs]), axis=1)
@@ -181,9 +264,15 @@ class SFMPlanner(LocalPlanner):
         self,
         wall_repulsion_strength: float = _DEFAULT_WALL_REPULSION_STRENGTH,
         wall_repulsion_range: float = _DEFAULT_WALL_REPULSION_RANGE,
+        occlusion: bool = True,
     ):
         self.wall_repulsion_strength = wall_repulsion_strength
         self.wall_repulsion_range = wall_repulsion_range
+        #: social repulsion only from the neighbours one can see: a neighbour hidden behind a nearer neighbour's body
+        #: does not push. Without it a walker in a dense crowd is pushed back by every row ahead within its vision
+        #: range (~40 walkers), and a long body (capsule), whose distances count from its front end, by about twice as
+        #: much as a round body there: wheelchair users stood still in dense two-way crowds while adults crept on.
+        self.occlusion = occlusion
         #: the side walkers sidestep to from an oncoming neighbour: +1 right, -1 left, 0 never (`set_side`)
         self.side = 0.0
         self._wall_segments: Segments = []
@@ -212,6 +301,7 @@ class SFMPlanner(LocalPlanner):
         p1 = np.ascontiguousarray(grid.segments[:, :2])
         d = np.ascontiguousarray(grid.segments[:, 2:] - p1)
         self._run_wall_kernel(np.zeros((2, 2), dtype=np.float64), np.full(2, 0.3), np.zeros(2), np.array([0.0, 0.5]), grid, p1, d, np.sum(d**2, axis=1))
+        _occluded_kernel(np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]), np.zeros(3), np.array([0.0, 0.2, 0.0]), np.full(3, 0.3), np.array([0, 2, 2, 2], dtype=np.int64), np.array([1, 2], dtype=np.int64), np.zeros(2, dtype=np.bool_))
 
     def _ensure_gain_classes(self, count: int) -> None:
         old = self._gain_strength_scale.shape[0]
@@ -405,6 +495,18 @@ class SFMPlanner(LocalPlanner):
                 eff_range[nbr_is_robot] *= pool.robot_reaction_gain[robot_pairs]
             eff_range = np.maximum(eff_range, 1e-4)
             magnitudes = eff_strength * np.exp((r_ij - dists) / eff_range)
+            if self.occlusion:
+                hidden = np.zeros(len(pair_obs), dtype=np.bool_)
+                _occluded_kernel(
+                    np.ascontiguousarray(pos, dtype=np.float64),
+                    np.ascontiguousarray(pool.theta[:n], dtype=np.float64),
+                    np.ascontiguousarray(pool.axial_offset[:n], dtype=np.float64),
+                    np.ascontiguousarray(radii, dtype=np.float64),
+                    np.ascontiguousarray(indptr[: n + 1], dtype=np.int64),
+                    np.ascontiguousarray(indices, dtype=np.int64),
+                    hidden,
+                )
+                magnitudes = np.where(hidden, 0.0, magnitudes)
 
             lam = aniso[pair_obs]
             cos_phi = np.sum(-normals * e_goal[pair_obs], axis=1)
