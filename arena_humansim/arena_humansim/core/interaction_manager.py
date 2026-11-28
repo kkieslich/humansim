@@ -60,6 +60,8 @@ _UNSET: Any = object()
 
 _HOLDING = "_holding"
 _SEATED = "_seated"
+# use points of an object interaction serving several walkers at once, each on its own hold clock (absent: one)
+_POINTS = "_use_points"
 _CLIP_SET = "_clip_set"
 _HEADINGS = ("heading_a", "heading_b")
 _DRIFT_LATCH_FRACTION = 0.5
@@ -195,6 +197,14 @@ class InteractionManager(Loggable):
         """Contact clip and render override are shown: contact enabled and the pair is holding."""
         return self.is_contact(interaction) and self._contact_mode == CONTACT_ENABLED and self.is_holding(interaction)
 
+    @staticmethod
+    def _point_params(interaction: InteractionState, formation_type: str, params: dict[str, Any]) -> dict[str, Any]:
+        """A line on an object with several use points puts that many in its front row."""
+        points = interaction.state.get(_POINTS, 1)
+        if formation_type != "line" or points <= 1:
+            return params
+        return {**params, "points": int(points)}
+
     def _contact_params(self, interaction: InteractionState, formation_type: str, params: dict[str, Any]) -> dict[str, Any]:
         if formation_type == "dyad" and self.is_contact(interaction) and self._contact_mode == CONTACT_LOCOMOTION_ONLY:
             return {**{k: v for k, v in params.items() if k not in _HEADINGS}, "separation": self._standing_distance}
@@ -245,6 +255,10 @@ class InteractionManager(Loggable):
         return bool(interaction.state.get(_HOLDING))
 
     def _restart_hold(self, interaction: InteractionState) -> None:
+        if interaction.state.get(_POINTS, 1) > 1:
+            # members of a multi-point object hold on their own clocks, one joining or leaving restarts no one else
+            interaction.state[_HOLDING] = bool(interaction.member_holds)
+            return
         interaction.state[_HOLDING] = False
         interaction.contract.elapsed = 0.0
 
@@ -475,6 +489,7 @@ class InteractionManager(Loggable):
 
         if was_involved:
             interaction.member_durations.pop(agent_id, None)
+            interaction.member_holds.pop(agent_id, None)
             self._on_formation_leave(interaction, agent_id)
             self._update_bt_movement(agent_id, interaction_id=None, clear_command=True, last_outcome=reason)
 
@@ -820,6 +835,7 @@ class InteractionManager(Loggable):
         self._drop_membership(agent_id, interaction_id)
         self._on_formation_leave(interaction, agent_id)
         interaction.member_durations.pop(agent_id, None)
+        interaction.member_holds.pop(agent_id, None)
         if not interaction.participants and not contract.queue:
             interaction.outcome = InteractionOutcome.INTERRUPTED
             self._unmap_object_bound(interaction)
@@ -1003,6 +1019,10 @@ class InteractionManager(Loggable):
             obj = self._world_knowledge.get(object_id)
             if obj is not None:
                 state_dict["object_type"] = obj.type
+                if spec.max_participants is None and obj.use_points > 1:
+                    # the object's capacity: that many walkers use it at once, the rest queue for the next free point
+                    contract.max_participants = obj.use_points
+                    state_dict[_POINTS] = obj.use_points
         if spec.offer:
             state_dict["provider"] = creator_id
 
@@ -1047,7 +1067,7 @@ class InteractionManager(Loggable):
                     anchor=anchor,
                     agent_lookup=self._agent_lookup,
                     formation_scale=self._formation_scale,
-                    **self._contact_params(interaction, spec.type, dict(spec.params or {})),
+                    **self._point_params(interaction, spec.type, self._contact_params(interaction, spec.type, dict(spec.params or {}))),
                 )
             except (KeyError, TypeError) as e:
                 self._logger.warning(f"Formation '{spec.type}' instantiation failed for interaction {interaction.id}: {e}")
@@ -1068,7 +1088,7 @@ class InteractionManager(Loggable):
         if anchor is None:
             return None
 
-        params = self._contact_params(interaction, active_spec.type, {**dict(active_spec.params or {}), **self._stance(interaction, active_spec.type)})
+        params = self._point_params(interaction, active_spec.type, self._contact_params(interaction, active_spec.type, {**dict(active_spec.params or {}), **self._stance(interaction, active_spec.type)}))
         seat_object: str | None = None
         if interaction.object_id is not None and active_spec.type == "cluster" and self._seat_count(interaction.object_id):
             seat_object = interaction.object_id
@@ -1208,6 +1228,7 @@ class InteractionManager(Loggable):
         for agent_id in list(interaction.participants):
             self._update_bt_movement(agent_id, interaction_id=None, clear_command=True, last_outcome=outcome)
         interaction.member_durations.clear()
+        interaction.member_holds.clear()
 
     def _unmap_object_bound(self, interaction: InteractionState) -> None:
         key = (interaction.object_id or "", interaction.type)
@@ -1217,6 +1238,10 @@ class InteractionManager(Loggable):
     def _tick_durations(self, dt: float) -> None:
         for iid, interaction in list(self.interactions.items()):
             contract = interaction.contract
+            if interaction.state.get(_POINTS, 1) > 1:
+                if interaction.outcome == InteractionOutcome.ACTIVE:
+                    self._tick_member_holds(iid, interaction, dt)
+                continue
             if interaction.outcome != InteractionOutcome.ACTIVE or not self.all_arrived(interaction):
                 continue
             if interaction.participants and not self.is_holding(interaction):
@@ -1247,6 +1272,41 @@ class InteractionManager(Loggable):
                 continue
             self._teardown(iid, InteractionOutcome.COMPLETED)
 
+    def _tick_member_holds(self, iid: int, interaction: InteractionState, dt: float) -> None:
+        """An object with several use points serves each walker on its own: a participant's hold starts when it stands
+        at its point and runs while it stands there, it leaves alone when its own duration is up, and the queue head
+        takes the freed point. The last one done with nobody queued completes the interaction."""
+        contract = interaction.contract
+        formation = contract.formation
+        done: list[int] = []
+        for pid in list(interaction.participants):
+            if formation is not None and not formation.arrived(pid):
+                continue
+            if pid not in interaction.member_holds:
+                interaction.member_holds[pid] = 0.0
+                self._emit(interaction, LifecycleEdge.HOLD_ONSET, [pid])
+            duration = interaction.member_durations.get(pid, contract.duration)
+            if duration is None:
+                continue
+            interaction.member_holds[pid] += dt
+            if interaction.member_holds[pid] >= duration:
+                done.append(pid)
+        interaction.state[_HOLDING] = bool(interaction.member_holds)
+        if not done:
+            return
+        if not contract.queue and len(done) == len(interaction.participants):
+            self._teardown(iid, InteractionOutcome.COMPLETED, done)
+            return
+        self._emit(interaction, LifecycleEdge.RELEASED, done)
+        for pid in done:
+            self._release_participant(interaction, pid)
+        promoted = contract.access.tick(interaction, 0.0) if contract.access is not None else []
+        for next_agent in promoted:
+            self._add_membership(next_agent, iid, MembershipRole.PARTICIPANT)
+            self._update_bt_movement(next_agent, interaction_id=iid)
+            self._on_formation_join(interaction, next_agent)
+        interaction.state[_HOLDING] = bool(interaction.member_holds)
+
     def _release_participant(self, interaction: InteractionState, agent_id: int) -> None:
         self._current_departed.add(agent_id)
         contract = interaction.contract
@@ -1256,6 +1316,7 @@ class InteractionManager(Loggable):
             contract.current_participants.remove(agent_id)
         self._drop_membership(agent_id, interaction.id)
         interaction.member_durations.pop(agent_id, None)
+        interaction.member_holds.pop(agent_id, None)
         self._on_formation_leave(interaction, agent_id)
         self._update_bt_movement(agent_id, interaction_id=None, clear_command=True, last_outcome=InteractionOutcome.COMPLETED)
 
