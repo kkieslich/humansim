@@ -40,8 +40,9 @@ class HSFMPlanner(SFMPlanner):
         self,
         wall_repulsion_strength: float = 3.0,
         wall_repulsion_range: float = 0.1,
+        occlusion: bool = True,
     ) -> None:
-        super().__init__(wall_repulsion_strength, wall_repulsion_range)
+        super().__init__(wall_repulsion_strength, wall_repulsion_range, occlusion)
         self._omega: dict[int, float] = {}
 
         self._lateral_gain = np.zeros(0, dtype=np.float64)
